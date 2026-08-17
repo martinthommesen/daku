@@ -66,7 +66,7 @@ fn parse_boolean_setting(value: &str) -> Option<bool> {
     }
 }
 
-/// Notifications return in Signal UI plans; hollow shell has no task banners.
+/// Notifications return in Signal UI plans; the current shell has no task banners.
 pub fn show_task_notification(_tag: &str, _title: &str, _body: &str, _: &gpui::App) {}
 
 #[cfg(target_os = "macos")]
