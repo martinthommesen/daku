@@ -34,6 +34,34 @@ pub fn signal_label(signal_id: &str) -> &'static str {
 
 const TREND_SIGNALS: [&str; 2] = ["jobs", "syslog"];
 
+/// Older than this and the header tints "polled … ago" as stale.
+// ponytail: fixed threshold (2.5x default cadence); put poll_interval_secs on
+// EnvironmentsUpdated if Operators start tuning cadence.
+pub const STALE_AFTER_SECS: i64 = 300;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Freshness {
+    pub label: String,
+    pub stale: bool,
+}
+
+/// "polled 42 s ago" / "polled 3 min ago" / "polled 2 h ago" for the selected
+/// Environment, or `None` before the first observation.
+pub fn freshness(last_observed_at: Option<i64>, now: i64) -> Option<Freshness> {
+    let age = now.saturating_sub(last_observed_at?).max(0);
+    let label = if age < 60 {
+        format!("polled {age} s ago")
+    } else if age < 3600 {
+        format!("polled {} min ago", age / 60)
+    } else {
+        format!("polled {} h ago", age / 3600)
+    };
+    Some(Freshness {
+        label,
+        stale: age > STALE_AFTER_SECS,
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DashboardState {
     connected: bool,
@@ -49,6 +77,15 @@ pub struct SidebarRow {
     pub label: String,
     pub health: EnvironmentHealth,
     pub muted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompareRow {
+    pub id: String,
+    pub label: String,
+    pub build: Option<String>,
+    pub drift: String,
+    pub last_clone: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -276,17 +313,25 @@ impl DashboardState {
         detail_from_payload(&snapshot.payload_json)
     }
 
-    pub fn compare_rows(&self) -> Vec<(String, String, Option<String>)> {
+    pub fn compare_rows(&self) -> Vec<CompareRow> {
         self.environments
             .iter()
-            .map(|environment| {
-                (
-                    environment.id.clone(),
-                    environment.label.clone(),
-                    environment_build(&self.snapshots, &environment.id),
-                )
+            .map(|environment| CompareRow {
+                id: environment.id.clone(),
+                label: environment.label.clone(),
+                build: environment_build(&self.snapshots, &environment.id),
+                drift: self.signal_summary(&environment.id, "drift"),
+                last_clone: self.signal_summary(&environment.id, "last_clone"),
             })
             .collect()
+    }
+
+    fn signal_summary(&self, environment_id: &str, signal_id: &str) -> String {
+        self.snapshots
+            .get(environment_id)
+            .and_then(|map| map.get(signal_id))
+            .map(|snapshot| summarize_payload(signal_id, &snapshot.payload_json))
+            .unwrap_or_default()
     }
 }
 
@@ -521,6 +566,7 @@ fn env(
     EnvironmentSummary {
         id: id.into(),
         label: label.into(),
+        instance_url: format!("https://{id}.example.service-now.com"),
         platform_id: "servicenow".into(),
         health,
         reachability,
@@ -675,5 +721,41 @@ mod tests {
         state.select("test");
         assert_eq!(state.card_detail("outbound"), "HTTP 429");
         assert_eq!(state.card_detail("jobs"), "");
+    }
+
+    #[test]
+    fn freshness_formats_seconds_minutes_hours() {
+        let now_secs = freshness(Some(1000), 1042).unwrap();
+        assert_eq!(now_secs.label, "polled 42 s ago");
+        assert!(!now_secs.stale);
+        assert_eq!(
+            freshness(Some(1000), 1000 + 180).unwrap().label,
+            "polled 3 min ago"
+        );
+        let hours = freshness(Some(1000), 1000 + 7200).unwrap();
+        assert_eq!(hours.label, "polled 2 h ago");
+        assert!(hours.stale);
+    }
+
+    #[test]
+    fn freshness_none_before_first_observation() {
+        assert_eq!(freshness(None, 1000), None);
+    }
+
+    #[test]
+    fn freshness_stale_after_threshold() {
+        assert!(!freshness(Some(0), STALE_AFTER_SECS).unwrap().stale);
+        assert!(freshness(Some(0), STALE_AFTER_SECS + 1).unwrap().stale);
+    }
+
+    #[test]
+    fn compare_rows_include_drift_and_last_clone() {
+        let rows = loaded().compare_rows();
+        let test = rows.iter().find(|row| row.id == "test").unwrap();
+        assert_eq!(test.drift, "3 plugins differ");
+        assert_eq!(test.last_clone, "2026-08-05 09:00:00");
+        let prod = rows.iter().find(|row| row.id == "prod").unwrap();
+        assert_eq!(prod.drift, "source of truth");
+        assert_eq!(prod.last_clone, "");
     }
 }

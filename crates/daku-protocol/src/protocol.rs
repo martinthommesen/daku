@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::settings::DaemonSettings;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "DAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "DAKU_DAEMON_ADDRESS";
@@ -73,6 +73,9 @@ pub enum Reachability {
 pub struct EnvironmentSummary {
     pub id: String,
     pub label: String,
+    /// Instance base URL — non-secret, but "sensitive by default": it travels
+    /// only over the loopback wire and is shown to the Operator, never logged.
+    pub instance_url: String,
     pub platform_id: String,
     pub health: EnvironmentHealth,
     pub reachability: Reachability,
@@ -227,6 +230,7 @@ mod tests {
             environments: vec![EnvironmentSummary {
                 id: "prod".into(),
                 label: "Production".into(),
+                instance_url: "https://prod.example.service-now.com".into(),
                 platform_id: "servicenow".into(),
                 health: EnvironmentHealth::Healthy,
                 reachability: Reachability::Asleep,
@@ -236,6 +240,10 @@ mod tests {
         let json = serde_json::to_value(&message).unwrap();
         assert_eq!(json["type"], "environmentsUpdated");
         assert_eq!(json["environments"][0]["platformId"], "servicenow");
+        assert_eq!(
+            json["environments"][0]["instanceUrl"],
+            "https://prod.example.service-now.com"
+        );
         assert_eq!(json["environments"][0]["health"], "healthy");
         assert_eq!(json["environments"][0]["reachability"], "asleep");
         assert_eq!(json["environments"][0]["lastObservedAt"], 1_700_000_000);
@@ -309,7 +317,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_daku_domain() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]

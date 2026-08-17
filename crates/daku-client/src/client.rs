@@ -301,6 +301,7 @@ mod tests {
             "environments": [{
                 "id": "prod",
                 "label": "Production",
+                "instanceUrl": "https://prod.example.service-now.com",
                 "platformId": "servicenow",
                 "health": "healthy",
                 "reachability": "asleep",

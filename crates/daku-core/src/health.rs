@@ -75,6 +75,7 @@ pub fn publish_dashboard(
         summaries.push(EnvironmentSummary {
             id: environment.id.clone(),
             label: environment.label.clone(),
+            instance_url: environment.instance_url.clone(),
             platform_id: SERVICENOW_PLATFORM_ID.into(),
             health: health_rollup(reachability, &votes),
             reachability,
@@ -331,6 +332,7 @@ mod tests {
         assert_ne!(environments[0].health, EnvironmentHealth::Degraded);
         assert_eq!(environments[0].reachability, Reachability::Asleep);
         assert_eq!(environments[0].platform_id, SERVICENOW_PLATFORM_ID);
+        assert_eq!(environments[0].instance_url, prod().instance_url);
         assert_eq!(environments[0].last_observed_at, Some(now));
 
         let snapshots = snapshots.expect("SignalSnapshotsUpdated");

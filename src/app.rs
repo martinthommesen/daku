@@ -8,7 +8,8 @@ use gpui::{
 };
 
 use crate::dashboard_state::{
-    DashboardState, SidebarRow, SignalCard, fixture_events, signal_label, ui_fixture_enabled,
+    CompareRow, DashboardState, SidebarRow, SignalCard, fixture_events, freshness, signal_label,
+    ui_fixture_enabled,
 };
 use crate::theme::Theme;
 use crate::{CloseWindow, ToggleFpsCounter};
@@ -37,6 +38,7 @@ impl Daku {
             } else if let Some(supervisor) = supervisor.as_ref() {
                 listen_dashboard(supervisor, cx);
             }
+            tick_freshness(cx);
             Self {
                 state,
                 _supervisor: supervisor,
@@ -44,6 +46,29 @@ impl Daku {
             }
         })
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Renders only happen on `cx.notify()`, so a stalled daemon would freeze the
+/// "polled … ago" label; re-render on a slow tick instead.
+fn tick_freshness(cx: &mut Context<Daku>) {
+    cx.spawn(async move |this, cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(30))
+                .await;
+            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
 }
 
 fn listen_dashboard(supervisor: &DaemonSupervisor, cx: &mut Context<Daku>) {
@@ -213,6 +238,36 @@ impl Daku {
                                     .gap(px(8.0))
                                     .child(health_badge(environment.health, theme))
                                     .child(reachability_badge(environment.reachability, theme)),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(6.0))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_tertiary)
+                                    .child(
+                                        environment
+                                            .instance_url
+                                            .trim_start_matches("https://")
+                                            .to_owned(),
+                                    )
+                                    .when_some(
+                                        freshness(environment.last_observed_at, unix_now()),
+                                        |element, fresh| {
+                                            element.child("\u{b7}").child(
+                                                div()
+                                                    .text_color(if fresh.stale {
+                                                        theme.warning
+                                                    } else {
+                                                        theme.text_tertiary
+                                                    })
+                                                    .child(fresh.label),
+                                            )
+                                        },
+                                    ),
                             ),
                     )
                     .child(
@@ -427,7 +482,7 @@ fn health_color(health: EnvironmentHealth, theme: &Theme) -> gpui::Hsla {
 fn compare_strip(
     has_mismatch: bool,
     selected_id: &str,
-    rows: &[(String, String, Option<String>)],
+    rows: &[CompareRow],
     theme: &Theme,
 ) -> impl IntoElement {
     div()
@@ -452,11 +507,11 @@ fn compare_strip(
                 .flex_wrap()
                 .gap(px(16.0))
                 .text_color(theme.text_secondary)
-                .children(rows.iter().filter(|(id, _, _)| id != selected_id).map(
-                    |(_, label, build)| {
-                        div().child(format!("{label}: {}", build.as_deref().unwrap_or("—")))
-                    },
-                )),
+                .children(
+                    rows.iter()
+                        .filter(|row| row.id != selected_id)
+                        .map(|row| div().child(compare_row_text(row))),
+                ),
         )
         .when(has_mismatch, |element| {
             element.child(
@@ -467,6 +522,21 @@ fn compare_strip(
                     .child("build / drift mismatch"),
             )
         })
+}
+
+fn compare_row_text(row: &CompareRow) -> String {
+    let mut text = format!(
+        "{}: {}",
+        row.label,
+        row.build.as_deref().unwrap_or("\u{2014}")
+    );
+    if !row.drift.is_empty() {
+        text.push_str(&format!(" \u{b7} drift {}", row.drift));
+    }
+    if !row.last_clone.is_empty() {
+        text.push_str(&format!(" \u{b7} clone {}", row.last_clone));
+    }
+    text
 }
 
 fn sparkline(points: &[f64], color: gpui::Hsla) -> impl IntoElement {
