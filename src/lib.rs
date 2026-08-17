@@ -44,56 +44,6 @@ const DEFAULT_WINDOW_WIDTH: f32 = 1380.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 880.0;
 const MIN_WINDOW_WIDTH: f32 = 980.0;
 const MIN_WINDOW_HEIGHT: f32 = 680.0;
-const TITLEBAR_GRAB_WIDTH: f32 = 160.0;
-const TITLEBAR_GRAB_HEIGHT: f32 = 22.0;
-
-fn restored_window_placement(cx: &App) -> (WindowBounds, Option<gpui::DisplayId>) {
-    let centered = |cx: &App| {
-        (
-            WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
-                cx,
-            )),
-            None,
-        )
-    };
-    let Some(saved) = crate::persistence::load_window_state().filter(|saved| {
-        [saved.x, saved.y, saved.width, saved.height]
-            .iter()
-            .all(|value| value.is_finite())
-    }) else {
-        return centered(cx);
-    };
-    let display = saved.display.and_then(|uuid| {
-        cx.displays()
-            .into_iter()
-            .find(|display| display.uuid().ok() == Some(uuid))
-    });
-    let display_id = display.as_ref().map(|display| display.id());
-    let Some(anchor) = display.or_else(|| cx.primary_display()) else {
-        return centered(cx);
-    };
-    let anchor_size = anchor.bounds().size;
-    let width = saved.width.max(MIN_WINDOW_WIDTH);
-    let height = saved.height.max(MIN_WINDOW_HEIGHT);
-    let x = saved.x.clamp(
-        TITLEBAR_GRAB_WIDTH - width,
-        (f32::from(anchor_size.width) - TITLEBAR_GRAB_WIDTH).max(0.0),
-    );
-    let y = saved.y.clamp(
-        0.0,
-        (f32::from(anchor_size.height) - TITLEBAR_GRAB_HEIGHT).max(0.0),
-    );
-    let bounds = Bounds::new(point(px(x), px(y)), size(px(width), px(height)));
-    let window_bounds = if saved.maximized {
-        WindowBounds::Maximized(bounds)
-    } else {
-        WindowBounds::Windowed(bounds)
-    };
-    (window_bounds, display_id)
-}
-
 trait DakuApplicationExt {
     fn with_main_window_reopen(self) -> Self;
 }
@@ -148,7 +98,11 @@ pub fn run() {
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
 
-            let (window_bounds, display_id) = restored_window_placement(cx);
+            let window_bounds = WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+                cx,
+            ));
             let window = cx
                 .open_window(
                     WindowOptions {
@@ -167,7 +121,7 @@ pub fn run() {
                         },
                         app_id: Some(APP_ID.to_owned()),
                         window_bounds: Some(window_bounds),
-                        display_id,
+                        display_id: None,
                         window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
                         ..Default::default()
                     },

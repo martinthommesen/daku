@@ -9,8 +9,8 @@ binary calls `serve` with `HollowBackend`.
 
 Configuration ownership:
 
-- desktop owns `~/.daku/app.json` in Release and checkout-local `temp/app.json` in Debug
-- daemon owns `~/.daku/settings.json`
+- desktop owns `~/.daku/app.json` (Release) / checkout-local `temp/app.json` (Debug): `daemon_exposure` only
+- daemon owns `~/.daku/settings.json`: `poll_interval_secs` (read at start)
 
 ## Migrations
 

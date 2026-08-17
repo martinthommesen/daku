@@ -15,10 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::DaemonClient;
-use daku_protocol::{
-    APP_EXECUTABLE_ENV, Command, DAEMON_TOKEN_ENV, DaemonReady, DaemonSettings, PROTOCOL_VERSION,
-    ResponsePayload,
-};
+use daku_protocol::{APP_EXECUTABLE_ENV, DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION};
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -325,9 +322,6 @@ struct SupervisorInner {
     target: Mutex<DaemonTarget>,
     exposure: Mutex<Option<DaemonExposureSettings>>,
     restart: Mutex<()>,
-    settings: Mutex<DaemonSettings>,
-    persisted_settings: Mutex<Option<DaemonSettings>>,
-    settings_updates: Sender<DaemonSettings>,
     client_updates: Mutex<Vec<Sender<DaemonClient>>>,
     running: AtomicBool,
 }
@@ -371,13 +365,11 @@ impl DaemonSupervisor {
     ) -> anyhow::Result<Self> {
         let exposure = exposure.validate()?;
         let process = DaemonProcess::spawn_configured(executable, exposure.clone())?;
-        let settings = read_settings(&process.client())?;
         let initial_stamp = ExecutableStamp::read(executable)?;
         let supervisor = Self::from_target(
             DaemonTarget::Local(process),
             Some(executable.to_owned()),
             Some(exposure),
-            settings,
         )?;
         let weak_inner = Arc::downgrade(&supervisor.inner);
         std::thread::Builder::new()
@@ -391,36 +383,24 @@ impl DaemonSupervisor {
     /// service manager). Dropping the desktop never shuts this daemon down.
     pub fn connect(address: &str, token: String) -> anyhow::Result<Self> {
         let client = DaemonClient::connect(address, token)?;
-        let settings = read_settings(&client)?;
-        Self::from_target(DaemonTarget::Remote(client), None, None, settings)
+        Self::from_target(DaemonTarget::Remote(client), None, None)
     }
 
     fn from_target(
         target: DaemonTarget,
         executable: Option<PathBuf>,
         exposure: Option<DaemonExposureSettings>,
-        settings: DaemonSettings,
     ) -> anyhow::Result<Self> {
-        let (settings_updates, settings_update_rx) = unbounded();
-        let inner = Arc::new(SupervisorInner {
-            executable,
-            target: Mutex::new(target),
-            exposure: Mutex::new(exposure),
-            restart: Mutex::new(()),
-            settings: Mutex::new(settings),
-            // The desktop sends one normalized snapshot after it has migrated
-            // the legacy combined settings document into app.json.
-            persisted_settings: Mutex::new(None),
-            settings_updates,
-            client_updates: Mutex::new(Vec::new()),
-            running: AtomicBool::new(true),
-        });
-        let weak_inner = Arc::downgrade(&inner);
-        std::thread::Builder::new()
-            .name("daku-daemon-settings".into())
-            .spawn(move || persist_settings(weak_inner, settings_update_rx))
-            .context("could not start daku daemon settings writer")?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: Arc::new(SupervisorInner {
+                executable,
+                target: Mutex::new(target),
+                exposure: Mutex::new(exposure),
+                restart: Mutex::new(()),
+                client_updates: Mutex::new(Vec::new()),
+                running: AtomicBool::new(true),
+            }),
+        })
     }
 
     pub fn client(&self) -> DaemonClient {
@@ -438,64 +418,6 @@ impl DaemonSupervisor {
         self.inner.client_updates.lock().push(updates.clone());
         let _ = updates.send(target.client());
         receiver
-    }
-
-    pub fn is_remote(&self) -> bool {
-        self.inner.executable.is_none()
-    }
-
-    pub fn settings(&self) -> DaemonSettings {
-        self.inner.settings.lock().clone()
-    }
-
-    /// Restart only the desktop-managed daemon with a new listener policy.
-    /// The caller should run this off the UI thread.
-    pub fn reconfigure(&self, exposure: DaemonExposureSettings) -> anyhow::Result<()> {
-        let exposure = exposure.validate()?;
-        let executable = self
-            .inner
-            .executable
-            .as_ref()
-            .context("the connected daemon is managed outside daku Desktop")?
-            .clone();
-        let _restart = self.inner.restart.lock();
-        let previous = self
-            .inner
-            .exposure
-            .lock()
-            .clone()
-            .context("managed daemon launch settings are unavailable")?;
-        match replace_local_daemon(&self.inner, &executable, &exposure) {
-            Ok(()) => {
-                *self.inner.exposure.lock() = Some(exposure);
-                queue_settings_refresh(&self.inner);
-                Ok(())
-            }
-            Err(error) => {
-                let restore = replace_local_daemon(&self.inner, &executable, &previous);
-                if restore.is_ok() {
-                    queue_settings_refresh(&self.inner);
-                    Err(error)
-                } else {
-                    Err(error.context(format!(
-                        "the previous daemon configuration also failed to restart: {:#}",
-                        restore.unwrap_err()
-                    )))
-                }
-            }
-        }
-    }
-
-    /// Queue a daemon settings update without blocking the desktop UI thread.
-    pub fn update_settings(&self, settings: DaemonSettings) -> anyhow::Result<()> {
-        *self.inner.settings.lock() = settings.clone();
-        if self.inner.persisted_settings.lock().as_ref() == Some(&settings) {
-            return Ok(());
-        }
-        self.inner
-            .settings_updates
-            .send(settings)
-            .map_err(|_| anyhow::anyhow!("daku daemon settings writer is closed"))
     }
 }
 
@@ -545,7 +467,6 @@ fn monitor_daemon(
                 continue;
             }
         }
-        queue_settings_refresh(&inner);
         if let Some(observed_stamp) = observed_stamp {
             active_stamp = observed_stamp;
         }
@@ -588,64 +509,6 @@ fn replace_local_daemon(
         .lock()
         .retain(|subscriber| subscriber.send(client.clone()).is_ok());
     Ok(())
-}
-
-fn queue_settings_refresh(inner: &SupervisorInner) {
-    let settings = inner.settings.lock().clone();
-    *inner.persisted_settings.lock() = None;
-    let _ = inner.settings_updates.send(settings);
-}
-
-fn read_settings(client: &DaemonClient) -> anyhow::Result<DaemonSettings> {
-    match client.request(Uuid::nil(), Uuid::nil(), Command::GetSettings)? {
-        ResponsePayload::Settings { settings } => Ok(settings),
-        _ => bail!("daku daemon returned an invalid settings response"),
-    }
-}
-
-fn persist_settings(
-    weak_inner: std::sync::Weak<SupervisorInner>,
-    updates: Receiver<DaemonSettings>,
-) {
-    while let Ok(mut settings) = updates.recv() {
-        while let Ok(newer) = updates.try_recv() {
-            settings = newer;
-        }
-        loop {
-            let Some(inner) = weak_inner.upgrade() else {
-                return;
-            };
-            if !inner.running.load(Ordering::Acquire) {
-                return;
-            }
-            let desired = inner.settings.lock().clone();
-            if desired != settings {
-                settings = desired;
-            }
-            let client = inner.target.lock().client();
-            let result = client.request(
-                Uuid::nil(),
-                Uuid::nil(),
-                Command::UpdateSettings {
-                    settings: settings.clone(),
-                },
-            );
-            match result {
-                Ok(ResponsePayload::Ack) => {
-                    *inner.persisted_settings.lock() = Some(settings);
-                    break;
-                }
-                Ok(_) => {
-                    eprintln!("daku daemon returned an invalid settings update response");
-                }
-                Err(error) => {
-                    eprintln!("could not persist daku daemon settings: {error:#}");
-                }
-            }
-            drop(inner);
-            std::thread::sleep(REBUILD_POLL_INTERVAL);
-        }
-    }
 }
 
 #[cfg(test)]
