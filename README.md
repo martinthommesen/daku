@@ -10,11 +10,12 @@ This tree is a **partial fork** of [egoist/waku](https://github.com/egoist/waku)
 
 ## Toolchain
 
-| Tool | Version |
-|------|---------|
-| Rust | **≥ 1.96** (edition 2024) |
-| Bun | current (schema / `scripts/dev.ts`) |
-| Xcode / clang | macOS builds |
+| Tool | Version / note |
+|------|----------------|
+| Rust | **≥ 1.96** (edition 2024; `rust-version` in `Cargo.toml`) |
+| Xcode + Command Line Tools | macOS builds |
+| Metal toolchain | GPUI compiles shaders with `xcrun metal`. On Xcode 26+ install it once: `xcodebuild -downloadComponent MetalToolchain`; check with `xcrun -f metal`. |
+| Bun | only for `scripts/dev.ts`, `bun run check`, `bun run release`, `bun run lint`, `bun run db:generate` — **not** needed for `cargo` builds |
 
 Release builds keep line-table debuginfo in a separate `.dSYM`
 (`split-debuginfo = "packed"`); the shipped binaries are stripped.
@@ -22,9 +23,13 @@ Release builds keep line-table debuginfo in a separate `.dSYM`
 ## Build
 
 ```sh
-bun install
-cargo check -p daku -p daku-core -p daku-daemon -p daku-protocol -p daku-client
+cargo check --workspace
+bun install  # optional: Bun scripts / lint
 ```
+
+The first `cargo` build clones the pinned zed repository for GPUI (~0.5 GB,
+several minutes); later builds reuse it. `bun install` is only needed for the
+Bun scripts.
 
 GPUI is pinned by `rev` in `Cargo.toml` (both `gpui` and `gpui_platform`); bump both together and run `bun run check`. Do not run `cargo update` casually — it re-resolves every zed crate.
 
@@ -72,6 +77,34 @@ Dev watcher (macOS Debug.app):
 ```sh
 bun run dev
 ```
+
+`DAKU_UI_FIXTURE=1 bun run dev` renders fixture data without ServiceNow;
+`DAKU_DB_PATH=/tmp/daku-dev.db` keeps a dev daemon's SQLite away from
+`~/.daku/app.db` (the dev Debug.app otherwise polls the same Environments as an
+installed Daku.app).
+
+## Environment variables
+
+Runtime and dev variables. See [`docs/packaging.md`](docs/packaging.md) for
+release-time variables.
+
+| Variable | Read by | Effect |
+|----------|---------|--------|
+| `DAKU_DAEMON_TOKEN` | daemon (`crates/daku-daemon`), app when attaching | Hello bearer token. The daemon refuses to start with an empty value. |
+| `DAKU_DAEMON_ADDRESS` | app (`src/daemon.rs`) | `host:port` or `ws://` URL of a daemon you run yourself; attach instead of spawning. Must be set together with `DAKU_DAEMON_TOKEN`. |
+| `DAKU_DAEMON_PATH` | app (`src/daemon.rs`), set by `scripts/dev.ts` | Path to the `daku-daemon` binary the app spawns. |
+| `DAKU_APP_EXECUTABLE` | set by the app for its daemon child (`crates/daku-client`) | Internal — not for Operators. |
+| `DAKU_DB_PATH` | `crates/daku-core` persistence | SQLite path override (default `~/.daku/app.db`). |
+| `DAKU_UI_FIXTURE` | app (`src/dashboard_state.rs`) | `=1` loads fixture dashboard events; no ServiceNow calls. |
+| `DAKU_CHANNEL` | app (`src/updater.rs`) | `homebrew` disables Sparkle at runtime. |
+| `DAKU_FORCE_UPDATER` | app (`src/updater.rs`, debug builds) | `=1` runs the real Sparkle flow from a debug bundle. |
+| `HOSTNAME` | app (`src/daemon.rs`) | Fallback host name for the LAN URL shown in Settings when `gethostname` fails. |
+| `CARGO_TARGET_DIR` | `scripts/dev.ts`, `scripts/delete-debug-app.ts` | Cargo's target directory, when it is not `target/`. |
+
+Daemon stderr: `~/.daku/daemon.log`.
+
+Secrets never go in env files — Credentials live in the macOS Keychain (service
+`daku`); there is deliberately no `.env.example`.
 
 ## Packaging
 

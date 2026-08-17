@@ -51,6 +51,19 @@ artifact with `DAKU_CHANNEL=homebrew` (passes `--features channel-homebrew`,
 skips embedding Sparkle, writes `dist/Daku-x.y.z-homebrew.dmg`). Runtime
 `DAKU_CHANNEL=homebrew` also no-ops a Sparkle-enabled binary.
 
+## Release-time environment variables
+
+| Variable | Read by | Effect |
+|----------|---------|--------|
+| `DAKU_SKIP_CARGO_BUILD` | `scripts/bundle.sh`, `scripts/release.ts` | `=1` reuses the existing `target/release` binaries. |
+| `SKIP_CODESIGN` | `scripts/bundle.sh` | `=1` is the same as `--unsigned`. |
+| `DAKU_CODESIGN_IDENTITY` | `scripts/bundle.sh`, `scripts/release.ts` | Developer ID Application identity — **local keychain / release secrets only, never commit**. |
+| `DAKU_NOTARY_PROFILE` | `scripts/release.ts` | notarytool keychain profile **name** (default `NOTARY`). |
+| `DAKU_DOWNLOAD_URL_PREFIX` | `scripts/appcast.ts`, `scripts/release.ts` | Base URL for appcast enclosure links. |
+| `SPARKLE_BIN` | `scripts/appcast.ts`, `scripts/release.ts` | Directory holding the Sparkle tools (`generate_appcast`). |
+| `SPARKLE_PRIVATE_KEY` | `scripts/appcast.ts` | EdDSA appcast signing key — **release secrets / keychain only, never commit**. |
+| `DAKU_CHANNEL` | `scripts/bundle.sh`, `homebrew/daku.rb` | `homebrew` builds the cask artifact with Sparkle left out. |
+
 ## Homebrew cask (alternate)
 
 Draft: [`homebrew/daku.rb`](../homebrew/daku.rb). `auto_updates false`.
