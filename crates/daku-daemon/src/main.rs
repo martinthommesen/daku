@@ -48,20 +48,26 @@ fn main() -> anyhow::Result<()> {
             })?;
     }
 
-    let task_path = daku_core::persistence::StateStore::default_path();
-    let settings = daku_core::DaemonSettingsStore::open(daku_core::DaemonSettings::default_path())
-        .context("could not load daemon settings")?;
-    let task_store = daku_core::persistence::StateStore::daemon(task_path.clone());
+    let store = daku_core::persistence::StateStore::daemon(
+        daku_core::persistence::StateStore::default_path(),
+    );
+    // Migrate once at startup so an unwritable database fails fast.
+    store
+        .open()
+        .with_context(|| format!("could not open {}", store.path().display()))?;
+    let settings =
+        daku_core::DaemonSettingsStore::open(daku_core::DaemonSettingsStore::default_path())
+            .context("could not load daemon settings")?;
     let dashboard_events = daku_core::start_default_loop(
         &daku_core::default_environments_path(),
-        daku_core::persistence::StateStore::daemon(task_path),
+        store,
         &settings.get(),
         shutdown.clone(),
     );
     daku_core::serve(
         listener,
         auth,
-        Arc::new(daku_core::HollowBackend::new(settings, task_store)?),
+        Arc::new(daku_core::SettingsBackend::new(settings)),
         shutdown,
         daku_core::ServerOptions {
             allowed_origins: arguments.allowed_origins.into_iter().collect(),
@@ -81,9 +87,10 @@ fn run_probe_availability() -> anyhow::Result<()> {
 }
 
 fn run_doctor_command() -> anyhow::Result<()> {
-    let settings = daku_core::DaemonSettingsStore::open(daku_core::DaemonSettings::default_path())
-        .context("could not load daemon settings")?
-        .get();
+    let settings =
+        daku_core::DaemonSettingsStore::open(daku_core::DaemonSettingsStore::default_path())
+            .context("could not load daemon settings")?
+            .get();
     let environments_path = daku_core::default_environments_path();
     let report = daku_core::run_doctor(
         &environments_path,

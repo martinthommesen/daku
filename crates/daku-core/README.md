@@ -5,7 +5,8 @@ ServiceNow HTTP/OAuth client (429 / `Retry-After`), and the shared `CollectorLoo
 Depends on [`daku-protocol`](../daku-protocol); no desktop transport or UI.
 
 `DaemonClient` lives in [`daku-client`](../daku-client). The `daku-daemon`
-binary calls `serve` with `HollowBackend`.
+binary calls `serve` with `SettingsBackend` (settings RPC); Signal data is
+broadcast by the `CollectorLoop`.
 
 Configuration ownership:
 

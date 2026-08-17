@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use anyhow::{Context as _, anyhow, bail};
 
 pub fn start_process() -> anyhow::Result<daku_client::DaemonSupervisor> {
-    let address = std::env::var(daku_client::DAEMON_ADDRESS_ENV)
+    let address = std::env::var(daku_protocol::DAEMON_ADDRESS_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let auth = std::env::var(daku_client::DAEMON_TOKEN_ENV)
+    let auth = std::env::var(daku_protocol::DAEMON_TOKEN_ENV)
         .ok()
         .filter(|value| !value.is_empty());
     match (address, auth) {
@@ -17,13 +17,13 @@ pub fn start_process() -> anyhow::Result<daku_client::DaemonSupervisor> {
         }
         (Some(_), None) => bail!(
             "{} is set but {} is missing",
-            daku_client::DAEMON_ADDRESS_ENV,
-            daku_client::DAEMON_TOKEN_ENV
+            daku_protocol::DAEMON_ADDRESS_ENV,
+            daku_protocol::DAEMON_TOKEN_ENV
         ),
         (None, Some(_)) => bail!(
             "{} is set but {} is missing",
-            daku_client::DAEMON_TOKEN_ENV,
-            daku_client::DAEMON_ADDRESS_ENV
+            daku_protocol::DAEMON_TOKEN_ENV,
+            daku_protocol::DAEMON_ADDRESS_ENV
         ),
         (None, None) => {}
     }

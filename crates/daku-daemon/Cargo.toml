@@ -2,7 +2,7 @@
 name = "daku-daemon"
 version = "0.1.0"
 edition = "2024"
-description = "Headless daku provider daemon"
+description = "daku daemon: polls ServiceNow Environments and serves the desktop client"
 license = "GPL-3.0-only"
 readme = "README.md"
 default-run = "daku-daemon"

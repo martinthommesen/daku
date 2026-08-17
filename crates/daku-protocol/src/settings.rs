@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 120;
@@ -18,14 +16,5 @@ impl Default for DaemonSettings {
         Self {
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
         }
-    }
-}
-
-impl DaemonSettings {
-    pub fn default_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join(".daku")
-            .join("settings.json")
     }
 }

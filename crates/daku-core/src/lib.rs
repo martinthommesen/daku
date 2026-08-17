@@ -5,7 +5,6 @@ pub mod collector;
 pub mod config;
 pub mod drift;
 pub mod health;
-pub mod hollow_backend;
 pub mod jobs;
 pub mod last_clone;
 pub mod mid_ecc;
@@ -13,6 +12,7 @@ pub mod outbound;
 pub mod persistence;
 pub mod servicenow;
 pub mod settings;
+pub mod settings_backend;
 pub mod syslog;
 
 mod server;
@@ -30,6 +30,6 @@ pub use daku_protocol::{
     Request, ResponseOutcome, ResponsePayload, RpcError, SamplePoint, ServerMessage,
     SignalSnapshotDto,
 };
-pub use hollow_backend::HollowBackend;
 pub use server::{Backend, ServerOptions, serve};
 pub use settings::{DaemonSettings, DaemonSettingsStore};
+pub use settings_backend::SettingsBackend;

@@ -132,16 +132,12 @@ pub fn parse_allowed_origins(text: &str) -> anyhow::Result<Vec<String>> {
     Ok(origins)
 }
 
-pub struct DaemonProcess {
+pub(crate) struct DaemonProcess {
     client: DaemonClient,
     child: Child,
 }
 
 impl DaemonProcess {
-    pub fn spawn(executable: &Path) -> anyhow::Result<Self> {
-        Self::spawn_configured(executable, DaemonExposureSettings::default())
-    }
-
     fn spawn_configured(
         executable: &Path,
         settings: DaemonExposureSettings,

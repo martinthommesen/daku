@@ -2,7 +2,7 @@
 name = "daku-core"
 version = "0.1.0"
 edition = "2024"
-description = "Headless provider, persistence, and workspace runtime for daku"
+description = "Daemon runtime for daku: WebSocket hub, SQLite snapshots, ServiceNow collectors"
 license = "GPL-3.0-only"
 readme = "README.md"
 
