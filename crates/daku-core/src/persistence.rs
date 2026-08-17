@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 
 use daku_protocol::SignalState;
 use daku_protocol::identity::DATA_DIRECTORY_NAME;
@@ -54,7 +54,22 @@ pub fn apply_migrations(connection: &Connection) -> io::Result<usize> {
         if already_applied {
             continue;
         }
-        let transaction = connection.unchecked_transaction().map_err(to_io_error)?;
+        // Collector threads each open their own connection; IMMEDIATE takes
+        // the write lock before the re-check, so a concurrent opener either
+        // applies the migration or sees it applied — never both.
+        let transaction =
+            rusqlite::Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+                .map_err(to_io_error)?;
+        let already_applied: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM migrations WHERE substr(tag, 1, ?1) = ?2)",
+                params![prefix.len() as i64, prefix],
+                |row| row.get(0),
+            )
+            .map_err(to_io_error)?;
+        if already_applied {
+            continue;
+        }
         transaction
             .execute_batch(sql)
             .map_err(|error| io::Error::other(format!("migration {tag} failed: {error}")))?;
@@ -134,15 +149,20 @@ impl StateStore {
     }
 
     pub fn open(&self) -> io::Result<Connection> {
+        // Collector threads open concurrently (plan 022); `PRAGMA journal_mode
+        // = WAL` on a fresh file returns SQLITE_BUSY under contention even with
+        // a busy handler, so serialise opens within the process.
+        static OPEN_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _guard = OPEN_LOCK.lock();
         ensure_daku_dir(&self.path)?;
         let connection = Connection::open(&self.path).map_err(to_io_error)?;
-        connection
-            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
-            .map_err(to_io_error)?;
         // One connection per collector thread: wait for a writer instead of
         // failing straight away with SQLITE_BUSY.
         connection
             .busy_timeout(Duration::from_secs(5))
+            .map_err(to_io_error)?;
+        connection
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
             .map_err(to_io_error)?;
         apply_migrations(&connection)?;
         // WAL may recreate sidecar modes; re-assert the main db file mode.
@@ -398,6 +418,27 @@ mod tests {
             .unwrap();
         assert_eq!(apply_migrations(&connection).unwrap(), 0);
         assert!(table_exists(&connection, "signal_snapshots"));
+    }
+
+    #[test]
+    fn apply_migrations_is_safe_under_concurrent_openers() {
+        // Two collector threads opening a fresh DB at once (plan 022) must not
+        // both try to create the tables.
+        let db = TempDb::new("concurrent");
+        let store = db.store();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| store.open().map(|_| ())))
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+        let connection = Connection::open(db.path()).unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM migrations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows as usize, MIGRATIONS.len());
     }
 
     #[test]
