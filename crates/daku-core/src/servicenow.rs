@@ -310,42 +310,62 @@ pub struct UreqTransport {
 
 impl Default for UreqTransport {
     fn default() -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(30))
+        // Platform verifier = macOS Keychain roots, so Environments behind
+        // corporate TLS interception / private CAs work like the WS client.
+        // `redirect_auth_headers` stays at ureq's default `Never`.
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                    .build(),
+            )
             .build();
-        Self { agent }
+        Self {
+            agent: ureq::Agent::new_with_config(config),
+        }
     }
 }
 
 impl HttpTransport for UreqTransport {
     fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
-        let mut call = match request.method.as_str() {
-            "GET" => self.agent.get(&request.url),
-            "POST" => self.agent.post(&request.url),
+        let response = match request.method.as_str() {
+            "GET" => {
+                let mut call = self.agent.get(&request.url);
+                for (name, value) in &request.headers {
+                    call = call.header(name.as_str(), value.as_str());
+                }
+                call.call()
+            }
+            "POST" => {
+                let mut call = self.agent.post(&request.url);
+                for (name, value) in &request.headers {
+                    call = call.header(name.as_str(), value.as_str());
+                }
+                call.send(request.body.as_deref().unwrap_or(""))
+            }
             other => return Err(anyhow!("unsupported HTTP method {other}")),
         };
-        for (name, value) in &request.headers {
-            call = call.set(name, value);
-        }
-        let response = match &request.body {
-            Some(body) => call.send_string(body),
-            None => call.call(),
-        };
-        match response {
-            Ok(response) | Err(ureq::Error::Status(_, response)) => read_ureq_response(response),
-            Err(error) => Err(error.into()),
-        }
+        read_ureq_response(response?)
     }
 }
 
-fn read_ureq_response(response: ureq::Response) -> anyhow::Result<HttpResponse> {
-    let status = response.status();
+fn read_ureq_response(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> anyhow::Result<HttpResponse> {
+    let status = response.status().as_u16();
     let headers = response
-        .headers_names()
-        .into_iter()
-        .filter_map(|name| response.header(&name).map(|value| (name, value.to_owned())))
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
+        })
         .collect();
-    let body = response.into_string().context("reading HTTP body")?;
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .context("reading HTTP body")?;
     Ok(HttpResponse {
         status,
         headers,
