@@ -617,7 +617,10 @@ fn compare_strip(
         )
         .child(Separator::horizontal().color(cx.theme().border))
         .children(rows.iter().map(|row| {
-            let mismatch = selected_build.is_some() && row.build != selected_build;
+            let mismatch = matches!(
+                (&row.build, &selected_build),
+                (Some(build), Some(selected)) if build != selected
+            );
             compare_row_cells([
                 row.label.clone(),
                 row.build.clone().unwrap_or_else(|| "\u{2014}".to_owned()),

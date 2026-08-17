@@ -678,6 +678,8 @@ fn detail_from_payload(payload_json: &str) -> String {
             "asleep" => "Environment asleep".to_owned(),
             "unreachable" => "Environment unreachable".to_owned(),
             "need_two_environments" => "needs two Environments".to_owned(),
+            "no_clone_source" => "no clone source configured".to_owned(),
+            "clone_source_cannot_list_clones" => "clone source cannot list clones".to_owned(),
             other => other.to_owned(),
         };
     }

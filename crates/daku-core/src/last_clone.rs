@@ -134,15 +134,26 @@ impl LastCloneCollector {
 
 impl SignalCollector for LastCloneCollector {
     fn collect(&self) -> anyhow::Result<()> {
+        let connection = self.store.open()?;
+        let observed_at = unix_now();
         let Some(source) = self
             .environments
             .iter()
             .find(|environment| environment.clone_source)
         else {
+            // Without a clone source the card would sit on "Waiting" forever
+            // (and its Skeleton would animate forever); say why instead.
+            for environment in &self.environments {
+                persistence::persist_signal_skipped(
+                    &connection,
+                    &environment.id,
+                    LAST_CLONE_SIGNAL_ID,
+                    observed_at,
+                    "no_clone_source",
+                )?;
+            }
             return Ok(());
         };
-        let connection = self.store.open()?;
-        let observed_at = unix_now();
         let response = match self.client.request(
             source,
             self.credentials.as_ref(),
@@ -173,8 +184,21 @@ impl SignalCollector for LastCloneCollector {
         let rows = parse_last_clones(response.status, &response.body);
         persist_clone_source(&connection, &source.id, rows.is_some(), observed_at)?;
         // 403: the source cannot list clones, so nothing is known about the
-        // targets — leave their snapshots alone rather than claiming "never".
+        // targets — record that rather than claiming "never" or waiting forever.
         let Some(rows) = rows else {
+            for environment in self
+                .environments
+                .iter()
+                .filter(|environment| environment.id != source.id)
+            {
+                persistence::persist_signal_skipped(
+                    &connection,
+                    &environment.id,
+                    LAST_CLONE_SIGNAL_ID,
+                    observed_at,
+                    "clone_source_cannot_list_clones",
+                )?;
+            }
             return Ok(());
         };
         for environment in self
@@ -460,13 +484,42 @@ mod tests {
         let prod = payload(&store, "prod");
         assert_eq!(prod["supported"], false);
         assert!(prod.get("reachability").is_none());
-        // Nothing is known about the targets, so they keep no snapshot.
+        // Nothing is known about the targets: say so instead of leaving the
+        // card on "Waiting" forever.
         let connection = store.open().unwrap();
+        let test = persistence::load_signal_snapshot(&connection, "test", LAST_CLONE_SIGNAL_ID)
+            .unwrap()
+            .expect("skipped snapshot");
+        assert_eq!(test.state, "skipped");
         assert!(
-            persistence::load_signal_snapshot(&connection, "test", LAST_CLONE_SIGNAL_ID)
-                .unwrap()
-                .is_none()
+            test.payload_json
+                .contains("clone_source_cannot_list_clones")
         );
+    }
+
+    #[test]
+    fn last_clone_signal_without_clone_source_is_skipped_everywhere() {
+        let db = TempDb::new("last-clone-no-source");
+        let store = db.store();
+        let collector = LastCloneCollector::new(
+            vec![env("pdi", "acme-pdi", false)],
+            Arc::new(MemoryCredentialStore::default()),
+            ServiceNowClient::new(
+                LastCloneTransport {
+                    status: 200,
+                    body: "{}",
+                },
+                SystemClock,
+            ),
+            store,
+        );
+        collector.collect().unwrap();
+        let connection = db.store().open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, "pdi", LAST_CLONE_SIGNAL_ID)
+            .unwrap()
+            .expect("skipped snapshot");
+        assert_eq!(row.state, "skipped");
+        assert!(row.payload_json.contains("no_clone_source"));
     }
 
     #[test]
