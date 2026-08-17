@@ -306,6 +306,11 @@ impl Daku {
     fn signal_card(&self, card: SignalCard, theme: &Theme) -> impl IntoElement {
         let summary = self.state.card_summary(card.signal_id);
         let detail = self.state.card_detail(card.signal_id);
+        let mismatch_lines = if card.signal_id == "drift" {
+            self.state.drift_mismatch_lines(5)
+        } else {
+            Vec::new()
+        };
         let waiting = card.status == crate::dashboard_state::WAITING;
         div()
             .id(SharedString::from(format!("card-{}", card.signal_id)))
@@ -341,6 +346,15 @@ impl Daku {
                         .text_size(px(11.0))
                         .text_color(theme.text_tertiary)
                         .child(detail),
+                )
+            })
+            .when(!mismatch_lines.is_empty(), |element| {
+                element.child(
+                    div()
+                        .mt(px(4.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.text_secondary)
+                        .children(mismatch_lines.into_iter().map(|line| div().child(line))),
                 )
             })
             .when(card.sparkline.len() >= 2, |element| {

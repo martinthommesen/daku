@@ -338,12 +338,15 @@ fn persist_drift_compare(
     other: &EnvInventory,
     observed_at: i64,
 ) -> io::Result<()> {
-    let mismatches = diff_plugin_inventory(&source.plugins, &other.plugins);
+    let mismatch_list = diff_plugin_inventory(&source.plugins, &other.plugins);
+    let mismatches = mismatch_list.len() as u64;
     let build_matches = source.build == other.build;
     let payload = serde_json::json!({
         "mismatches": mismatches,
         "build_matches": build_matches,
         "truncated": source.truncated || other.truncated,
+        "mismatch_list": &mismatch_list[..mismatch_list.len().min(MISMATCH_LIST_LIMIT)],
+        "mismatch_list_truncated": mismatch_list.len() > MISMATCH_LIST_LIMIT,
     });
     persistence::persist_signal_snapshot(
         connection,
@@ -408,7 +411,32 @@ pub struct PluginRecord {
     pub active: bool,
 }
 
-pub fn diff_plugin_inventory(source: &[PluginRecord], other: &[PluginRecord]) -> u64 {
+/// One plugin that differs between two Environments. `None` means the plugin is
+/// absent on that side; an `active` difference is carried as an " (inactive)"
+/// suffix on the version of the side where it is switched off.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PluginMismatch {
+    pub id: String,
+    pub source_version: Option<String>,
+    pub other_version: Option<String>,
+}
+
+/// Bound on the list persisted per snapshot; the count stays exact.
+// ponytail: 50 rows keeps a 3-Environment payload under ~10 KB per tick.
+pub const MISMATCH_LIST_LIMIT: usize = 50;
+
+fn mismatch_version(record: &PluginRecord) -> String {
+    if record.active {
+        record.version.clone()
+    } else {
+        format!("{} (inactive)", record.version)
+    }
+}
+
+pub fn diff_plugin_inventory(
+    source: &[PluginRecord],
+    other: &[PluginRecord],
+) -> Vec<PluginMismatch> {
     let source_by_id: HashMap<&str, &PluginRecord> = source
         .iter()
         .map(|record| (record.id.as_str(), record))
@@ -417,20 +445,29 @@ pub fn diff_plugin_inventory(source: &[PluginRecord], other: &[PluginRecord]) ->
         .iter()
         .map(|record| (record.id.as_str(), record))
         .collect();
-    let mut mismatches = 0;
+    let mut mismatches = Vec::new();
     for (id, source_record) in &source_by_id {
         match other_by_id.get(id) {
             Some(other_record)
                 if other_record.version == source_record.version
                     && other_record.active == source_record.active => {}
-            _ => mismatches += 1,
+            other_record => mismatches.push(PluginMismatch {
+                id: (*id).to_owned(),
+                source_version: Some(mismatch_version(source_record)),
+                other_version: other_record.map(|record| mismatch_version(record)),
+            }),
         }
     }
-    for id in other_by_id.keys() {
+    for (id, other_record) in &other_by_id {
         if !source_by_id.contains_key(id) {
-            mismatches += 1;
+            mismatches.push(PluginMismatch {
+                id: (*id).to_owned(),
+                source_version: None,
+                other_version: Some(mismatch_version(other_record)),
+            });
         }
     }
+    mismatches.sort_by(|a, b| a.id.cmp(&b.id));
     mismatches
 }
 
@@ -460,14 +497,70 @@ mod tests {
     #[test]
     fn diff_plugin_inventory_identical_is_empty() {
         let plugins = [plugin("com.example.plugin_a", "1.0.0")];
-        assert_eq!(diff_plugin_inventory(&plugins, &plugins), 0);
+        assert_eq!(diff_plugin_inventory(&plugins, &plugins).len(), 0);
     }
 
     #[test]
     fn diff_plugin_inventory_version_mismatch_counts_one() {
         let source = [plugin("com.example.plugin_a", "1.0.0")];
         let other = [plugin("com.example.plugin_a", "1.1.0")];
-        assert_eq!(diff_plugin_inventory(&source, &other), 1);
+        assert_eq!(
+            diff_plugin_inventory(&source, &other),
+            vec![PluginMismatch {
+                id: "com.example.plugin_a".into(),
+                source_version: Some("1.0.0".into()),
+                other_version: Some("1.1.0".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_plugin_inventory_reports_inactive_side() {
+        let source = [plugin("com.example.plugin_a", "1.0.0")];
+        let other = [PluginRecord {
+            active: false,
+            ..plugin("com.example.plugin_a", "1.0.0")
+        }];
+        assert_eq!(
+            diff_plugin_inventory(&source, &other),
+            vec![PluginMismatch {
+                id: "com.example.plugin_a".into(),
+                source_version: Some("1.0.0".into()),
+                other_version: Some("1.0.0 (inactive)".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_plugin_inventory_reports_missing_both_ways_sorted() {
+        let source = [
+            plugin("com.example.plugin_a", "1.0.0"),
+            plugin("com.example.plugin_b", "2.0.0"),
+        ];
+        let other = [
+            plugin("com.example.plugin_a", "1.1.0"),
+            plugin("com.example.plugin_c", "0.9.0"),
+        ];
+        assert_eq!(
+            diff_plugin_inventory(&source, &other),
+            vec![
+                PluginMismatch {
+                    id: "com.example.plugin_a".into(),
+                    source_version: Some("1.0.0".into()),
+                    other_version: Some("1.1.0".into()),
+                },
+                PluginMismatch {
+                    id: "com.example.plugin_b".into(),
+                    source_version: Some("2.0.0".into()),
+                    other_version: None,
+                },
+                PluginMismatch {
+                    id: "com.example.plugin_c".into(),
+                    source_version: None,
+                    other_version: Some("0.9.0".into()),
+                },
+            ]
+        );
     }
 
     struct DriftTransport {
@@ -594,6 +687,48 @@ mod tests {
         assert_eq!(other.state, "degraded");
         let payload: serde_json::Value = serde_json::from_str(&other.payload_json).unwrap();
         assert_eq!(payload["mismatches"], 1);
+        assert_eq!(payload["mismatch_list"][0]["id"], "com.example.plugin_a");
+        assert_eq!(payload["mismatch_list"][0]["other_version"], "1.1.0");
+        assert_eq!(payload["mismatch_list_truncated"], false);
+    }
+
+    #[test]
+    fn drift_payload_mismatch_list_is_bounded() {
+        let db = TempDb::new("drift_bounded");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        let source: Vec<PluginRecord> = (0..60)
+            .map(|index| plugin(&format!("com.example.plugin_{index:02}"), "1.0.0"))
+            .collect();
+        let other: Vec<PluginRecord> = (0..60)
+            .map(|index| plugin(&format!("com.example.plugin_{index:02}"), "1.1.0"))
+            .collect();
+        persist_drift_compare(
+            &connection,
+            "test",
+            &EnvInventory {
+                build: None,
+                plugins: source,
+                truncated: false,
+            },
+            &EnvInventory {
+                build: None,
+                plugins: other,
+                truncated: false,
+            },
+            1,
+        )
+        .unwrap();
+        let snapshot = persistence::load_signal_snapshot(&connection, "test", DRIFT_SIGNAL_ID)
+            .unwrap()
+            .expect("snapshot");
+        let payload: serde_json::Value = serde_json::from_str(&snapshot.payload_json).unwrap();
+        assert_eq!(payload["mismatches"], 60);
+        assert_eq!(
+            payload["mismatch_list"].as_array().unwrap().len(),
+            MISMATCH_LIST_LIMIT
+        );
+        assert_eq!(payload["mismatch_list_truncated"], true);
     }
 
     #[test]

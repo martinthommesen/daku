@@ -313,6 +313,61 @@ impl DashboardState {
         detail_from_payload(&snapshot.payload_json)
     }
 
+    /// Up to `limit` human lines ("id: 1.0.0 → 1.1.0", "id: missing here",
+    /// "id: only here") for the selected Environment's drift snapshot, plus a
+    /// "… and N more" line when the exact count exceeds the lines shown.
+    /// Empty for the clone source and when there is no drift.
+    pub fn drift_mismatch_lines(&self, limit: usize) -> Vec<String> {
+        let Some(environment_id) = self.selected_id.as_deref() else {
+            return Vec::new();
+        };
+        let Some(snapshot) = self
+            .snapshots
+            .get(environment_id)
+            .and_then(|map| map.get("drift"))
+        else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&snapshot.payload_json) else {
+            return Vec::new();
+        };
+        let Some(list) = value.get("mismatch_list").and_then(|item| item.as_array()) else {
+            return Vec::new();
+        };
+        let mut lines: Vec<String> = list
+            .iter()
+            .take(limit)
+            .map(|entry| {
+                let id = entry
+                    .get("id")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("?");
+                let version = |key: &str| {
+                    entry
+                        .get(key)
+                        .and_then(|item| item.as_str())
+                        .map(str::to_owned)
+                };
+                match (version("source_version"), version("other_version")) {
+                    (Some(source), Some(other)) => format!("{id}: {source} → {other}"),
+                    (Some(_), None) => format!("{id}: missing here"),
+                    (None, Some(_)) => format!("{id}: only here"),
+                    (None, None) => id.to_owned(),
+                }
+            })
+            .collect();
+        // `mismatches` stays exact even when the persisted list is capped.
+        let total = value
+            .get("mismatches")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(list.len() as u64);
+        let remaining = total.saturating_sub(lines.len() as u64);
+        if remaining > 0 {
+            lines.push(format!("… and {remaining} more"));
+        }
+        lines
+    }
+
     pub fn compare_rows(&self) -> Vec<CompareRow> {
         self.environments
             .iter()
@@ -522,7 +577,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 snap(
                     "drift",
                     "degraded",
-                    r#"{"mismatches":3,"build_matches":false,"truncated":false}"#,
+                    r#"{"mismatches":3,"build_matches":false,"truncated":false,"mismatch_list":[{"id":"com.example.plugin_a","source_version":"1.0.0","other_version":"1.1.0"},{"id":"com.example.plugin_b","source_version":"2.0.0","other_version":null},{"id":"com.example.plugin_c","source_version":null,"other_version":"0.9.0"}],"mismatch_list_truncated":false}"#,
                 ),
                 snap(
                     "last_clone",
@@ -746,6 +801,36 @@ mod tests {
     fn freshness_stale_after_threshold() {
         assert!(!freshness(Some(0), STALE_AFTER_SECS).unwrap().stale);
         assert!(freshness(Some(0), STALE_AFTER_SECS + 1).unwrap().stale);
+    }
+
+    #[test]
+    fn drift_mismatch_lines_formats_three_kinds() {
+        let mut state = loaded();
+        state.select("test");
+        assert_eq!(
+            state.drift_mismatch_lines(10),
+            vec![
+                "com.example.plugin_a: 1.0.0 → 1.1.0",
+                "com.example.plugin_b: missing here",
+                "com.example.plugin_c: only here",
+            ]
+        );
+    }
+
+    #[test]
+    fn drift_mismatch_lines_respects_limit() {
+        let mut state = loaded();
+        state.select("test");
+        let lines = state.drift_mismatch_lines(2);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "… and 1 more");
+    }
+
+    #[test]
+    fn drift_mismatch_lines_empty_for_source() {
+        let mut state = loaded();
+        state.select("prod");
+        assert!(state.drift_mismatch_lines(10).is_empty());
     }
 
     #[test]
