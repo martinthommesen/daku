@@ -328,7 +328,7 @@ mod tests {
         // Simulate a regenerated migration name for the same index.
         connection
             .execute(
-                "UPDATE migrations SET tag = '0000_renamed_by_regeneration'",
+                "UPDATE migrations SET tag = '0000_renamed_by_regeneration' WHERE tag LIKE '0000%'",
                 [],
             )
             .unwrap();
