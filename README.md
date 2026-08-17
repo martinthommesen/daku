@@ -98,7 +98,6 @@ release-time variables.
 | `DAKU_UI_FIXTURE` | app (`src/dashboard_state.rs`) | `=1` loads fixture dashboard events; no ServiceNow calls. |
 | `DAKU_CHANNEL` | app (`src/updater.rs`) | `homebrew` disables Sparkle at runtime. |
 | `DAKU_FORCE_UPDATER` | app (`src/updater.rs`, debug builds) | `=1` runs the real Sparkle flow from a debug bundle. |
-| `HOSTNAME` | app (`src/daemon.rs`) | Fallback host name for the LAN URL shown in Settings when `gethostname` fails. |
 | `CARGO_TARGET_DIR` | `scripts/dev.ts`, `scripts/delete-debug-app.ts` | Cargo's target directory, when it is not `target/`. |
 
 Daemon stderr: `~/.daku/daemon.log`.
