@@ -6,6 +6,7 @@ pub mod config;
 pub mod hollow_backend;
 pub mod jobs;
 pub mod mid_ecc;
+pub mod outbound;
 pub mod persistence;
 pub mod servicenow;
 pub mod settings;

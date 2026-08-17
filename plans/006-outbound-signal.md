@@ -70,9 +70,9 @@ Silent integration failure is v1 Signal #7. v1 uses Aggregate counts on outbound
 
 ## Done criteria
 
-- [ ] `cargo test -p daku-core outbound` exit 0
-- [ ] `rg -n 'sys_outbound_http_log' crates/daku-core` → ≥1 hit
-- [ ] `plans/README.md` row 006 Status = `DONE`
+- [x] `cargo test -p daku-core outbound` exit 0
+- [x] `rg -n 'sys_outbound_http_log' crates/daku-core` → ≥1 hit
+- [x] `plans/README.md` row 006 Status = `DONE`
 
 ## STOP conditions
 

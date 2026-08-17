@@ -27,7 +27,7 @@ Daemon Hello auth uses env **`DAKU_DAEMON_TOKEN`**. Operator data/config lives u
 
 Copy [`environments.example.json`](environments.example.json) to `~/.daku/environments.json` and edit Environment URLs/labels. **Secrets stay in the macOS Keychain** (daku-owned service) — never in that JSON file or in SQLite.
 
-Optional `poll_interval_secs` in `~/.daku/settings.json` `extra` (default **120**). One shared `CollectorLoop` polls every Environment; Availability, jobs, syslog, and MID/ECC register onto it.
+Optional `poll_interval_secs` in `~/.daku/settings.json` `extra` (default **120**). One shared `CollectorLoop` polls every Environment; Availability, jobs, syslog, MID/ECC, and outbound register onto it.
 
 ### Operator smoke (local)
 

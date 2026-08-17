@@ -14,6 +14,7 @@ use crate::config::{
 };
 use crate::jobs::JobsCollector;
 use crate::mid_ecc::MidEccCollector;
+use crate::outbound::OutboundCollector;
 use crate::persistence::StateStore;
 use crate::servicenow::{Clock, ServiceNowClient, SystemClock, UreqTransport};
 use crate::syslog::SyslogCollector;
@@ -114,6 +115,12 @@ pub fn build_default_loop(
         store.clone(),
     ));
     loop_.register(MidEccCollector::new(
+        environments.clone(),
+        credentials.clone(),
+        client.clone(),
+        store.clone(),
+    ));
+    loop_.register(OutboundCollector::new(
         environments,
         credentials,
         client,
