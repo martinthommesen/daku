@@ -19,7 +19,15 @@ use daku_protocol::{APP_EXECUTABLE_ENV, DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// First delay after a failed respawn/reconnect; doubles per failure.
+const RESTART_BACKOFF_MIN: Duration = Duration::from_millis(500);
+/// Ceiling for the doubling — a dead daemon costs one spawn per 30 s, not two per second.
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub const DEFAULT_EXPOSED_DAEMON_PORT: u16 = 34_123;
+
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(RESTART_BACKOFF_MAX)
+}
 
 /// Desktop-owned launch configuration for the daemon it supervises.
 ///
@@ -319,10 +327,13 @@ impl ExecutableStamp {
 
 struct SupervisorInner {
     executable: Option<PathBuf>,
+    /// Address and token of a daemon managed elsewhere, kept for reconnects.
+    remote: Option<(String, String)>,
     target: Mutex<DaemonTarget>,
     exposure: Mutex<Option<DaemonExposureSettings>>,
     restart: Mutex<()>,
     client_updates: Mutex<Vec<Sender<DaemonClient>>>,
+    last_error: Mutex<Option<String>>,
     running: AtomicBool,
 }
 
@@ -370,6 +381,7 @@ impl DaemonSupervisor {
             DaemonTarget::Local(process),
             Some(executable.to_owned()),
             Some(exposure),
+            None,
         )?;
         let weak_inner = Arc::downgrade(&supervisor.inner);
         std::thread::Builder::new()
@@ -382,25 +394,40 @@ impl DaemonSupervisor {
     /// Connect to a daemon managed on another host (or by an external local
     /// service manager). Dropping the desktop never shuts this daemon down.
     pub fn connect(address: &str, token: String) -> anyhow::Result<Self> {
+        let remote = Some((address.to_owned(), token.clone()));
         let client = DaemonClient::connect(address, token)?;
-        Self::from_target(DaemonTarget::Remote(client), None, None)
+        let supervisor = Self::from_target(DaemonTarget::Remote(client), None, None, remote)?;
+        let weak_inner = Arc::downgrade(&supervisor.inner);
+        std::thread::Builder::new()
+            .name("daku-daemon-reconnect".into())
+            .spawn(move || monitor_remote(weak_inner))
+            .context("could not start daku daemon reconnect monitor")?;
+        Ok(supervisor)
     }
 
     fn from_target(
         target: DaemonTarget,
         executable: Option<PathBuf>,
         exposure: Option<DaemonExposureSettings>,
+        remote: Option<(String, String)>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: Arc::new(SupervisorInner {
                 executable,
+                remote,
                 target: Mutex::new(target),
                 exposure: Mutex::new(exposure),
                 restart: Mutex::new(()),
                 client_updates: Mutex::new(Vec::new()),
+                last_error: Mutex::new(None),
                 running: AtomicBool::new(true),
             }),
         })
+    }
+
+    /// Why the last respawn/reconnect failed, if it did (cleared on success).
+    pub fn last_error(&self) -> Option<String> {
+        self.inner.last_error.lock().clone()
     }
 
     pub fn client(&self) -> DaemonClient {
@@ -434,6 +461,7 @@ fn monitor_daemon(
     mut active_stamp: ExecutableStamp,
     watch_for_rebuilds: bool,
 ) {
+    let mut backoff = RESTART_BACKOFF_MIN;
     loop {
         std::thread::sleep(REBUILD_POLL_INTERVAL);
         let Some(inner) = weak_inner.upgrade() else {
@@ -461,9 +489,18 @@ fn monitor_daemon(
             return;
         };
         match replace_local_daemon(&inner, executable, &exposure) {
-            Ok(()) => {}
+            Ok(()) => {
+                *inner.last_error.lock() = None;
+                backoff = RESTART_BACKOFF_MIN;
+            }
             Err(error) => {
-                eprintln!("could not restart rebuilt daku daemon: {error:#}");
+                let message = format!("{error:#}");
+                eprintln!("could not restart daku daemon (retry in {backoff:?}): {message}");
+                *inner.last_error.lock() = Some(message);
+                drop(_restart);
+                drop(inner);
+                std::thread::sleep(backoff);
+                backoff = next_backoff(backoff);
                 continue;
             }
         }
@@ -472,6 +509,53 @@ fn monitor_daemon(
         }
         drop(_restart);
         drop(inner);
+    }
+}
+
+/// Poll a daemon managed elsewhere and re-dial it when the socket drops, so a
+/// daemon upgrade or a laptop sleep does not require relaunching the desktop.
+fn monitor_remote(weak_inner: std::sync::Weak<SupervisorInner>) {
+    let mut backoff = RESTART_BACKOFF_MIN;
+    loop {
+        std::thread::sleep(REBUILD_POLL_INTERVAL);
+        let Some(inner) = weak_inner.upgrade() else {
+            return;
+        };
+        if !inner.running.load(Ordering::Acquire) {
+            return;
+        }
+        let Some((address, token)) = inner.remote.clone() else {
+            return;
+        };
+        let disconnected = match &*inner.target.lock() {
+            DaemonTarget::Remote(client) => client.is_disconnected(),
+            _ => return,
+        };
+        if !disconnected {
+            backoff = RESTART_BACKOFF_MIN;
+            continue;
+        }
+        match DaemonClient::connect(&address, token) {
+            Ok(client) => {
+                *inner.target.lock() = DaemonTarget::Remote(client.clone());
+                inner
+                    .client_updates
+                    .lock()
+                    .retain(|subscriber| subscriber.send(client.clone()).is_ok());
+                *inner.last_error.lock() = None;
+                backoff = RESTART_BACKOFF_MIN;
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                eprintln!(
+                    "could not reconnect to daku daemon at {address} (retry in {backoff:?}): {message}"
+                );
+                *inner.last_error.lock() = Some(message);
+                drop(inner);
+                std::thread::sleep(backoff);
+                backoff = next_backoff(backoff);
+            }
+        }
     }
 }
 
@@ -526,6 +610,13 @@ mod tests {
         );
         assert!(parse_allowed_origins("https://app.daku.test/path").is_err());
         assert!(parse_allowed_origins("ws://app.daku.test").is_err());
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        assert_eq!(next_backoff(RESTART_BACKOFF_MIN), Duration::from_secs(1));
+        assert_eq!(next_backoff(Duration::from_secs(20)), RESTART_BACKOFF_MAX);
+        assert_eq!(next_backoff(RESTART_BACKOFF_MAX), RESTART_BACKOFF_MAX);
     }
 
     #[test]

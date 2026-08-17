@@ -89,6 +89,12 @@ impl DaemonClient {
         Ok(Self { inner })
     }
 
+    /// True once the reader thread has ended — the socket closed, the daemon
+    /// shut down, or the connection broke. Supervisors poll this to reconnect.
+    pub fn is_disconnected(&self) -> bool {
+        self.inner.disconnected.load(Ordering::Acquire)
+    }
+
     pub fn subscribe_dashboard(&self) -> Receiver<ServerMessage> {
         let (events, receiver) = unbounded();
         for message in self.inner.dashboard_cache.lock().values() {
