@@ -1,0 +1,28 @@
+[package]
+name = "daku-daemon"
+version = "0.1.0"
+edition = "2024"
+description = "Headless daku provider daemon"
+license = "GPL-3.0-only"
+readme = "README.md"
+
+[features]
+dev-binary = []
+
+[[bin]]
+name = "daku-daemon"
+path = "src/main.rs"
+
+[[bin]]
+name = "daku-debug-daemon"
+path = "src/bin/daku-debug-daemon.rs"
+required-features = ["dev-binary"]
+
+[dependencies]
+anyhow = "1.0"
+serde_json = "1.0"
+daku-core = { path = "../daku-core" }
+daku-protocol = { path = "../daku-protocol" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

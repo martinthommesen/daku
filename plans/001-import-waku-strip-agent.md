@@ -13,7 +13,8 @@
 - **Depends on**: none (inventory paths are inlined below; remote note is reference only)
 - **Category**: direction
 - **Planned at**: commit `567179a`, 2026-08-17
-- **Issue**: https://github.com/martinthommesen/daku/issues/20
+- **Issue**: https://github.com/martinthommesen/daku/issues/24
+- **Done**: workspace green on upstream Zed GPUI; hollow backend + empty shell
 
 ## Why this matters
 

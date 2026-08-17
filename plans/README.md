@@ -23,7 +23,7 @@ Drift checks use `567179a..HEAD` against each plan’s **Scope** paths (not only
 
 | Plan | Title | Priority | Status | Depends on |
 |------|-------|----------|--------|------------|
-| [001](001-import-waku-strip-agent.md) | Import pinned waku trees and strip agent domain until `cargo` workspace builds | P1 | TODO | inventory inlined in plan |
+| [001](001-import-waku-strip-agent.md) | Import pinned waku trees and strip agent domain until `cargo` workspace builds | P1 | DONE | inventory inlined in plan |
 | [002](002-daemon-sqlite-skeleton.md) | Daemon skeleton + SQLite under `~/.daku` | P1 | TODO | 001 |
 | [003](003-availability-signal.md) | Availability Signal + shared HTTP/OAuth/429 + CollectorLoop | P1 | TODO | 002 |
 | [004](004-jobs-syslog-trends.md) | Scheduled jobs + syslog Signals with ~24h trends | P1 | TODO | 003 |

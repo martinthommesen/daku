@@ -12,7 +12,8 @@
 # Build artifacts (when the app exists)
 target/
 node_modules/
-.waku-cache/
+.daku-cache/
+temp/
 dist/
 *.db
 *.db-wal
