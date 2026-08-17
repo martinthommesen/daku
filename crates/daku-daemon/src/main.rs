@@ -1,14 +1,17 @@
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context as _, anyhow, bail};
-use daku_protocol::{DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION};
+use anyhow::{anyhow, bail, Context as _};
+use daku_protocol::{DaemonReady, DAEMON_TOKEN_ENV, PROTOCOL_VERSION};
 
 fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse(std::env::args().skip(1))?;
+    if arguments.probe_availability {
+        return run_probe_availability();
+    }
     let auth = std::env::var(DAEMON_TOKEN_ENV).context("DAKU_DAEMON_TOKEN is missing")?;
     // The bearer capability belongs only to this server process. Remove it
     // before any provider or workspace subprocess can inherit the daemon's
@@ -48,7 +51,13 @@ fn main() -> anyhow::Result<()> {
         [task_path.with_file_name("settings.json")],
     )
     .context("could not load daemon settings")?;
-    let task_store = daku_core::persistence::StateStore::daemon(task_path);
+    let task_store = daku_core::persistence::StateStore::daemon(task_path.clone());
+    daku_core::start_default_loop(
+        &daku_core::default_environments_path(),
+        daku_core::persistence::StateStore::daemon(task_path),
+        &settings.get(),
+        shutdown.clone(),
+    );
     daku_core::serve(
         listener,
         auth,
@@ -59,6 +68,15 @@ fn main() -> anyhow::Result<()> {
             allow_shutdown: arguments.parent_pid.is_some(),
         },
     )
+}
+
+fn run_probe_availability() -> anyhow::Result<()> {
+    let store = daku_core::persistence::StateStore::daemon(
+        daku_core::persistence::StateStore::default_path(),
+    );
+    daku_core::probe_availability_once(&daku_core::default_environments_path(), store)?;
+    println!("availability probe complete");
+    Ok(())
 }
 
 fn ensure_bind_allowed(address: SocketAddr, allow_non_loopback: bool) -> anyhow::Result<()> {
@@ -75,6 +93,7 @@ struct Arguments {
     parent_pid: Option<u32>,
     allowed_origins: Vec<String>,
     allow_non_loopback: bool,
+    probe_availability: bool,
 }
 
 impl Arguments {
@@ -83,9 +102,13 @@ impl Arguments {
         let mut parent_pid = None;
         let mut allowed_origins = Vec::new();
         let mut allow_non_loopback = false;
+        let mut probe_availability = false;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
+                "probe-availability" => {
+                    probe_availability = true;
+                }
                 "--bind" => {
                     bind = arguments
                         .next()
@@ -112,7 +135,7 @@ impl Arguments {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]...",
+                        "usage: {} [probe-availability] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]...",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -125,6 +148,7 @@ impl Arguments {
             parent_pid,
             allowed_origins,
             allow_non_loopback,
+            probe_availability,
         })
     }
 }
@@ -174,5 +198,11 @@ mod tests {
     fn parses_explicit_non_loopback_opt_in() {
         let arguments = Arguments::parse(["--allow-non-loopback".into()]).unwrap();
         assert!(arguments.allow_non_loopback);
+    }
+
+    #[test]
+    fn parses_probe_availability() {
+        let arguments = Arguments::parse(["probe-availability".into()]).unwrap();
+        assert!(arguments.probe_availability);
     }
 }

@@ -1,11 +1,17 @@
 //! daku's daemon-side core.
 
+pub mod availability;
+pub mod collector;
+pub mod config;
 pub mod hollow_backend;
 pub mod persistence;
+pub mod servicenow;
 pub mod settings;
 
 mod server;
 
+pub use collector::{probe_availability_once, start_default_loop};
+pub use config::default_environments_path;
 pub use hollow_backend::HollowBackend;
 pub use server::{Backend, EventSink, ServerOptions, serve};
 pub use settings::{DaemonSettings, DaemonSettingsStore};

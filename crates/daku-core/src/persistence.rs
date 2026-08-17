@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 use daku_protocol::identity::DATA_DIRECTORY_NAME;
 
@@ -125,15 +125,71 @@ impl StateStore {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalSnapshot {
+    pub environment_id: String,
+    pub signal_id: String,
+    pub observed_at: i64,
+    pub state: String,
+    pub payload_json: String,
+}
+
+pub fn persist_signal_snapshot(
+    connection: &Connection,
+    environment_id: &str,
+    signal_id: &str,
+    observed_at: i64,
+    state: &str,
+    payload_json: &str,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "INSERT INTO signal_snapshots (
+                environment_id, signal_id, observed_at, state, payload_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(environment_id, signal_id) DO UPDATE SET
+                observed_at = excluded.observed_at,
+                state = excluded.state,
+                payload_json = excluded.payload_json",
+            params![environment_id, signal_id, observed_at, state, payload_json],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+pub fn load_signal_snapshot(
+    connection: &Connection,
+    environment_id: &str,
+    signal_id: &str,
+) -> io::Result<Option<SignalSnapshot>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT environment_id, signal_id, observed_at, state, payload_json
+             FROM signal_snapshots
+             WHERE environment_id = ?1 AND signal_id = ?2",
+        )
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![environment_id, signal_id])
+        .map_err(to_io_error)?;
+    let Some(row) = rows.next().map_err(to_io_error)? else {
+        return Ok(None);
+    };
+    Ok(Some(SignalSnapshot {
+        environment_id: row.get(0).map_err(to_io_error)?,
+        signal_id: row.get(1).map_err(to_io_error)?,
+        observed_at: row.get(2).map_err(to_io_error)?,
+        state: row.get(3).map_err(to_io_error)?,
+        payload_json: row.get(4).map_err(to_io_error)?,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_db_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "daku-{label}-{}.db",
-            uuid::Uuid::new_v4()
-        ))
+        std::env::temp_dir().join(format!("daku-{label}-{}.db", uuid::Uuid::new_v4()))
     }
 
     fn table_exists(connection: &Connection, name: &str) -> bool {

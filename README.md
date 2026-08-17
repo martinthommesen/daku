@@ -27,6 +27,27 @@ Daemon Hello auth uses env **`DAKU_DAEMON_TOKEN`**. Operator data/config lives u
 
 Copy [`environments.example.json`](environments.example.json) to `~/.daku/environments.json` and edit Environment URLs/labels. **Secrets stay in the macOS Keychain** (daku-owned service) — never in that JSON file or in SQLite.
 
+Optional `poll_interval_secs` in `~/.daku/settings.json` `extra` (default **120**). One shared `CollectorLoop` polls every Environment; later Signals only register onto it.
+
+### Operator smoke (local)
+
+1. Copy the example file to `~/.daku/environments.json`. Use your own Environment URLs locally — do not commit them.
+2. Store Credentials in Keychain, service `daku`, account = Environment `id`:
+   - OAuth: `{"client_id":"…","client_secret":"…"}`
+   - Basic (PDI stand-in only): `{"username":"…","password":"…"}`
+
+   ```sh
+   security add-generic-password -s daku -a prod -w '{"client_id":"…","client_secret":"…"}'
+   ```
+
+3. One-shot Availability probe (no daemon token):
+
+   ```sh
+   cargo run -p daku-daemon -- probe-availability
+   ```
+
+   Writes `signal_id=availability` into `~/.daku/app.db` (or `DAKU_DB_PATH`).
+
 ```sh
 cargo test -p daku-daemon
 ```
