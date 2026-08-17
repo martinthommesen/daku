@@ -26,4 +26,4 @@ The `mattpocock-skills:*` skills are the canonical, mandatory skills for this pr
 
 ### Verification gate
 
-There is no CI. Before committing to `main`, run `bun run check` (fmt check + `cargo test --workspace` + oxlint) and require exit 0. Plans under `plans/` use it as a done criterion.
+There is no CI. Before committing to `main`, run `bun run check` (fmt check + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` + oxlint) and require exit 0. The gate includes `cargo clippy -- -D warnings`; do not add `#[allow]` to pass it without a comment saying why. Plans under `plans/` use it as a done criterion.

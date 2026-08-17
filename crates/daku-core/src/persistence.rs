@@ -114,10 +114,10 @@ pub struct StateStore {
 impl StateStore {
     /// Default DB path: `DAKU_DB_PATH`, else `~/.daku/app.db`.
     pub fn default_path() -> PathBuf {
-        if let Ok(path) = std::env::var(DAKU_DB_PATH_ENV) {
-            if !path.is_empty() {
-                return PathBuf::from(path);
-            }
+        if let Ok(path) = std::env::var(DAKU_DB_PATH_ENV)
+            && !path.is_empty()
+        {
+            return PathBuf::from(path);
         }
         dirs::home_dir()
             .unwrap_or_else(std::env::temp_dir)

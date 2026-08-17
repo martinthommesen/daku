@@ -131,10 +131,10 @@ impl ServiceNowClient {
         environment: &EnvironmentConfig,
         credentials: &dyn CredentialStore,
     ) -> anyhow::Result<Vec<(String, String)>> {
-        if environment.auth_method == AuthMethod::OauthClientCredentials {
-            if let Some(access) = self.cached_access_token(&environment.id) {
-                return Ok(vec![("Authorization".into(), format!("Bearer {access}"))]);
-            }
+        if environment.auth_method == AuthMethod::OauthClientCredentials
+            && let Some(access) = self.cached_access_token(&environment.id)
+        {
+            return Ok(vec![("Authorization".into(), format!("Bearer {access}"))]);
         }
         let blob = credentials
             .get(&environment.id)?

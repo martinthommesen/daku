@@ -58,13 +58,6 @@ struct Hub {
 }
 
 impl Hub {
-    fn broadcast(&self, message: ServerMessage) {
-        let mut state = self.state.lock();
-        state
-            .subscribers
-            .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
-    }
-
     /// Broadcasts a dashboard message and remembers it for late subscribers.
     fn publish_dashboard(&self, message: ServerMessage) {
         let mut state = self.state.lock();
@@ -162,6 +155,8 @@ pub fn serve(
     Ok(())
 }
 
+// The handshake closure below returns tungstenite's ErrorResponse; boxing it buys nothing here.
+#[allow(clippy::result_large_err)]
 fn handle_connection(
     stream: TcpStream,
     expected_token: &str,
@@ -294,6 +289,8 @@ fn dispatch_request(request: Request, outgoing: Sender<ServerMessage>, backend: 
         .ok();
 }
 
+// tungstenite's ErrorResponse is a full http::Response; boxing it buys nothing here.
+#[allow(clippy::result_large_err)]
 fn validate_handshake(
     request: &HandshakeRequest,
     response: HandshakeResponse,
@@ -377,21 +374,7 @@ fn write_json<S: io::Read + io::Write, T: serde::Serialize>(
 mod tests {
     use super::*;
 
-    use daku_protocol::{Command, ServerMessage};
-
-    struct TestBackend;
-
-    impl Backend for TestBackend {
-        fn handle(&self, command: Command) -> anyhow::Result<ResponsePayload> {
-            match command {
-                Command::Ping => Ok(ResponsePayload::Ack),
-                Command::GetSettings => Ok(ResponsePayload::Settings {
-                    settings: Default::default(),
-                }),
-                _ => bail!("unexpected command"),
-            }
-        }
-    }
+    use daku_protocol::ServerMessage;
 
     #[test]
     fn token_matches_is_exact() {
@@ -400,11 +383,11 @@ mod tests {
     }
 
     #[test]
-    fn hub_broadcasts_environments_updated() {
+    fn hub_publishes_to_existing_subscribers() {
         let hub = Hub::default();
         let (tx, rx) = unbounded();
         hub.subscribe(tx);
-        hub.broadcast(ServerMessage::EnvironmentsUpdated {
+        hub.publish_dashboard(ServerMessage::EnvironmentsUpdated {
             environments: vec![],
         });
         match rx.try_recv().unwrap() {

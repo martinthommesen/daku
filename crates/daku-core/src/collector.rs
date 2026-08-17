@@ -128,24 +128,23 @@ impl<S: Signal> PerEnvironmentCollector<S> {
         environment: &EnvironmentConfig,
         observed_at: i64,
     ) -> anyhow::Result<()> {
-        if self.signal.gated_by_availability() {
-            if let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
+        if self.signal.gated_by_availability()
+            && let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
                 recent_reachability(
                     connection,
                     &environment.id,
                     observed_at,
                     REACHABILITY_REUSE_SECS,
                 )
-            {
-                return persistence::persist_signal_skipped(
-                    connection,
-                    &environment.id,
-                    self.signal.id(),
-                    observed_at,
-                    reachability.as_str(),
-                )
-                .map_err(anyhow::Error::from);
-            }
+        {
+            return persistence::persist_signal_skipped(
+                connection,
+                &environment.id,
+                self.signal.id(),
+                observed_at,
+                reachability.as_str(),
+            )
+            .map_err(anyhow::Error::from);
         }
         match self
             .signal
@@ -194,10 +193,10 @@ impl<S: Signal + 'static> SignalCollector for PerEnvironmentCollector<S> {
                 first_error.get_or_insert(error);
             }
         }
-        if self.signal.keeps_samples() {
-            if let Err(error) = persistence::prune_signal_samples(&connection, observed_at) {
-                first_error.get_or_insert_with(|| anyhow::Error::from(error));
-            }
+        if self.signal.keeps_samples()
+            && let Err(error) = persistence::prune_signal_samples(&connection, observed_at)
+        {
+            first_error.get_or_insert_with(|| anyhow::Error::from(error));
         }
         match first_error {
             Some(error) => Err(error),

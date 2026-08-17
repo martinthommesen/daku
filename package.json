@@ -7,7 +7,7 @@
     "release": "bun ./scripts/release.ts",
     "db:generate": "drizzle-kit generate",
     "lint": "oxlint -c oxlint.config.ts .",
-    "check": "cargo fmt --all --check && cargo test --workspace --no-fail-fast && oxlint -c oxlint.config.ts ."
+    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --no-fail-fast && oxlint -c oxlint.config.ts ."
   },
   "devDependencies": {
     "@oxlint/plugins": "1.78.0",
