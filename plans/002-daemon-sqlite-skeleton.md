@@ -114,11 +114,11 @@ Add `environments.example.json` with fake example.service-now.com URLs only.
 
 ## Done criteria
 
-- [ ] `bun run db:generate` and `cargo check -p daku-core -p daku-daemon` exit 0
-- [ ] `cargo test -p daku-core apply_migrations` and `daku_dir_permissions` pass
-- [ ] No `environments` table in migrations (`rg` check in Step 1)
-- [ ] Example JSON uses only fake hosts
-- [ ] `plans/README.md` row 002 Status = `DONE`
+- [x] `bun run db:generate` and `cargo check -p daku-core -p daku-daemon` exit 0
+- [x] `cargo test -p daku-core apply_migrations` and `daku_dir_permissions` pass
+- [x] No `environments` table in migrations (`rg` check in Step 1)
+- [x] Example JSON uses only fake hosts
+- [x] `plans/README.md` row 002 Status = `DONE`
 
 ## STOP conditions
 

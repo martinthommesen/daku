@@ -1,0 +1,23 @@
+[
+  {
+    "id": "prod",
+    "label": "Production",
+    "instance_url": "https://acme-prod.example.service-now.com",
+    "auth_method": "oauth_client_credentials",
+    "sort_order": 0
+  },
+  {
+    "id": "test",
+    "label": "Test",
+    "instance_url": "https://acme-test.example.service-now.com",
+    "auth_method": "oauth_client_credentials",
+    "sort_order": 1
+  },
+  {
+    "id": "dev",
+    "label": "Dev",
+    "instance_url": "https://acme-dev.example.service-now.com",
+    "auth_method": "basic",
+    "sort_order": 2
+  }
+]
