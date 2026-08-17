@@ -17,6 +17,9 @@ pub mod syslog;
 
 mod server;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use collector::{probe_availability_once, start_default_loop};
 pub use config::default_environments_path;
 pub use daku_protocol::{

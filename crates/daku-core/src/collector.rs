@@ -228,11 +228,12 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use crate::availability::{AVAILABILITY_SIGNAL_ID, AvailabilityCollector};
-    use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore};
-    use crate::persistence::{self, StateStore};
+    use crate::config::MemoryCredentialStore;
+    use crate::persistence;
     use crate::servicenow::{
         Clock, HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
     };
+    use crate::test_support::{TempDb, prod};
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -277,20 +278,12 @@ mod tests {
 
     #[test]
     fn collector_loop_tick_writes_availability_snapshot() {
-        let path = std::env::temp_dir().join(format!("daku-collector-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("collector");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         let collector = AvailabilityCollector::new(
-            vec![EnvironmentConfig {
-                id: "prod".into(),
-                label: "Production".into(),
-                instance_url: "https://acme-prod.example.service-now.com".into(),
-                auth_method: AuthMethod::Basic,
-                sort_order: 0,
-                clone_source: false,
-            }],
+            vec![prod()],
             credentials,
             ServiceNowClient::new(FixtureTransport, SystemClock),
             store,
@@ -303,7 +296,7 @@ mod tests {
         loop_.tick().unwrap();
         loop_.tick().unwrap();
 
-        let connection = StateStore::daemon(path.clone()).open().unwrap();
+        let connection = db.store().open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", AVAILABILITY_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
@@ -317,7 +310,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -338,5 +330,31 @@ mod tests {
             calls.fetch_add(1, Ordering::Release);
         });
         assert_eq!(calls.load(Ordering::Acquire), 2);
+    }
+    #[test]
+    fn collector_loop_tick_isolates_failures() {
+        struct Failing;
+        impl SignalCollector for Failing {
+            fn collect(&self) -> anyhow::Result<()> {
+                anyhow::bail!("first collector failed")
+            }
+        }
+        struct Recording(Arc<AtomicBool>);
+        impl SignalCollector for Recording {
+            fn collect(&self) -> anyhow::Result<()> {
+                self.0.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut loop_ = CollectorLoop::new(Duration::from_secs(1));
+        loop_.register(Failing);
+        loop_.register(Recording(ran.clone()));
+        let error = loop_.tick().unwrap_err();
+        assert!(error.to_string().contains("first collector failed"));
+        assert!(
+            ran.load(Ordering::Acquire),
+            "later collectors must still run"
+        );
     }
 }

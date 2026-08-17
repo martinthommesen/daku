@@ -305,10 +305,7 @@ pub fn prune_signal_samples(connection: &Connection, now: i64) -> io::Result<usi
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp_db_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("daku-{label}-{}.db", uuid::Uuid::new_v4()))
-    }
+    use crate::test_support::TempDb;
 
     fn table_exists(connection: &Connection, name: &str) -> bool {
         connection
@@ -322,9 +319,8 @@ mod tests {
 
     #[test]
     fn apply_migrations_creates_signal_tables() {
-        let path = temp_db_path("apply");
-        let _ = fs::remove_file(&path);
-        let connection = Connection::open(&path).unwrap();
+        let db = TempDb::new("apply");
+        let connection = Connection::open(db.path()).unwrap();
         let applied = apply_migrations(&connection).unwrap();
         assert!(applied >= 1);
         assert!(table_exists(&connection, "signal_snapshots"));
@@ -332,14 +328,12 @@ mod tests {
         assert!(!table_exists(&connection, "environments"));
         assert!(!table_exists(&connection, "projects"));
         assert_eq!(apply_migrations(&connection).unwrap(), 0);
-        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn apply_migrations_matches_by_numeric_prefix() {
-        let path = temp_db_path("prefix");
-        let _ = fs::remove_file(&path);
-        let connection = Connection::open(&path).unwrap();
+        let db = TempDb::new("prefix");
+        let connection = Connection::open(db.path()).unwrap();
         assert!(apply_migrations(&connection).unwrap() >= 1);
         // Simulate a regenerated migration name for the same index.
         connection
@@ -350,7 +344,6 @@ mod tests {
             .unwrap();
         assert_eq!(apply_migrations(&connection).unwrap(), 0);
         assert!(table_exists(&connection, "signal_snapshots"));
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -385,10 +378,8 @@ mod tests {
 
     #[test]
     fn prune_signal_samples_drops_older_than_24h() {
-        let path = temp_db_path("prune");
-        let _ = fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
-        let connection = store.open().unwrap();
+        let db = TempDb::new("prune");
+        let connection = db.store().open().unwrap();
         let now = 1_700_000_000;
         persist_signal_sample(
             &connection,
@@ -421,6 +412,5 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let _ = fs::remove_file(path);
     }
 }

@@ -118,6 +118,7 @@ pub fn publish_dashboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TempDb, prod};
 
     #[test]
     fn health_rollup_unreachable_is_down() {
@@ -219,18 +220,15 @@ mod tests {
 
     #[test]
     fn health_rollup_publish_emits_dashboard_events_after_fixture() {
-        use crate::config::{AuthMethod, EnvironmentConfig};
         use crate::jobs::JOBS_SIGNAL_ID;
         use crate::last_clone::LAST_CLONE_SIGNAL_ID;
-        use crate::persistence::{self, StateStore};
+        use crate::persistence;
         use crate::syslog::SYSLOG_SIGNAL_ID;
         use crossbeam_channel::unbounded;
         use daku_protocol::ServerMessage;
 
-        let path =
-            std::env::temp_dir().join(format!("daku-health-publish-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("health-publish");
+        let store = db.store();
         let connection = store.open().unwrap();
         let now = 1_700_000_000;
         persistence::persist_signal_snapshot(
@@ -289,20 +287,7 @@ mod tests {
         .unwrap();
 
         let (tx, rx) = unbounded();
-        publish_dashboard(
-            &[EnvironmentConfig {
-                id: "prod".into(),
-                label: "Production".into(),
-                instance_url: "https://acme-prod.example.service-now.com".into(),
-                auth_method: AuthMethod::Basic,
-                sort_order: 0,
-                clone_source: false,
-            }],
-            &store,
-            &tx,
-            now,
-        )
-        .unwrap();
+        publish_dashboard(&[prod()], &store, &tx, now).unwrap();
 
         let mut environments = None;
         let mut snapshots = None;
@@ -356,7 +341,5 @@ mod tests {
                 .expect("syslog SignalSamplesUpdated")
                 .is_empty()
         );
-
-        let _ = std::fs::remove_file(path);
     }
 }

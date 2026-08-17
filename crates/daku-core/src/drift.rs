@@ -444,6 +444,7 @@ pub fn diff_plugin_inventory(source: &[PluginRecord], other: &[PluginRecord]) ->
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::TempDb;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -532,10 +533,9 @@ mod tests {
     fn collect_pair(
         source_plugins: &'static str,
         other_plugins: &'static str,
-    ) -> (std::path::PathBuf, StateStore) {
-        let path = std::env::temp_dir().join(format!("daku-drift-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+    ) -> (TempDb, StateStore) {
+        let db = TempDb::new("drift");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
@@ -558,12 +558,13 @@ mod tests {
             Duration::from_secs(120),
         );
         collector.collect().unwrap();
-        (path.clone(), StateStore::daemon(path))
+        let reopened = db.store();
+        (db, reopened)
     }
 
     #[test]
     fn drift_signal_identical_inventories_are_healthy() {
-        let (path, store) = collect_pair(
+        let (_db, store) = collect_pair(
             include_str!("../tests/fixtures/drift/plugins_a.json"),
             include_str!("../tests/fixtures/drift/plugins_a.json"),
         );
@@ -582,12 +583,11 @@ mod tests {
         let other_payload: serde_json::Value = serde_json::from_str(&other.payload_json).unwrap();
         assert_eq!(other_payload["mismatches"], 0);
         assert_eq!(other_payload["truncated"], false);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn drift_signal_version_mismatch_is_degraded() {
-        let (path, store) = collect_pair(
+        let (_db, store) = collect_pair(
             include_str!("../tests/fixtures/drift/plugins_a.json"),
             include_str!("../tests/fixtures/drift/plugins_a_v2.json"),
         );
@@ -602,15 +602,12 @@ mod tests {
         assert_eq!(other.state, "degraded");
         let payload: serde_json::Value = serde_json::from_str(&other.payload_json).unwrap();
         assert_eq!(payload["mismatches"], 1);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn drift_signal_single_environment_skips() {
-        let path =
-            std::env::temp_dir().join(format!("daku-drift-skip-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("drift-skip");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         let collector = DriftCollector::new(
@@ -629,22 +626,19 @@ mod tests {
             Duration::from_secs(120),
         );
         collector.collect().unwrap();
-        let connection = StateStore::daemon(path.clone()).open().unwrap();
+        let connection = db.store().open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", DRIFT_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
         assert_eq!(row.state, "healthy");
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["skipped"], "need_two_environments");
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn drift_signal_without_clone_source_skips() {
-        let path =
-            std::env::temp_dir().join(format!("daku-drift-nosrc-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("drift-nosrc");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
@@ -667,7 +661,7 @@ mod tests {
             Duration::from_secs(120),
         );
         collector.collect().unwrap();
-        let connection = StateStore::daemon(path.clone()).open().unwrap();
+        let connection = db.store().open().unwrap();
         for id in ["prod", "test"] {
             let row = persistence::load_signal_snapshot(&connection, id, DRIFT_SIGNAL_ID)
                 .unwrap()
@@ -676,7 +670,6 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
             assert_eq!(payload["skipped"], "need_two_environments");
         }
-        let _ = std::fs::remove_file(path);
     }
 
     struct TruncatedTransport;
@@ -712,10 +705,8 @@ mod tests {
 
     #[test]
     fn drift_signal_truncated_when_more_rows_exist() {
-        let path =
-            std::env::temp_dir().join(format!("daku-drift-trunc-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("drift-trunc");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
@@ -730,13 +721,12 @@ mod tests {
             Duration::from_secs(120),
         );
         collector.collect().unwrap();
-        let connection = StateStore::daemon(path.clone()).open().unwrap();
+        let connection = db.store().open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "test", DRIFT_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["truncated"], true);
-        let _ = std::fs::remove_file(path);
     }
 
     struct NoGlideTransport;
@@ -764,10 +754,8 @@ mod tests {
 
     #[test]
     fn drift_signal_reuses_fresh_availability_build() {
-        let path =
-            std::env::temp_dir().join(format!("daku-drift-reuse-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("drift-reuse");
+        let store = db.store();
         let connection = store.open().unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -812,12 +800,11 @@ mod tests {
             Duration::from_secs(120),
         );
         collector.collect().unwrap();
-        let connection = StateStore::daemon(path.clone()).open().unwrap();
+        let connection = db.store().open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "test", DRIFT_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
         assert_eq!(row.state, "healthy");
-        let _ = std::fs::remove_file(path);
     }
 
     struct CountingTransport {
@@ -887,7 +874,6 @@ mod tests {
         other_plugins: &'static str,
         test_plugin_statuses: Vec<u16>,
     ) -> (DriftCollector, Arc<std::sync::atomic::AtomicUsize>) {
-        let _ = std::fs::remove_file(path);
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
@@ -917,10 +903,9 @@ mod tests {
 
     #[test]
     fn drift_signal_reuses_inventory_within_refresh_window() {
-        let path =
-            std::env::temp_dir().join(format!("daku-drift-cache-{}.db", uuid::Uuid::new_v4()));
+        let db = TempDb::new("drift-cache");
         let (collector, plugin_requests) = counting_collector(
-            &path,
+            db.path(),
             include_str!("../tests/fixtures/drift/plugins_a.json"),
             include_str!("../tests/fixtures/drift/plugins_a_v2.json"),
             vec![],
@@ -931,7 +916,7 @@ mod tests {
             4,
             "cold cache: 2 pages x 2 environments"
         );
-        assert_eq!(mismatches(&path, "test")["mismatches"], 1);
+        assert_eq!(mismatches(db.path(), "test")["mismatches"], 1);
 
         collector.collect().unwrap();
         assert_eq!(
@@ -939,16 +924,14 @@ mod tests {
             4,
             "second tick must reuse the cached inventories"
         );
-        assert_eq!(mismatches(&path, "test")["mismatches"], 1);
-        let _ = std::fs::remove_file(path);
+        assert_eq!(mismatches(db.path(), "test")["mismatches"], 1);
     }
 
     #[test]
     fn drift_signal_refetches_inventory_after_refresh_window() {
-        let path =
-            std::env::temp_dir().join(format!("daku-drift-stale-{}.db", uuid::Uuid::new_v4()));
+        let db = TempDb::new("drift-stale");
         let (collector, plugin_requests) = counting_collector(
-            &path,
+            db.path(),
             include_str!("../tests/fixtures/drift/plugins_a.json"),
             include_str!("../tests/fixtures/drift/plugins_a_v2.json"),
             vec![],
@@ -969,16 +952,14 @@ mod tests {
             8,
             "stale cache must refetch both environments"
         );
-        assert_eq!(mismatches(&path, "test")["mismatches"], 1);
-        let _ = std::fs::remove_file(path);
+        assert_eq!(mismatches(db.path(), "test")["mismatches"], 1);
     }
 
     #[test]
     fn drift_signal_failed_inventory_is_not_cached() {
-        let path =
-            std::env::temp_dir().join(format!("daku-drift-retry-{}.db", uuid::Uuid::new_v4()));
+        let db = TempDb::new("drift-retry");
         let (collector, plugin_requests) = counting_collector(
-            &path,
+            db.path(),
             include_str!("../tests/fixtures/drift/plugins_a.json"),
             include_str!("../tests/fixtures/drift/plugins_a.json"),
             vec![500],
@@ -986,7 +967,7 @@ mod tests {
         // Tick 1: prod fetches both pages (2), test's sys_plugins 500s and bails (1).
         collector.collect().unwrap();
         assert_eq!(plugin_requests.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert_eq!(mismatches(&path, "test")["state"], "down");
+        assert_eq!(mismatches(db.path(), "test")["state"], "down");
 
         // Tick 2: prod is cached (0), test retries both pages (2).
         collector.collect().unwrap();
@@ -995,9 +976,8 @@ mod tests {
             5,
             "a failed fetch must not be cached"
         );
-        let snapshot = mismatches(&path, "test");
+        let snapshot = mismatches(db.path(), "test");
         assert_eq!(snapshot["state"], "healthy");
         assert_eq!(snapshot["mismatches"], 0);
-        let _ = std::fs::remove_file(path);
     }
 }

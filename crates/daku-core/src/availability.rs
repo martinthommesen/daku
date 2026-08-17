@@ -237,6 +237,7 @@ fn parse_glide_war(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDb;
 
     const OK_JSON: &str = include_str!("../tests/fixtures/availability/ok.json");
     const HIBERNATING_HTML: &str = include_str!("../tests/fixtures/availability/hibernating.html");
@@ -289,10 +290,8 @@ mod tests {
 
     #[test]
     fn persist_availability_snapshot_writes_one_row() {
-        let path =
-            std::env::temp_dir().join(format!("daku-avail-persist-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = crate::persistence::StateStore::daemon(path.clone());
+        let db = TempDb::new("avail-persist");
+        let store = db.store();
         let connection = store.open().unwrap();
         let observation = classify_availability_response(200, "application/json", OK_JSON, 42);
         persist_availability_snapshot(&connection, "prod", &observation, 1_700_000_000).unwrap();
@@ -315,6 +314,5 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1);
-        let _ = std::fs::remove_file(path);
     }
 }

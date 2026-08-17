@@ -156,6 +156,7 @@ fn persist_last_clone_unreachable(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::TempDb;
     use std::sync::Arc;
 
     use crate::collector::SignalCollector;
@@ -241,11 +242,9 @@ mod tests {
         }
     }
 
-    fn collect_last_clone(status: u16, body: &'static str) -> (std::path::PathBuf, StateStore) {
-        let path =
-            std::env::temp_dir().join(format!("daku-last-clone-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+    fn collect_last_clone(status: u16, body: &'static str) -> (TempDb, StateStore) {
+        let db = TempDb::new("last-clone");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
@@ -259,12 +258,13 @@ mod tests {
             store,
         );
         collector.collect().unwrap();
-        (path.clone(), StateStore::daemon(path))
+        let reopened = db.store();
+        (db, reopened)
     }
 
     #[test]
     fn last_clone_signal_completed_writes_healthy_snapshot() {
-        let (path, store) = collect_last_clone(
+        let (_db, store) = collect_last_clone(
             200,
             include_str!("../tests/fixtures/last_clone/completed.json"),
         );
@@ -281,12 +281,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn last_clone_signal_403_writes_healthy_unsupported() {
-        let (path, store) =
+        let (_db, store) =
             collect_last_clone(403, r#"{"error":{"message":"Operation not allowed"}}"#);
         let connection = store.open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", LAST_CLONE_SIGNAL_ID)
@@ -297,12 +296,11 @@ mod tests {
         assert_eq!(payload["supported"], false);
         assert!(payload["completed"].is_null());
         assert!(payload.get("reachability").is_none());
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn last_clone_signal_probe_failure_is_healthy_unreachable() {
-        let (path, store) = collect_last_clone(500, r#"{"error":{"message":"boom"}}"#);
+        let (_db, store) = collect_last_clone(500, r#"{"error":{"message":"boom"}}"#);
         let connection = store.open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", LAST_CLONE_SIGNAL_ID)
             .unwrap()
@@ -311,6 +309,5 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["reachability"], "unreachable");
         assert!(payload.get("supported").is_none());
-        let _ = std::fs::remove_file(path);
     }
 }

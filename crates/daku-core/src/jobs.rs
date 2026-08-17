@@ -164,11 +164,12 @@ fn persist_jobs_down(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::{TempDb, prod};
     use std::sync::Arc;
 
     use crate::collector::SignalCollector;
-    use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore};
-    use crate::persistence::{self, StateStore};
+    use crate::config::MemoryCredentialStore;
+    use crate::persistence;
     use crate::servicenow::{
         HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
     };
@@ -200,22 +201,10 @@ mod tests {
         }
     }
 
-    fn prod() -> EnvironmentConfig {
-        EnvironmentConfig {
-            id: "prod".into(),
-            label: "Production".into(),
-            instance_url: "https://acme-prod.example.service-now.com".into(),
-            auth_method: AuthMethod::Basic,
-            sort_order: 0,
-            clone_source: false,
-        }
-    }
-
     #[test]
     fn jobs_signal_zeros_are_healthy_and_write_sample() {
-        let path = std::env::temp_dir().join(format!("daku-jobs-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("jobs");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         let collector = JobsCollector::new(
@@ -232,7 +221,7 @@ mod tests {
         );
         collector.collect().unwrap();
 
-        let connection = StateStore::daemon(path.clone()).open().unwrap();
+        let connection = db.store().open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", JOBS_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
@@ -244,15 +233,12 @@ mod tests {
             persistence::load_signal_samples(&connection, "prod", JOBS_SIGNAL_ID).unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value_real, Some(0.0));
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn jobs_signal_overdue_is_degraded() {
-        let path =
-            std::env::temp_dir().join(format!("daku-jobs-overdue-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("jobs-overdue");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         let collector = JobsCollector::new(
@@ -269,7 +255,7 @@ mod tests {
         );
         collector.collect().unwrap();
 
-        let connection = StateStore::daemon(path.clone()).open().unwrap();
+        let connection = db.store().open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", JOBS_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
@@ -280,7 +266,6 @@ mod tests {
         let samples =
             persistence::load_signal_samples(&connection, "prod", JOBS_SIGNAL_ID).unwrap();
         assert_eq!(samples[0].value_real, Some(2.0));
-        let _ = std::fs::remove_file(path);
     }
 
     struct JobsFailTransport;
@@ -293,9 +278,8 @@ mod tests {
 
     #[test]
     fn jobs_signal_probe_failure_is_down_without_sample() {
-        let path = std::env::temp_dir().join(format!("daku-jobs-fail-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("jobs-fail");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         let collector = JobsCollector::new(
@@ -306,7 +290,7 @@ mod tests {
         );
         collector.collect().unwrap();
 
-        let connection = StateStore::daemon(path.clone()).open().unwrap();
+        let connection = db.store().open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", JOBS_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
@@ -319,6 +303,5 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let _ = std::fs::remove_file(path);
     }
 }

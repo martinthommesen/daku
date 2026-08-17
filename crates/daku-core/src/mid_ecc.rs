@@ -207,10 +207,11 @@ fn persist_mid_ecc_down(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::{TempDb, prod};
     use std::sync::Arc;
 
     use crate::collector::SignalCollector;
-    use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore};
+    use crate::config::MemoryCredentialStore;
     use crate::persistence::{self, StateStore};
     use crate::servicenow::{
         HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
@@ -260,25 +261,13 @@ mod tests {
         }
     }
 
-    fn prod() -> EnvironmentConfig {
-        EnvironmentConfig {
-            id: "prod".into(),
-            label: "Production".into(),
-            instance_url: "https://acme-prod.example.service-now.com".into(),
-            auth_method: AuthMethod::Basic,
-            sort_order: 0,
-            clone_source: false,
-        }
-    }
-
     fn collect_with(
         agents: &'static str,
         ready: &'static str,
         error: &'static str,
-    ) -> (std::path::PathBuf, StateStore) {
-        let path = std::env::temp_dir().join(format!("daku-mid-ecc-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+    ) -> (TempDb, StateStore) {
+        let db = TempDb::new("mid-ecc");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         let collector = MidEccCollector::new(
@@ -295,7 +284,8 @@ mod tests {
             store,
         );
         collector.collect().unwrap();
-        (path.clone(), StateStore::daemon(path))
+        let reopened = db.store();
+        (db, reopened)
     }
 
     #[test]
@@ -324,7 +314,7 @@ mod tests {
 
     #[test]
     fn mid_ecc_signal_empty_agents_zero_queue_is_healthy() {
-        let (path, store) = collect_with(
+        let (_db, store) = collect_with(
             include_str!("../tests/fixtures/mid_ecc/agents_empty.json"),
             include_str!("../tests/fixtures/mid_ecc/count_0.json"),
             include_str!("../tests/fixtures/mid_ecc/count_0.json"),
@@ -344,12 +334,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn mid_ecc_signal_down_agent_is_degraded() {
-        let (path, store) = collect_with(
+        let (_db, store) = collect_with(
             include_str!("../tests/fixtures/mid_ecc/agents_down.json"),
             include_str!("../tests/fixtures/mid_ecc/count_0.json"),
             include_str!("../tests/fixtures/mid_ecc/count_0.json"),
@@ -362,12 +351,11 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["agents_total"], 1);
         assert_eq!(payload["agents_unhealthy"], 1);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn mid_ecc_signal_ecc_error_is_degraded() {
-        let (path, store) = collect_with(
+        let (_db, store) = collect_with(
             include_str!("../tests/fixtures/mid_ecc/agents_empty.json"),
             include_str!("../tests/fixtures/mid_ecc/count_0.json"),
             include_str!("../tests/fixtures/mid_ecc/count_2.json"),
@@ -379,12 +367,11 @@ mod tests {
         assert_eq!(row.state, "degraded");
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["ecc_error"], 2);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn mid_ecc_signal_ready_at_ceiling_is_degraded() {
-        let (path, store) = collect_with(
+        let (_db, store) = collect_with(
             include_str!("../tests/fixtures/mid_ecc/agents_empty.json"),
             include_str!("../tests/fixtures/mid_ecc/count_100.json"),
             include_str!("../tests/fixtures/mid_ecc/count_0.json"),
@@ -396,7 +383,6 @@ mod tests {
         assert_eq!(row.state, "degraded");
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["ecc_output_ready"], 100);
-        let _ = std::fs::remove_file(path);
     }
 
     struct MidEccFailTransport;
@@ -409,10 +395,8 @@ mod tests {
 
     #[test]
     fn mid_ecc_signal_probe_failure_is_down_without_sample() {
-        let path =
-            std::env::temp_dir().join(format!("daku-mid-ecc-fail-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("mid-ecc-fail");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         let collector = MidEccCollector::new(
@@ -423,7 +407,7 @@ mod tests {
         );
         collector.collect().unwrap();
 
-        let connection = StateStore::daemon(path.clone()).open().unwrap();
+        let connection = db.store().open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", MID_ECC_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
@@ -436,6 +420,5 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let _ = std::fs::remove_file(path);
     }
 }

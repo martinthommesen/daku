@@ -131,10 +131,11 @@ fn persist_outbound_down(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::{TempDb, prod};
     use std::sync::Arc;
 
     use crate::collector::SignalCollector;
-    use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore};
+    use crate::config::MemoryCredentialStore;
     use crate::persistence::{self, StateStore};
     use crate::servicenow::{
         HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
@@ -182,21 +183,9 @@ mod tests {
         }
     }
 
-    fn prod() -> EnvironmentConfig {
-        EnvironmentConfig {
-            id: "prod".into(),
-            label: "Production".into(),
-            instance_url: "https://acme-prod.example.service-now.com".into(),
-            auth_method: AuthMethod::Basic,
-            sort_order: 0,
-            clone_source: false,
-        }
-    }
-
-    fn collect_with(body: &'static str) -> (std::path::PathBuf, StateStore) {
-        let path = std::env::temp_dir().join(format!("daku-outbound-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+    fn collect_with(body: &'static str) -> (TempDb, StateStore) {
+        let db = TempDb::new("outbound");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         let collector = OutboundCollector::new(
@@ -206,12 +195,13 @@ mod tests {
             store,
         );
         collector.collect().unwrap();
-        (path.clone(), StateStore::daemon(path))
+        let reopened = db.store();
+        (db, reopened)
     }
 
     #[test]
     fn outbound_signal_zero_writes_healthy_snapshot_without_sample() {
-        let (path, store) = collect_with(include_str!("../tests/fixtures/outbound/count_0.json"));
+        let (_db, store) = collect_with(include_str!("../tests/fixtures/outbound/count_0.json"));
         let connection = store.open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", OUTBOUND_SIGNAL_ID)
             .unwrap()
@@ -224,12 +214,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn outbound_signal_nonzero_writes_degraded_snapshot() {
-        let (path, store) = collect_with(include_str!("../tests/fixtures/outbound/count_3.json"));
+        let (_db, store) = collect_with(include_str!("../tests/fixtures/outbound/count_3.json"));
         let connection = store.open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", OUTBOUND_SIGNAL_ID)
             .unwrap()
@@ -242,7 +231,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let _ = std::fs::remove_file(path);
     }
 
     struct OutboundFailTransport;
@@ -255,10 +243,8 @@ mod tests {
 
     #[test]
     fn outbound_signal_probe_failure_is_down_without_sample() {
-        let path =
-            std::env::temp_dir().join(format!("daku-outbound-fail-{}.db", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::daemon(path.clone());
+        let db = TempDb::new("outbound-fail");
+        let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         let collector = OutboundCollector::new(
@@ -269,7 +255,7 @@ mod tests {
         );
         collector.collect().unwrap();
 
-        let connection = StateStore::daemon(path.clone()).open().unwrap();
+        let connection = db.store().open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", OUTBOUND_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
@@ -282,6 +268,5 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let _ = std::fs::remove_file(path);
     }
 }
