@@ -76,7 +76,7 @@ Recommended order = table order (tiers: **A** baseline/bugs, **B** tests+debt fo
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
-| [011](011-green-baseline-check-gate.md) | Make the local verification gate one command and green (fix `extra` flatten test, fmt, lint; `bun run check`) ([#34](https://github.com/martinthommesen/daku/issues/34)) | P1 | S | — | TODO |
+| [011](011-green-baseline-check-gate.md) | Make the local verification gate one command and green (fix `extra` flatten test, fmt, lint; `bun run check`) ([#34](https://github.com/martinthommesen/daku/issues/34)) | P1 | S | — | DONE |
 | [012](012-bound-server-controlled-durations-and-token.md) | Cap `Retry-After` / OAuth `expires_in`; refuse an empty daemon token ([#35](https://github.com/martinthommesen/daku/issues/35)) | P1 | S | 011 | TODO |
 | [014](014-replay-dashboard-on-subscribe.md) | Replay latest dashboard state to new subscribers; publish before first tick ([#36](https://github.com/martinthommesen/daku/issues/36)) | P1 | S | 011 | TODO |
 | [013](013-asleep-never-degrades.md) | Asleep Environment never rolls up degraded; secondary Signals skip probing it ([#37](https://github.com/martinthommesen/daku/issues/37)) | P1 | M | 011 (land after 014) | TODO |
