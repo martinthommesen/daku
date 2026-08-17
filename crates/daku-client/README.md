@@ -1,7 +1,7 @@
 # daku-client
 
 Rust client for `daku-daemon`: authenticated WebSocket handshake, request
-correlation, subscriptions, replay cursors, and local-daemon supervision
+correlation, dashboard subscription, and local-daemon supervision
 (`DaemonSupervisor`). Depends on [`daku-protocol`](../daku-protocol), never on
 `daku-core`.
 

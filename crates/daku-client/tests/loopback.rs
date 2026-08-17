@@ -12,10 +12,8 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use daku_client::DaemonClient;
-use daku_core::{Backend, EventSink, ServerOptions, serve};
-use daku_protocol::{
-    ClientMessage, Command, PROTOCOL_VERSION, Request, ResponsePayload, ServerMessage,
-};
+use daku_core::{Backend, ServerOptions, serve};
+use daku_protocol::{ClientMessage, Command, PROTOCOL_VERSION, ResponsePayload, ServerMessage};
 use tungstenite::client::ClientRequestBuilder;
 use tungstenite::http::StatusCode;
 use uuid::Uuid;
@@ -26,8 +24,8 @@ const WAIT: Duration = Duration::from_secs(5);
 struct TestBackend;
 
 impl Backend for TestBackend {
-    fn handle(&self, request: Request, _: EventSink) -> anyhow::Result<ResponsePayload> {
-        match request.command {
+    fn handle(&self, command: Command) -> anyhow::Result<ResponsePayload> {
+        match command {
             Command::Ping => Ok(ResponsePayload::Ack),
             Command::GetSettings => Ok(ResponsePayload::Settings {
                 settings: Default::default(),
@@ -121,13 +119,9 @@ fn wrong_token_is_rejected_at_hello() {
 fn correct_token_gets_ack_and_settings() {
     let daemon = Daemon::start(false, &[]);
     let client = daemon.connect();
-    let ack = client
-        .request(Uuid::nil(), Uuid::nil(), Command::Ping)
-        .unwrap();
+    let ack = client.request(Command::Ping).unwrap();
     assert!(matches!(ack, ResponsePayload::Ack), "unexpected {ack:?}");
-    let settings = client
-        .request(Uuid::nil(), Uuid::nil(), Command::GetSettings)
-        .unwrap();
+    let settings = client.request(Command::GetSettings).unwrap();
     assert!(
         matches!(settings, ResponsePayload::Settings { .. }),
         "unexpected {settings:?}"
@@ -169,9 +163,7 @@ fn shutdown_is_rejected_unless_allowed() {
     let daemon = Daemon::start(false, &[]);
     daemon.connect().shutdown();
     let client = daemon.connect();
-    let ack = client
-        .request(Uuid::nil(), Uuid::nil(), Command::Ping)
-        .unwrap();
+    let ack = client.request(Command::Ping).unwrap();
     assert!(matches!(ack, ResponsePayload::Ack), "unexpected {ack:?}");
 
     let daemon = Daemon::start(true, &[]);
@@ -214,7 +206,7 @@ fn daemon_shutdown_disconnects_client() {
 
     let deadline = Instant::now() + WAIT;
     let error = loop {
-        match client.request(Uuid::nil(), Uuid::nil(), Command::Ping) {
+        match client.request(Command::Ping) {
             Err(error) => break error,
             Ok(payload) => assert!(
                 Instant::now() < deadline,
@@ -239,7 +231,6 @@ fn wrong_protocol_version_is_rejected() {
         protocol_version: PROTOCOL_VERSION + 1,
         token: TOKEN.to_owned(),
         client_id: Uuid::new_v4(),
-        resume_from: vec![],
     })
     .unwrap();
     socket

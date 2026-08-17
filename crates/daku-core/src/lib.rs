@@ -27,9 +27,9 @@ pub use config::default_environments_path;
 pub use daku_protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
     EnvironmentHealth, EnvironmentSummary, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, Reachability,
-    ReplayCursor, Request, ResponseOutcome, ResponsePayload, RpcError, SamplePoint, SequencedEvent,
-    ServerMessage, SignalSnapshotDto, WireDriverEvent,
+    Request, ResponseOutcome, ResponsePayload, RpcError, SamplePoint, ServerMessage,
+    SignalSnapshotDto,
 };
 pub use hollow_backend::HollowBackend;
-pub use server::{Backend, EventSink, ServerOptions, serve};
+pub use server::{Backend, ServerOptions, serve};
 pub use settings::{DaemonSettings, DaemonSettingsStore};

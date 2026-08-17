@@ -1,11 +1,9 @@
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::settings::DaemonSettings;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "DAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "DAKU_DAEMON_ADDRESS";
@@ -30,8 +28,6 @@ pub enum ClientMessage {
         protocol_version: u32,
         token: String,
         client_id: Uuid,
-        #[serde(default)]
-        resume_from: Vec<ReplayCursor>,
     },
     Request(Request),
     Shutdown,
@@ -41,18 +37,7 @@ pub enum ClientMessage {
 #[serde(rename_all = "camelCase")]
 pub struct Request {
     pub request_id: Uuid,
-    pub session_id: Uuid,
-    pub runtime_id: Uuid,
     pub command: Command,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReplayCursor {
-    pub session_id: Uuid,
-    pub runtime_id: Uuid,
-    pub epoch: Uuid,
-    pub sequence: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -65,34 +50,6 @@ pub enum Command {
     Ping,
     GetSettings,
     UpdateSettings { settings: DaemonSettings },
-    LoadTaskState,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WireDriverEvent {
-    pub kind: String,
-    #[serde(default)]
-    pub payload: serde_json::Value,
-}
-
-impl WireDriverEvent {
-    pub fn new(kind: impl Into<String>, payload: serde_json::Value) -> Self {
-        Self {
-            kind: kind.into(),
-            payload,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SequencedEvent {
-    pub session_id: Uuid,
-    pub runtime_id: Uuid,
-    pub epoch: Uuid,
-    pub sequence: u64,
-    pub event: WireDriverEvent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -156,10 +113,6 @@ pub enum ServerMessage {
         request_id: Uuid,
         outcome: ResponseOutcome,
     },
-    Event(SequencedEvent),
-    TaskStateChanged {
-        revision: u64,
-    },
     EnvironmentsUpdated {
         environments: Vec<EnvironmentSummary>,
     },
@@ -214,15 +167,7 @@ pub enum ResponseOutcome {
 )]
 pub enum ResponsePayload {
     Ack,
-    Settings {
-        settings: DaemonSettings,
-    },
-    TaskState {
-        projects: Vec<serde_json::Value>,
-        sessions: Vec<serde_json::Value>,
-        default_cwd: PathBuf,
-        projectless_root: Option<PathBuf>,
-    },
+    Settings { settings: DaemonSettings },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -248,18 +193,32 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             token: "secret".into(),
             client_id: Uuid::from_u128(2),
-            resume_from: vec![ReplayCursor {
-                session_id: Uuid::nil(),
-                runtime_id: Uuid::from_u128(1),
-                epoch: Uuid::from_u128(3),
-                sequence: 9,
-            }],
         };
         let json = serde_json::to_value(message).unwrap();
 
         assert_eq!(json["type"], "hello");
         assert_eq!(json["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(json["resumeFrom"][0]["sequence"], 9);
+        assert!(json.get("clientId").is_some());
+        assert!(json.get("resumeFrom").is_none());
+    }
+
+    #[test]
+    fn request_carries_only_id_and_command() {
+        let json = serde_json::to_value(Request {
+            request_id: Uuid::from_u128(7),
+            command: Command::Ping,
+        })
+        .unwrap();
+        // Sorted: `serde_json` key order depends on its `preserve_order`
+        // feature, which workspace feature unification turns on.
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["command", "requestId"]);
     }
 
     #[test]
@@ -350,7 +309,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_daku_domain() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]

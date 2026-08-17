@@ -1,10 +1,9 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use daku_protocol::{Command, Request, ResponsePayload};
+use daku_protocol::{Command, ResponsePayload};
 
+use crate::Backend;
 use crate::settings::DaemonSettingsStore;
-use crate::{Backend, EventSink};
 
 pub struct HollowBackend {
     settings: Arc<DaemonSettingsStore>,
@@ -23,8 +22,8 @@ impl HollowBackend {
 }
 
 impl Backend for HollowBackend {
-    fn handle(&self, request: Request, _: EventSink) -> anyhow::Result<ResponsePayload> {
-        match request.command {
+    fn handle(&self, command: Command) -> anyhow::Result<ResponsePayload> {
+        match command {
             Command::Ping => Ok(ResponsePayload::Ack),
             Command::GetSettings => Ok(ResponsePayload::Settings {
                 settings: self.settings.get(),
@@ -33,13 +32,6 @@ impl Backend for HollowBackend {
                 self.settings.replace(settings)?;
                 Ok(ResponsePayload::Ack)
             }
-            // ponytail: empty catalog until Environments/Signals (plan 002+); replace with real task state.
-            Command::LoadTaskState => Ok(ResponsePayload::TaskState {
-                projects: Vec::new(),
-                sessions: Vec::new(),
-                default_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                projectless_root: None,
-            }),
         }
     }
 }

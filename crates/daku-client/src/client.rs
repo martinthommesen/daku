@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -15,13 +15,12 @@ use uuid::Uuid;
 
 use daku_protocol::MAX_WIRE_MESSAGE_BYTES;
 use daku_protocol::{
-    ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
-    ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireDriverEvent,
+    ClientMessage, Command, PROTOCOL_VERSION, Request, ResponseOutcome, ResponsePayload, RpcError,
+    ServerMessage,
 };
 
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_BUFFERED_EVENTS_PER_RUNTIME: usize = 4096;
 
 enum Outgoing {
     Message(ClientMessage),
@@ -31,19 +30,9 @@ enum Outgoing {
 struct ClientInner {
     outgoing: Sender<Outgoing>,
     pending: Mutex<HashMap<Uuid, Sender<Result<ResponsePayload, RpcError>>>>,
-    sessions: Mutex<HashMap<(Uuid, Uuid), Sender<SequencedEvent>>>,
-    pending_events: Mutex<HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>>,
-    task_state_subscribers: Mutex<Vec<Sender<u64>>>,
     dashboard: Mutex<Vec<Sender<ServerMessage>>>,
     dashboard_cache: Mutex<BTreeMap<String, ServerMessage>>,
-    last_sequences: Mutex<HashMap<(Uuid, Uuid), LastSequence>>,
     disconnected: AtomicBool,
-}
-
-#[derive(Clone, Copy)]
-struct LastSequence {
-    epoch: Uuid,
-    sequence: u64,
 }
 
 #[derive(Clone)]
@@ -53,26 +42,6 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     pub fn connect(address: &str, token: String) -> anyhow::Result<Self> {
-        Self::connect_with_resume(address, token, Vec::new())
-    }
-
-    pub fn connect_with_resume(
-        address: &str,
-        token: String,
-        resume_from: Vec<ReplayCursor>,
-    ) -> anyhow::Result<Self> {
-        let last_sequences = resume_from
-            .iter()
-            .map(|cursor| {
-                (
-                    (cursor.session_id, cursor.runtime_id),
-                    LastSequence {
-                        epoch: cursor.epoch,
-                        sequence: cursor.sequence,
-                    },
-                )
-            })
-            .collect();
         let url = daemon_url(address)?;
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_WIRE_MESSAGE_BYTES))
@@ -87,7 +56,6 @@ impl DaemonClient {
                 protocol_version: PROTOCOL_VERSION,
                 token,
                 client_id: Uuid::new_v4(),
-                resume_from,
             },
         )?;
         let hello = read_server_message(&mut socket)?;
@@ -109,12 +77,8 @@ impl DaemonClient {
         let inner = Arc::new(ClientInner {
             outgoing,
             pending: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
-            pending_events: Mutex::new(HashMap::new()),
-            task_state_subscribers: Mutex::new(Vec::new()),
             dashboard: Mutex::new(Vec::new()),
             dashboard_cache: Mutex::new(BTreeMap::new()),
-            last_sequences: Mutex::new(last_sequences),
             disconnected: AtomicBool::new(false),
         });
         let thread_inner = inner.clone();
@@ -123,32 +87,6 @@ impl DaemonClient {
             .spawn(move || run_client(socket, outgoing_rx, thread_inner))
             .context("could not start daku daemon client thread")?;
         Ok(Self { inner })
-    }
-
-    pub fn subscribe(&self, session_id: Uuid, runtime_id: Uuid) -> Receiver<SequencedEvent> {
-        let (events, receiver) = unbounded();
-        let key = (session_id, runtime_id);
-        let mut sessions = self.inner.sessions.lock();
-        sessions.insert(key, events.clone());
-        // Keep the subscription lock while draining the pre-subscription
-        // replay queue. The socket thread takes these locks in the same order,
-        // so a new live event cannot overtake older replayed events here.
-        if let Some(buffered) = self.inner.pending_events.lock().remove(&key) {
-            for event in buffered {
-                let _ = events.send(event);
-            }
-        }
-        receiver
-    }
-
-    pub fn unsubscribe(&self, session_id: Uuid, runtime_id: Uuid) {
-        self.inner.sessions.lock().remove(&(session_id, runtime_id));
-    }
-
-    pub fn subscribe_task_state(&self) -> Receiver<u64> {
-        let (events, receiver) = unbounded();
-        self.inner.task_state_subscribers.lock().push(events);
-        receiver
     }
 
     pub fn subscribe_dashboard(&self) -> Receiver<ServerMessage> {
@@ -160,12 +98,7 @@ impl DaemonClient {
         receiver
     }
 
-    pub fn request(
-        &self,
-        session_id: Uuid,
-        runtime_id: Uuid,
-        command: Command,
-    ) -> anyhow::Result<ResponsePayload> {
+    pub fn request(&self, command: Command) -> anyhow::Result<ResponsePayload> {
         if self.inner.disconnected.load(Ordering::Acquire) {
             bail!("daku daemon is disconnected");
         }
@@ -174,8 +107,6 @@ impl DaemonClient {
         self.inner.pending.lock().insert(request_id, response);
         let message = ClientMessage::Request(Request {
             request_id,
-            session_id,
-            runtime_id,
             command,
         });
         if self
@@ -195,43 +126,6 @@ impl DaemonClient {
                 Err(anyhow!("timed out waiting for daku daemon: {error}"))
             }
         }
-    }
-
-    pub fn notify(
-        &self,
-        session_id: Uuid,
-        runtime_id: Uuid,
-        command: Command,
-    ) -> anyhow::Result<()> {
-        if self.inner.disconnected.load(Ordering::Acquire) {
-            bail!("daku daemon is disconnected");
-        }
-        self.inner
-            .outgoing
-            .send(Outgoing::Message(ClientMessage::Request(Request {
-                // The nil request id is reserved for fire-and-forget controls;
-                // the daemon executes them in the runtime mailbox but does
-                // not allocate or send a response.
-                request_id: Uuid::nil(),
-                session_id,
-                runtime_id,
-                command,
-            })))
-            .map_err(|_| anyhow!("daku daemon connection is closed"))
-    }
-
-    pub fn last_sequences(&self) -> Vec<ReplayCursor> {
-        self.inner
-            .last_sequences
-            .lock()
-            .iter()
-            .map(|(&(session_id, runtime_id), cursor)| ReplayCursor {
-                session_id,
-                runtime_id,
-                epoch: cursor.epoch,
-                sequence: cursor.sequence,
-            })
-            .collect()
     }
 
     pub fn shutdown(&self) {
@@ -291,45 +185,6 @@ fn run_client(
                             let _ = pending.send(result);
                         }
                     }
-                    ServerMessage::Event(event) => {
-                        let should_deliver = {
-                            let mut sequences = inner.last_sequences.lock();
-                            let previous = sequences
-                                .entry((event.session_id, event.runtime_id))
-                                .or_insert(LastSequence {
-                                    epoch: event.epoch,
-                                    sequence: 0,
-                                });
-                            if previous.epoch == event.epoch && event.sequence <= previous.sequence
-                            {
-                                false
-                            } else {
-                                previous.epoch = event.epoch;
-                                previous.sequence = event.sequence;
-                                true
-                            }
-                        };
-                        if should_deliver {
-                            let key = (event.session_id, event.runtime_id);
-                            let sessions = inner.sessions.lock();
-                            if let Some(events) = sessions.get(&key) {
-                                let _ = events.send(event);
-                            } else {
-                                let mut pending = inner.pending_events.lock();
-                                let buffered = pending.entry(key).or_default();
-                                buffered.push_back(event);
-                                while buffered.len() > MAX_BUFFERED_EVENTS_PER_RUNTIME {
-                                    buffered.pop_front();
-                                }
-                            }
-                        }
-                    }
-                    ServerMessage::TaskStateChanged { revision } => {
-                        inner
-                            .task_state_subscribers
-                            .lock()
-                            .retain(|subscriber| subscriber.send(revision).is_ok());
-                    }
                     ServerMessage::EnvironmentsUpdated { .. }
                     | ServerMessage::SignalSnapshotsUpdated { .. }
                     | ServerMessage::SignalSamplesUpdated { .. } => {
@@ -363,26 +218,6 @@ fn run_client(
             message: "daku daemon disconnected".into(),
         }));
     }
-    let sessions = std::mem::take(&mut *inner.sessions.lock());
-    for ((session_id, runtime_id), events) in sessions {
-        // This event is synthesized locally and is not present in the
-        // daemon's replay journal. Do not advance the replay cursor for it or
-        // reconnecting to the same daemon would skip the next real event.
-        let (epoch, sequence) = inner
-            .last_sequences
-            .lock()
-            .get(&(session_id, runtime_id))
-            .map(|cursor| (cursor.epoch, cursor.sequence))
-            .unwrap_or((Uuid::nil(), 0));
-        let _ = events.send(SequencedEvent {
-            session_id,
-            runtime_id,
-            epoch,
-            sequence,
-            event: WireDriverEvent::new("processExited", serde_json::Value::Null),
-        });
-    }
-    inner.task_state_subscribers.lock().clear();
     inner.dashboard.lock().clear();
     inner.dashboard_cache.lock().clear();
 }

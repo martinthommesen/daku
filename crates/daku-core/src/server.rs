@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use daku_protocol::{
-    ClientMessage, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, ReplayCursor, Request,
-    ResponseOutcome, ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireDriverEvent,
+    ClientMessage, Command, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, Request, ResponseOutcome,
+    ResponsePayload, RpcError, ServerMessage,
 };
 use parking_lot::Mutex as ParkingMutex;
 use subtle::ConstantTimeEq as _;
@@ -19,14 +19,11 @@ use tungstenite::handshake::server::{
 use tungstenite::http::{StatusCode, header::ORIGIN};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket, accept_hdr_with_config};
-use uuid::Uuid;
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_HANDSHAKE_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 64;
-const MAX_REPLAY_EVENTS_PER_SESSION: usize = 4096;
-const MAX_CACHED_RESPONSES: usize = 2048;
 
 #[derive(Clone, Debug, Default)]
 pub struct ServerOptions {
@@ -43,96 +40,24 @@ impl Drop for ConnectionPermit {
 }
 
 pub trait Backend: Send + Sync + 'static {
-    fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload>;
+    fn handle(&self, command: Command) -> anyhow::Result<ResponsePayload>;
 
     fn shutdown(&self) {}
-}
-
-#[derive(Clone)]
-pub struct EventSink {
-    session_id: Uuid,
-    runtime_id: Uuid,
-    hub: Arc<Hub>,
-}
-
-impl EventSink {
-    pub fn send(&self, event: WireDriverEvent) -> anyhow::Result<()> {
-        self.hub.emit(self.session_id, self.runtime_id, event, true);
-        Ok(())
-    }
-
-    pub fn send_ephemeral(&self, event: WireDriverEvent) -> anyhow::Result<()> {
-        self.hub
-            .emit(self.session_id, self.runtime_id, event, false);
-        Ok(())
-    }
 }
 
 #[derive(Default)]
 struct HubState {
     next_subscriber_id: u64,
-    task_state_revision: u64,
     subscribers: HashMap<u64, Sender<ServerMessage>>,
-    active_runtimes: HashMap<Uuid, Uuid>,
-    next_sequences: HashMap<(Uuid, Uuid), u64>,
-    journal: HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>,
-    responses: VecDeque<(Uuid, ResponseOutcome)>,
     dashboard: BTreeMap<String, ServerMessage>,
 }
 
+#[derive(Default)]
 struct Hub {
-    epoch: Uuid,
     state: ParkingMutex<HubState>,
 }
 
-impl Default for Hub {
-    fn default() -> Self {
-        Self {
-            epoch: Uuid::new_v4(),
-            state: ParkingMutex::new(HubState::default()),
-        }
-    }
-}
-
 impl Hub {
-    fn event_sink(self: &Arc<Self>, session_id: Uuid, runtime_id: Uuid) -> EventSink {
-        EventSink {
-            session_id,
-            runtime_id,
-            hub: self.clone(),
-        }
-    }
-
-    fn emit(&self, session_id: Uuid, runtime_id: Uuid, event: WireDriverEvent, replayable: bool) {
-        let mut state = self.state.lock();
-        if state.active_runtimes.get(&session_id) != Some(&runtime_id) {
-            return;
-        }
-        let sequence = state
-            .next_sequences
-            .entry((session_id, runtime_id))
-            .or_default();
-        *sequence = sequence.saturating_add(1);
-        let event = SequencedEvent {
-            session_id,
-            runtime_id,
-            epoch: self.epoch,
-            sequence: *sequence,
-            event,
-        };
-        if replayable {
-            let journal = state.journal.entry((session_id, runtime_id)).or_default();
-            journal.push_back(event.clone());
-            while journal.len() > MAX_REPLAY_EVENTS_PER_SESSION {
-                journal.pop_front();
-            }
-        }
-        let message = ServerMessage::Event(event);
-        state
-            .subscribers
-            .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
-    }
-
     fn broadcast(&self, message: ServerMessage) {
         let mut state = self.state.lock();
         state
@@ -151,22 +76,8 @@ impl Hub {
             .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
     }
 
-    fn subscribe(&self, resume_from: &[ReplayCursor], sender: Sender<ServerMessage>) -> u64 {
+    fn subscribe(&self, sender: Sender<ServerMessage>) -> u64 {
         let mut state = self.state.lock();
-        for (&(session_id, runtime_id), events) in &state.journal {
-            let sequence = resume_from
-                .iter()
-                .find(|cursor| {
-                    cursor.session_id == session_id
-                        && cursor.runtime_id == runtime_id
-                        && cursor.epoch == self.epoch
-                })
-                .map(|cursor| cursor.sequence)
-                .unwrap_or_default();
-            for event in events.iter().filter(|event| event.sequence > sequence) {
-                let _ = sender.send(ServerMessage::Event(event.clone()));
-            }
-        }
         for message in state.dashboard.values() {
             let _ = sender.send(message.clone());
         }
@@ -178,34 +89,6 @@ impl Hub {
 
     fn unsubscribe(&self, subscriber_id: u64) {
         self.state.lock().subscribers.remove(&subscriber_id);
-    }
-
-    fn task_state_changed(&self, source_subscriber_id: u64) {
-        let mut state = self.state.lock();
-        state.task_state_revision = state.task_state_revision.saturating_add(1);
-        let message = ServerMessage::TaskStateChanged {
-            revision: state.task_state_revision,
-        };
-        state.subscribers.retain(|subscriber_id, subscriber| {
-            *subscriber_id == source_subscriber_id || subscriber.send(message.clone()).is_ok()
-        });
-    }
-
-    fn cached_response(&self, request_id: Uuid) -> Option<ResponseOutcome> {
-        self.state
-            .lock()
-            .responses
-            .iter()
-            .rev()
-            .find_map(|(cached_id, outcome)| (*cached_id == request_id).then(|| outcome.clone()))
-    }
-
-    fn cache_response(&self, request_id: Uuid, outcome: ResponseOutcome) {
-        let mut state = self.state.lock();
-        state.responses.push_back((request_id, outcome));
-        while state.responses.len() > MAX_CACHED_RESPONSES {
-            state.responses.pop_front();
-        }
     }
 }
 
@@ -302,15 +185,12 @@ fn handle_connection(
     )
     .context("WebSocket handshake failed")?;
     let hello = read_client_message(&mut socket)?;
-    let resume_from = match hello {
+    match hello {
         ClientMessage::Hello {
             protocol_version,
             token,
-            resume_from,
             ..
-        } if protocol_version == PROTOCOL_VERSION && token_matches(expected_token, &token) => {
-            resume_from
-        }
+        } if protocol_version == PROTOCOL_VERSION && token_matches(expected_token, &token) => {}
         ClientMessage::Hello {
             protocol_version, ..
         } if protocol_version != PROTOCOL_VERSION => {
@@ -351,7 +231,7 @@ fn handle_connection(
         .set_read_timeout(Some(SOCKET_POLL_INTERVAL))?;
 
     let (outgoing, outgoing_rx) = unbounded();
-    let subscriber_id = hub.subscribe(&resume_from, outgoing.clone());
+    let subscriber_id = hub.subscribe(outgoing.clone());
 
     'connection: while !shutdown.load(Ordering::Acquire) {
         while let Ok(message) = outgoing_rx.try_recv() {
@@ -362,13 +242,7 @@ fn handle_connection(
         match socket.read() {
             Ok(Message::Text(text)) => match serde_json::from_str(text.as_ref()) {
                 Ok(ClientMessage::Request(request)) => {
-                    dispatch_request(
-                        request,
-                        outgoing.clone(),
-                        subscriber_id,
-                        backend.clone(),
-                        hub.clone(),
-                    );
+                    dispatch_request(request, outgoing.clone(), backend.clone());
                 }
                 Ok(ClientMessage::Shutdown) => {
                     if options.allow_shutdown {
@@ -402,52 +276,20 @@ fn handle_connection(
     Ok(())
 }
 
-fn dispatch_request(
-    request: Request,
-    outgoing: Sender<ServerMessage>,
-    source_subscriber_id: u64,
-    backend: Arc<dyn Backend>,
-    hub: Arc<Hub>,
-) {
+fn dispatch_request(request: Request, outgoing: Sender<ServerMessage>, backend: Arc<dyn Backend>) {
     std::thread::Builder::new()
         .name("daku-daemon-request".into())
         .spawn(move || {
-            let request_id = request.request_id;
-            let notification = request_id.is_nil();
-            let session_id = request.session_id;
-            let runtime_id = request.runtime_id;
-            let (outcome, executed) =
-                if !notification && let Some(cached) = hub.cached_response(request_id) {
-                    (cached, false)
-                } else {
-                    let outcome =
-                        match backend.handle(request, hub.event_sink(session_id, runtime_id)) {
-                            Ok(payload) => ResponseOutcome::Ok { payload },
-                            Err(error) => ResponseOutcome::Error {
-                                error: RpcError::from(error),
-                            },
-                        };
-                    if !notification {
-                        hub.cache_response(request_id, outcome.clone());
-                    }
-                    (outcome, true)
-                };
-            if executed && matches!(&outcome, ResponseOutcome::Ok { .. }) {
-                if matches!(
-                    outcome,
-                    ResponseOutcome::Ok {
-                        payload: ResponsePayload::TaskState { .. }
-                    }
-                ) {
-                    hub.task_state_changed(source_subscriber_id);
-                }
-            }
-            if !notification {
-                let _ = outgoing.send(ServerMessage::Response {
-                    request_id,
-                    outcome,
-                });
-            }
+            let outcome = match backend.handle(request.command) {
+                Ok(payload) => ResponseOutcome::Ok { payload },
+                Err(error) => ResponseOutcome::Error {
+                    error: RpcError::from(error),
+                },
+            };
+            let _ = outgoing.send(ServerMessage::Response {
+                request_id: request.request_id,
+                outcome,
+            });
         })
         .ok();
 }
@@ -540,8 +382,8 @@ mod tests {
     struct TestBackend;
 
     impl Backend for TestBackend {
-        fn handle(&self, request: Request, _: EventSink) -> anyhow::Result<ResponsePayload> {
-            match request.command {
+        fn handle(&self, command: Command) -> anyhow::Result<ResponsePayload> {
+            match command {
                 Command::Ping => Ok(ResponsePayload::Ack),
                 Command::GetSettings => Ok(ResponsePayload::Settings {
                     settings: Default::default(),
@@ -561,7 +403,7 @@ mod tests {
     fn hub_broadcasts_environments_updated() {
         let hub = Hub::default();
         let (tx, rx) = unbounded();
-        hub.subscribe(&[], tx);
+        hub.subscribe(tx);
         hub.broadcast(ServerMessage::EnvironmentsUpdated {
             environments: vec![],
         });
@@ -587,7 +429,7 @@ mod tests {
             environments: vec![],
         });
         let (tx, rx) = unbounded();
-        hub.subscribe(&[], tx);
+        hub.subscribe(tx);
         let replayed: Vec<ServerMessage> = rx.try_iter().collect();
         assert_eq!(replayed.len(), 2);
         assert!(matches!(
