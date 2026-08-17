@@ -139,3 +139,15 @@ Recommended order = table order (tiers: **A** baseline/bugs, **B** tests+debt fo
 - Splitting `drift.rs`/`servicenow.rs`/`process.rs` — cohesive single-topic modules.
 - "Upgrade happened" marker Signal — build drift already flags it; would need an ADR-0007 exception.
 - `scripts/delete-debug-app.ts` `sh.waku.dev`/`codes.waku.dev` — intentional legacy bundle IDs for cleaning pre-rename debug data.
+
+---
+
+## gpui-component adoption — 2026-08-17 (planned at `826a636`)
+
+Decided in a grill session; ADR-0008 + ADR-0005 amendment. **Tracking issue:** [#71](https://github.com/martinthommesen/daku/issues/71). Spike branch `spike/gpui-component` (`10e6585`) is the working reference and is deleted once 044 lands. Drift checks for 044+ use `826a636..HEAD` (045/046: the previous plan's landing commit) against each plan's Scope paths. Land in order; the Operator visually checks each step (`DAKU_UI_FIXTURE=1 bun run dev` + PDI) before the next.
+
+| Plan | Title | Priority | Effort | Depends on | Status |
+|------|-------|----------|--------|------------|--------|
+| [044](044-gpui-component-shell-and-pin.md) | Shell on gpui-component: Root, TitleBar, Sidebar, tokens; zed sha pinned in Cargo.lock only ([#68](https://github.com/martinthommesen/daku/issues/68)) | P1 | M | — | TODO |
+| [045](045-environment-detail-restyle.md) | Environment detail restyle: header, pills, Signal cards, compare strip ([#69](https://github.com/martinthommesen/daku/issues/69)) | P1 | M | 044 | TODO |
+| [046](046-drill-in-and-deep-links.md) | Card selection → Drill-in region + Open-in-ServiceNow links ([#70](https://github.com/martinthommesen/daku/issues/70)) | P2 | M | 045 | TODO |
