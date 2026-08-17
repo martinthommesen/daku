@@ -3,7 +3,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -140,6 +140,11 @@ impl StateStore {
         let connection = Connection::open(&self.path).map_err(to_io_error)?;
         connection
             .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+            .map_err(to_io_error)?;
+        // One connection per collector thread: wait for a writer instead of
+        // failing straight away with SQLITE_BUSY.
+        connection
+            .busy_timeout(Duration::from_secs(5))
             .map_err(to_io_error)?;
         apply_migrations(&connection)?;
         // WAL may recreate sidecar modes; re-assert the main db file mode.

@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, unbounded};
 use daku_protocol::ServerMessage;
@@ -42,29 +42,62 @@ pub trait SignalCollector: Send + Sync {
 
 pub struct CollectorLoop {
     interval: Duration,
-    collectors: Vec<Box<dyn SignalCollector>>,
+    /// Run concurrently, one scoped thread per group (one group per Environment).
+    groups: Vec<Vec<Box<dyn SignalCollector>>>,
+    /// Run sequentially after every group has finished (cross-Environment Signals).
+    shared: Vec<Box<dyn SignalCollector>>,
 }
 
 impl CollectorLoop {
     pub fn new(interval: Duration) -> Self {
         Self {
             interval,
-            collectors: Vec::new(),
+            groups: Vec::new(),
+            shared: Vec::new(),
         }
     }
 
+    /// Registers a collector that runs after all groups, on the calling thread.
     pub fn register(&mut self, collector: impl SignalCollector + 'static) {
-        self.collectors.push(Box::new(collector));
+        self.shared.push(Box::new(collector));
+    }
+
+    /// Registers a set of collectors that run in order on their own thread,
+    /// concurrently with the other groups.
+    pub fn register_group(&mut self, group: Vec<Box<dyn SignalCollector>>) {
+        if !group.is_empty() {
+            self.groups.push(group);
+        }
     }
 
     pub fn tick(&self) -> anyhow::Result<()> {
-        let mut first_error = None;
-        for collector in &self.collectors {
-            if let Err(error) = collector.collect() {
-                first_error.get_or_insert(error);
-            }
+        let started = Instant::now();
+        let mut errors: Vec<anyhow::Error> = std::thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .groups
+                .iter()
+                .map(|group| scope.spawn(move || run_sequential(group)))
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|handle| match handle.join() {
+                    Ok(result) => result.err(),
+                    Err(_) => Some(anyhow::anyhow!("collector group panicked")),
+                })
+                .collect()
+        });
+        if let Err(error) = run_sequential(&self.shared) {
+            errors.push(error);
         }
-        match first_error {
+        let elapsed = started.elapsed();
+        if elapsed > self.interval {
+            eprintln!(
+                "daku collector tick took {:.0}s (poll interval {:.0}s)",
+                elapsed.as_secs_f64(),
+                self.interval.as_secs_f64()
+            );
+        }
+        match errors.into_iter().next() {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -84,6 +117,19 @@ impl CollectorLoop {
             }
             clock.sleep(self.interval);
         }
+    }
+}
+
+fn run_sequential(collectors: &[Box<dyn SignalCollector>]) -> anyhow::Result<()> {
+    let mut first_error = None;
+    for collector in collectors {
+        if let Err(error) = collector.collect() {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -109,36 +155,41 @@ pub fn build_default_loop(
 ) -> CollectorLoop {
     let client = Arc::new(client);
     let mut loop_ = CollectorLoop::new(interval);
-    loop_.register(AvailabilityCollector::new(
-        environments.clone(),
-        credentials.clone(),
-        client.clone(),
-        store.clone(),
-    ));
-    loop_.register(JobsCollector::new(
-        environments.clone(),
-        credentials.clone(),
-        client.clone(),
-        store.clone(),
-    ));
-    loop_.register(SyslogCollector::new(
-        environments.clone(),
-        credentials.clone(),
-        client.clone(),
-        store.clone(),
-    ));
-    loop_.register(MidEccCollector::new(
-        environments.clone(),
-        credentials.clone(),
-        client.clone(),
-        store.clone(),
-    ));
-    loop_.register(OutboundCollector::new(
-        environments.clone(),
-        credentials.clone(),
-        client.clone(),
-        store.clone(),
-    ));
+    for environment in &environments {
+        let one = vec![environment.clone()];
+        loop_.register_group(vec![
+            Box::new(AvailabilityCollector::new(
+                one.clone(),
+                credentials.clone(),
+                client.clone(),
+                store.clone(),
+            )),
+            Box::new(JobsCollector::new(
+                one.clone(),
+                credentials.clone(),
+                client.clone(),
+                store.clone(),
+            )),
+            Box::new(SyslogCollector::new(
+                one.clone(),
+                credentials.clone(),
+                client.clone(),
+                store.clone(),
+            )),
+            Box::new(MidEccCollector::new(
+                one.clone(),
+                credentials.clone(),
+                client.clone(),
+                store.clone(),
+            )),
+            Box::new(OutboundCollector::new(
+                one,
+                credentials.clone(),
+                client.clone(),
+                store.clone(),
+            )),
+        ]);
+    }
     loop_.register(DriftCollector::new(
         environments.clone(),
         credentials.clone(),
@@ -430,6 +481,76 @@ mod tests {
             ran.load(Ordering::Acquire),
             "later collectors must still run"
         );
+    }
+
+    struct SleepingCollector(Duration, Arc<AtomicUsize>);
+
+    impl SignalCollector for SleepingCollector {
+        fn collect(&self) -> anyhow::Result<()> {
+            std::thread::sleep(self.0);
+            self.1.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn collector_loop_tick_runs_groups_concurrently() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut loop_ = CollectorLoop::new(Duration::from_secs(120));
+        for _ in 0..3 {
+            loop_.register_group(vec![Box::new(SleepingCollector(
+                Duration::from_millis(200),
+                calls.clone(),
+            ))]);
+        }
+        let started = Instant::now();
+        loop_.tick().unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 3);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "groups must not run serially"
+        );
+    }
+
+    #[test]
+    fn collector_loop_tick_isolates_failures_and_returns_first_error() {
+        struct Failing;
+        impl SignalCollector for Failing {
+            fn collect(&self) -> anyhow::Result<()> {
+                anyhow::bail!("boom")
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut loop_ = CollectorLoop::new(Duration::from_secs(120));
+        loop_.register_group(vec![
+            Box::new(Failing),
+            Box::new(SleepingCollector(Duration::ZERO, calls.clone())),
+        ]);
+        loop_.register(SleepingCollector(Duration::ZERO, calls.clone()));
+        let error = loop_.tick().unwrap_err();
+        assert!(error.to_string().contains("boom"));
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            2,
+            "later collectors still run"
+        );
+    }
+
+    #[test]
+    fn build_default_loop_groups_per_environment() {
+        let db = TempDb::new("groups");
+        let mut second = prod();
+        second.id = "test".into();
+        let loop_ = build_default_loop(
+            vec![prod(), second],
+            Arc::new(MemoryCredentialStore::default()),
+            db.store(),
+            Duration::from_secs(120),
+            ServiceNowClient::new(FixtureTransport, SystemClock),
+        );
+        assert_eq!(loop_.groups.len(), 2);
+        assert_eq!(loop_.groups[0].len(), 5);
+        assert_eq!(loop_.shared.len(), 2, "drift and last-clone stay shared");
     }
 
     #[test]
