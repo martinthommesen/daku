@@ -204,4 +204,63 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(environments.len(), 1);
     }
+    #[test]
+    fn load_environments_invalid_json_error_names_the_path() {
+        let path = write_temp("{not json");
+        let error = format!("{:#}", load_environments(&path).unwrap_err());
+        let _ = fs::remove_file(&path);
+        assert!(error.contains("parsing "), "{error}");
+        assert!(
+            error.contains(path.file_name().unwrap().to_str().unwrap()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn load_environments_missing_file_error_names_the_path() {
+        let path = std::env::temp_dir().join(format!("daku-missing-{}.json", uuid::Uuid::new_v4()));
+        let error = load_environments(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("reading "), "{error:#}");
+        // `collector::is_not_found` relies on the io::Error surviving in the chain.
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+        }));
+    }
+
+    #[test]
+    fn load_environments_rejects_unknown_auth_method() {
+        let path = write_temp(
+            r#"[{"id":"dev","label":"Dev","instance_url":"https://acme.example.service-now.com","auth_method":"saml","sort_order":0}]"#,
+        );
+        let error = load_environments(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+        assert!(format!("{error:#}").contains("parsing "), "{error:#}");
+    }
+
+    /// Duplicate ids parse today; pinned so a future validation change is deliberate.
+    #[test]
+    fn load_environments_sorts_by_sort_order_and_keeps_duplicate_ids() {
+        let entry = |id: &str, sort_order: i64| {
+            format!(
+                r#"{{"id":"{id}","label":"{id}","instance_url":"https://{id}.example.service-now.com","auth_method":"basic","sort_order":{sort_order}}}"#
+            )
+        };
+        let path = write_temp(&format!("[{},{}]", entry("second", 2), entry("first", 1)));
+        let environments = load_environments(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            environments
+                .iter()
+                .map(|environment| environment.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+
+        let path = write_temp(&format!("[{},{}]", entry("prod", 0), entry("prod", 1)));
+        let duplicates = load_environments(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(duplicates.len(), 2);
+    }
 }

@@ -951,4 +951,26 @@ mod tests {
         assert_eq!(count, 0, "doctor must not write snapshots");
         let _ = std::fs::remove_file(&environments_path);
     }
+    #[test]
+    fn start_default_loop_returns_none_for_missing_and_empty_config() {
+        let db = TempDb::new("start-default-loop");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let start = |path: &Path| {
+            start_default_loop(
+                path,
+                db.store(),
+                &DaemonSettings::default(),
+                shutdown.clone(),
+            )
+        };
+
+        let missing =
+            std::env::temp_dir().join(format!("daku-missing-{}.json", uuid::Uuid::new_v4()));
+        assert!(start(&missing).is_none());
+
+        let empty = std::env::temp_dir().join(format!("daku-empty-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&empty, "[]").unwrap();
+        assert!(start(&empty).is_none());
+        let _ = std::fs::remove_file(&empty);
+    }
 }

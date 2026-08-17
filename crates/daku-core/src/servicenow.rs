@@ -451,6 +451,32 @@ mod tests {
         }
     }
 
+    /// Lets a test walk past a token's expiry without sleeping.
+    struct AdvancingClock(Mutex<SystemTime>);
+
+    impl AdvancingClock {
+        fn new() -> Self {
+            Self(Mutex::new(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            ))
+        }
+
+        fn advance(&self, by: Duration) {
+            let mut now = self.0.lock().expect("clock");
+            *now += by;
+        }
+    }
+
+    impl Clock for AdvancingClock {
+        fn now(&self) -> SystemTime {
+            *self.0.lock().expect("clock")
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.advance(duration);
+        }
+    }
+
     fn basic_env() -> EnvironmentConfig {
         EnvironmentConfig {
             id: "dev".into(),
@@ -855,5 +881,180 @@ mod tests {
         fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
             self.0.execute(request)
         }
+    }
+    #[test]
+    fn servicenow_http_transport_error_propagates() {
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("dev", r#"{"username":"reader","password":"secret"}"#);
+        let client =
+            ServiceNowClient::new(ScriptedTransport::new(vec![]), RecordingClock::default());
+        let error = client
+            .request(
+                &basic_env(),
+                &credentials,
+                "GET",
+                "/api/now/table/sys_properties",
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no scripted response left"), "{error}");
+    }
+
+    #[test]
+    fn servicenow_http_missing_credential_is_an_error() {
+        let client =
+            ServiceNowClient::new(ScriptedTransport::new(vec![]), RecordingClock::default());
+        let error = client
+            .request(
+                &basic_env(),
+                &MemoryCredentialStore::default(),
+                "GET",
+                "/api/now/table/sys_properties",
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "no credential for environment dev");
+    }
+
+    #[test]
+    fn servicenow_http_oauth_token_endpoint_non_200_is_an_error() {
+        let transport = Arc::new(ScriptedTransport::new(vec![HttpResponse {
+            status: 401,
+            headers: vec![],
+            body: "{}".into(),
+        }]));
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("prod", r#"{"client_id":"id","client_secret":"secret"}"#);
+        let client = ServiceNowClient::new(
+            SharedTransport(transport.clone()),
+            RecordingClock::default(),
+        );
+        let error = client
+            .request(
+                &oauth_env(),
+                &credentials,
+                "GET",
+                "/api/now/table/sys_properties",
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("oauth_token.do returned HTTP 401"),
+            "{error}"
+        );
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.contains("oauth_token.do"));
+    }
+
+    #[test]
+    fn servicenow_http_oauth_token_body_not_json_is_an_error() {
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("prod", r#"{"client_id":"id","client_secret":"secret"}"#);
+        let client = ServiceNowClient::new(
+            ScriptedTransport::new(vec![HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: "<html>".into(),
+            }]),
+            RecordingClock::default(),
+        );
+        let error = format!(
+            "{:#}",
+            client
+                .request(
+                    &oauth_env(),
+                    &credentials,
+                    "GET",
+                    "/api/now/table/sys_properties",
+                    None,
+                )
+                .unwrap_err()
+        );
+        assert!(error.contains("oauth token JSON"), "{error}");
+    }
+
+    #[test]
+    fn servicenow_http_oauth_refetches_after_expiry() {
+        let short_token = |token: &str| HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: format!(r#"{{"access_token":"{token}","expires_in":60}}"#),
+        };
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            short_token("tok-1"),
+            ok_table(),
+            short_token("tok-2"),
+            ok_table(),
+        ]));
+        let clock = Arc::new(AdvancingClock::new());
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("prod", r#"{"client_id":"id","client_secret":"secret"}"#);
+        let client = ServiceNowClient::new(SharedTransport(transport.clone()), clock.clone());
+        let path = "/api/now/table/sys_properties";
+        let call = || {
+            client
+                .request(&oauth_env(), &credentials, "GET", path, None)
+                .unwrap()
+                .status
+        };
+        assert_eq!(call(), 200);
+        clock.advance(Duration::from_secs(61));
+        assert_eq!(call(), 200);
+        let requests = transport.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.contains("oauth_token.do"))
+                .count(),
+            2
+        );
+        let last = requests.last().expect("data request");
+        assert_eq!(
+            last.headers
+                .iter()
+                .find(|(name, _)| name == "Authorization")
+                .map(|(_, value)| value.as_str()),
+            Some("Bearer tok-2")
+        );
+    }
+
+    #[test]
+    fn servicenow_http_oauth_secret_is_form_urlencoded() {
+        let transport = Arc::new(ScriptedTransport::new(vec![token_ok("t"), ok_table()]));
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("prod", r#"{"client_id":"id","client_secret":"a&b=c d+e%"}"#);
+        let client = ServiceNowClient::new(
+            SharedTransport(transport.clone()),
+            RecordingClock::default(),
+        );
+        assert_eq!(
+            client
+                .request(
+                    &oauth_env(),
+                    &credentials,
+                    "GET",
+                    "/api/now/table/sys_properties",
+                    None
+                )
+                .unwrap()
+                .status,
+            200
+        );
+        let body = transport.requests()[0].body.clone().expect("token body");
+        let encoded = body
+            .split('&')
+            .find_map(|parameter| parameter.strip_prefix("client_secret="))
+            .expect("client_secret parameter");
+        assert_eq!(encoded, "a%26b%3Dc%20d%2Be%25");
+    }
+
+    #[test]
+    fn urlencode_keeps_unreserved_and_escapes_the_rest() {
+        assert_eq!(urlencode("AZaz09-_.~"), "AZaz09-_.~");
+        assert_eq!(urlencode(" /?#"), "%20%2F%3F%23");
     }
 }

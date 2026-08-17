@@ -758,4 +758,204 @@ mod tests {
         assert_eq!(prod.drift, "source of truth");
         assert_eq!(prod.last_clone, "");
     }
+    #[test]
+    fn dashboard_state_removed_selected_environment_falls_back_to_first() {
+        let mut state = loaded();
+        state.select("test");
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![env(
+                "prod",
+                "Production",
+                EnvironmentHealth::Healthy,
+                Reachability::Reachable,
+            )],
+        });
+        assert_eq!(state.selected_id(), Some("prod"));
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![],
+        });
+        assert_eq!(state.selected_id(), None);
+    }
+
+    #[test]
+    fn dashboard_state_select_unknown_id_is_noop() {
+        let mut state = loaded();
+        state.select("nope");
+        assert_eq!(state.selected_id(), Some("prod"));
+    }
+
+    #[test]
+    fn dashboard_state_disconnected_mutes_every_row() {
+        let mut state = loaded();
+        state.set_connected(false);
+        assert!(state.sidebar().iter().all(|row| row.muted));
+        state.set_connected(true);
+        assert!(state.sidebar().iter().all(|row| !row.muted));
+    }
+
+    #[test]
+    fn dashboard_state_none_sample_becomes_zero() {
+        let mut state = loaded();
+        let points = vec![
+            SamplePoint {
+                observed_at: 1,
+                value_real: None,
+            },
+            SamplePoint {
+                observed_at: 2,
+                value_real: Some(4.0),
+            },
+        ];
+        state.apply(&ServerMessage::SignalSamplesUpdated {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            points: points.clone(),
+        });
+        // Samples for a non-trend Signal are kept but never charted.
+        state.apply(&ServerMessage::SignalSamplesUpdated {
+            environment_id: "prod".into(),
+            signal_id: "availability".into(),
+            points,
+        });
+        let card = |signal_id: &str| {
+            state
+                .cards()
+                .into_iter()
+                .find(|card| card.signal_id == signal_id)
+                .unwrap()
+        };
+        assert_eq!(card("jobs").sparkline, vec![0.0, 4.0]);
+        assert!(card("availability").sparkline.is_empty());
+    }
+
+    #[test]
+    fn dashboard_state_single_environment_hides_compare_strip() {
+        let mut state = DashboardState::new();
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![env(
+                "prod",
+                "Production",
+                EnvironmentHealth::Healthy,
+                Reachability::Reachable,
+            )],
+        });
+        assert_eq!(
+            state.compare_strip(),
+            CompareStrip {
+                visible: false,
+                has_mismatch: false,
+            }
+        );
+    }
+
+    /// Two Environments, neither flagged `role: source` — the strip falls back
+    /// to comparing builds pairwise.
+    #[test]
+    fn dashboard_state_pairwise_build_mismatch_without_clone_source() {
+        let mut state = DashboardState::new();
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![
+                env(
+                    "prod",
+                    "Production",
+                    EnvironmentHealth::Healthy,
+                    Reachability::Reachable,
+                ),
+                env(
+                    "test",
+                    "Test",
+                    EnvironmentHealth::Healthy,
+                    Reachability::Reachable,
+                ),
+            ],
+        });
+        let availability = |build: &str| {
+            vec![snap(
+                "availability",
+                "healthy",
+                &format!(r#"{{"build":"{build}"}}"#),
+            )]
+        };
+        for id in ["prod", "test"] {
+            state.apply(&ServerMessage::SignalSnapshotsUpdated {
+                environment_id: id.into(),
+                snapshots: availability("a"),
+            });
+        }
+        assert!(!state.compare_strip().has_mismatch);
+        state.apply(&ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "test".into(),
+            snapshots: availability("b"),
+        });
+        assert!(state.compare_strip().has_mismatch);
+    }
+
+    #[test]
+    fn dashboard_state_plugin_only_mismatch() {
+        let mut state = DashboardState::new();
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![
+                env(
+                    "prod",
+                    "Production",
+                    EnvironmentHealth::Healthy,
+                    Reachability::Reachable,
+                ),
+                env(
+                    "test",
+                    "Test",
+                    EnvironmentHealth::Healthy,
+                    Reachability::Reachable,
+                ),
+            ],
+        });
+        // One message per Environment: it replaces that Environment's whole map.
+        state.apply(&ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "prod".into(),
+            snapshots: vec![
+                snap("availability", "healthy", r#"{"build":"a"}"#),
+                snap("drift", "healthy", r#"{"role":"source"}"#),
+            ],
+        });
+        let test_drift = |drift: &str| ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "test".into(),
+            snapshots: vec![
+                snap("availability", "healthy", r#"{"build":"a"}"#),
+                snap("drift", "healthy", drift),
+            ],
+        };
+        state.apply(&test_drift(r#"{"mismatches":1,"build_matches":true}"#));
+        assert!(state.compare_strip().has_mismatch);
+        state.apply(&test_drift(r#"{"mismatches":0,"build_matches":true}"#));
+        assert!(!state.compare_strip().has_mismatch);
+    }
+
+    #[test]
+    fn dashboard_state_card_summary_per_signal() {
+        let mut state = loaded();
+        assert_eq!(
+            state.card_summary("availability"),
+            "142 ms · glide-zurich-patch3"
+        );
+        assert_eq!(state.card_summary("syslog"), "38 errors / h");
+        assert_eq!(state.card_summary("mid_ecc"), "3/3 up · queue 12");
+        assert_eq!(state.card_summary("outbound"), "4 HTTP fail");
+        assert_eq!(state.card_summary("drift"), "source of truth");
+        state.select("test");
+        assert_eq!(state.card_summary("drift"), "3 plugins differ");
+        assert_eq!(state.card_summary("last_clone"), "2026-08-05 09:00:00");
+        state.apply(&ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "test".into(),
+            snapshots: vec![snap("jobs", "healthy", "not json")],
+        });
+        assert_eq!(state.card_summary("jobs"), "");
+    }
+
+    #[test]
+    fn dashboard_state_ignores_non_dashboard_messages() {
+        let mut state = loaded();
+        state.apply(&ServerMessage::ShuttingDown);
+        assert_eq!(state.sidebar().len(), 2);
+        assert_eq!(state.selected_id(), Some("prod"));
+    }
 }
