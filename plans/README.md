@@ -3,7 +3,7 @@
 Handoff plans for executor agents implementing [docs/spec/v1.md](../docs/spec/v1.md).  
 Map: [#17](https://github.com/martinthommesen/daku/issues/17). Index locked in [#19](https://github.com/martinthommesen/daku/issues/19).
 
-**Planned against:** `315f38d` (2026-08-17) for 008–009; Signal plans at `315f38d`; foundation at `da67ae9` / `b670982`.  
+**Planned against:** `d912bbb` (2026-08-17) for 010; UI plans at `d912bbb`; Signals at `315f38d`; foundation at `da67ae9` / `b670982`.  
 **Template:** `.agents/skills/improve/references/plan-template.md`  
 **Public hygiene:** never put instance hostnames, usernames, or secrets in plans or commits — Operator-local `~/.daku/` / keychain only.
 
@@ -20,7 +20,7 @@ Map: [#17](https://github.com/martinthommesen/daku/issues/17). Index locked in [
 | [007](007-drift-last-clone.md) | Version/plugin drift + last-clone Signals | P2 | pending | 003 |
 | [008](008-health-rollup-protocol.md) | Environment health rollup + protocol events for UI | P1 | pending | **003** (stubs OK) |
 | [009](009-gpui-shell-variant-c.md) | GPUI shell — sidebar + Environment detail (variant C) | P1 | pending | 008 |
-| 010 | Notarised DMG + Sparkle; Homebrew cask alternate | P3 | not authored | 009 |
+| [010](010-dmg-sparkle-homebrew.md) | Notarised DMG + Sparkle; Homebrew cask alternate | P3 | pending | 009 |
 
 ## Dependency graph
 
