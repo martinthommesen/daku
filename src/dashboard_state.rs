@@ -622,6 +622,30 @@ pub fn fixture_events() -> Vec<ServerMessage> {
             signal_id: "syslog".into(),
             points: vec![],
         },
+        // Test carries syslog samples so the restyled card's status-coloured
+        // sparkline is visible somewhere; prod stays empty on purpose.
+        ServerMessage::SignalSamplesUpdated {
+            environment_id: "test".into(),
+            signal_id: "syslog".into(),
+            points: vec![
+                SamplePoint {
+                    observed_at: 10,
+                    value_real: Some(9.0),
+                },
+                SamplePoint {
+                    observed_at: 20,
+                    value_real: Some(3.0),
+                },
+                SamplePoint {
+                    observed_at: 30,
+                    value_real: Some(6.0),
+                },
+                SamplePoint {
+                    observed_at: 40,
+                    value_real: Some(4.0),
+                },
+            ],
+        },
     ]
 }
 

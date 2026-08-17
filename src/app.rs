@@ -8,10 +8,15 @@ use gpui::{
     px,
 };
 use gpui_component::{
-    ActiveTheme as _, TitleBar, h_flex,
+    ActiveTheme as _, Sizable as _, TitleBar, h_flex,
+    separator::Separator,
     sidebar::{
         Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
     },
+    skeleton::Skeleton,
+    tag::Tag,
+    tooltip::Tooltip,
+    v_flex,
 };
 
 use crate::dashboard_state::{
@@ -229,36 +234,31 @@ impl Daku {
                 let selected_id = environment.id.clone();
                 element
                     .child(
-                        div()
+                        v_flex()
                             .px(px(22.0))
                             .pt(px(18.0))
-                            .pb(px(10.0))
+                            .pb(px(12.0))
+                            .gap(px(6.0))
                             .border_b_1()
                             .border_color(cx.theme().border)
                             .child(
-                                div()
-                                    .text_size(px(20.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(environment.label.clone()),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(6.0))
-                                    .flex()
-                                    .flex_row()
+                                h_flex()
                                     .items_center()
                                     .gap(px(8.0))
-                                    .child(health_badge(environment.health, cx))
-                                    .child(reachability_badge(environment.reachability, cx)),
+                                    .child(
+                                        div()
+                                            .text_xl()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(environment.label.clone()),
+                                    )
+                                    .child(health_tag(environment.health))
+                                    .child(reachability_tag(environment.reachability)),
                             )
                             .child(
-                                div()
-                                    .mt(px(6.0))
-                                    .flex()
-                                    .flex_row()
+                                h_flex()
                                     .items_center()
                                     .gap(px(6.0))
-                                    .text_size(px(12.0))
+                                    .text_sm()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(
                                         environment
@@ -287,7 +287,7 @@ impl Daku {
                             .flex()
                             .flex_row()
                             .flex_wrap()
-                            .gap(px(10.0))
+                            .gap(px(12.0))
                             .p(px(22.0))
                             .children(cards.into_iter().map(|card| self.signal_card(card, cx))),
                     )
@@ -325,11 +325,20 @@ impl Daku {
             Vec::new()
         };
         let waiting = card.status == crate::dashboard_state::WAITING;
+        let color = status_color(&card.status, cx);
+        let (value, context) = split_summary(if summary.is_empty() {
+            &card.status
+        } else {
+            &summary
+        });
         div()
             .id(SharedString::from(format!("card-{}", card.signal_id)))
-            .w(px(220.0))
-            .flex_grow(1.0)
-            .p(px(12.0))
+            .w(px(300.0))
+            .min_h(px(120.0))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .p(px(14.0))
             .rounded(cx.theme().radius)
             .border_1()
             .border_color(cx.theme().border)
@@ -339,41 +348,83 @@ impl Daku {
                 h_flex()
                     .items_center()
                     .gap(px(6.0))
-                    .text_size(px(11.0))
+                    .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(status_dot(&card.status, cx))
+                    .child(div().size(px(8.0)).rounded_full().bg(color))
                     .child(signal_label(card.signal_id)),
             )
-            .child(div().mt(px(6.0)).text_size(px(15.0)).child(if waiting {
-                crate::dashboard_state::WAITING.to_owned()
-            } else if summary.is_empty() {
-                card.status.clone()
+            .child(if waiting {
+                Skeleton::new()
+                    .w(px(96.0))
+                    .h(px(22.0))
+                    .rounded(cx.theme().radius)
+                    .into_any_element()
             } else {
-                summary
-            }))
+                clipped_line(value.clone())
+                    .text_2xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().foreground)
+                    .into_any_element()
+            })
+            .when(!context.is_empty(), |element| {
+                element.child(
+                    clipped_line(context.clone())
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground),
+                )
+            })
             .when(!detail.is_empty(), |element| {
                 element.child(
                     div()
-                        .mt(px(4.0))
-                        .text_size(px(11.0))
-                        .text_color(cx.theme().muted_foreground)
+                        .text_xs()
+                        .text_color(if card.status == "down" {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
                         .child(detail),
                 )
             })
             .when(!mismatch_lines.is_empty(), |element| {
                 element.child(
                     div()
-                        .mt(px(4.0))
-                        .text_size(px(11.0))
+                        .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .children(mismatch_lines.into_iter().map(|line| div().child(line))),
                 )
             })
             .when(card.sparkline.len() >= 2, |element| {
-                element.child(sparkline(&card.sparkline, cx.theme().accent))
+                element.child(sparkline(&card.sparkline, color))
             })
             .into_any_element()
     }
+}
+
+/// One line that clips instead of wrapping; the full text is on hover.
+fn clipped_line(text: String) -> gpui::Stateful<gpui::Div> {
+    let tip = SharedString::from(text.clone());
+    div()
+        .id(SharedString::from(format!("line-{text}")))
+        .w_full()
+        .overflow_hidden()
+        .text_ellipsis()
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .child(text)
+}
+
+/// Splits a card summary into a prominent value and a muted context line:
+/// on the summary's "\u{b7}" separator when there is one, else after a leading
+/// numeric token ("38 errors / h"). Anything else stays whole as the value.
+fn split_summary(summary: &str) -> (String, String) {
+    if let Some((value, context)) = summary.split_once(" \u{b7} ") {
+        return (value.to_owned(), context.to_owned());
+    }
+    if let Some((first, rest)) = summary.split_once(' ')
+        && first.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return (first.to_owned(), rest.to_owned());
+    }
+    (summary.to_owned(), String::new())
 }
 
 fn disconnected_banner(cx: &App) -> impl IntoElement {
@@ -387,51 +438,44 @@ fn disconnected_banner(cx: &App) -> impl IntoElement {
         .child("Disconnected")
 }
 
-fn status_dot(status: &str, cx: &App) -> impl IntoElement {
-    let color = match status {
+fn status_color(status: &str, cx: &App) -> gpui::Hsla {
+    match status {
         "healthy" => cx.theme().success,
         "degraded" => cx.theme().warning,
         "down" => cx.theme().danger,
         _ => cx.theme().muted_foreground,
-    };
-    div().size(px(8.0)).rounded_full().bg(color)
+    }
 }
 
-fn health_badge(health: EnvironmentHealth, cx: &App) -> impl IntoElement {
-    badge(
-        match health {
-            EnvironmentHealth::Healthy => "healthy",
-            EnvironmentHealth::Degraded => "degraded",
-            EnvironmentHealth::Down => "down",
-        },
-        health_color(health, cx),
-        cx,
-    )
+fn health_tag(health: EnvironmentHealth) -> Tag {
+    match health {
+        EnvironmentHealth::Healthy => Tag::success(),
+        EnvironmentHealth::Degraded => Tag::warning(),
+        EnvironmentHealth::Down => Tag::danger(),
+    }
+    .outline()
+    .small()
+    .rounded_full()
+    .child(match health {
+        EnvironmentHealth::Healthy => "healthy",
+        EnvironmentHealth::Degraded => "degraded",
+        EnvironmentHealth::Down => "down",
+    })
 }
 
-fn reachability_badge(reachability: Reachability, cx: &App) -> impl IntoElement {
-    let (label, color) = match reachability {
-        Reachability::Reachable => ("reachable", cx.theme().success),
-        Reachability::Unreachable => ("unreachable", cx.theme().danger),
-        Reachability::Asleep => ("asleep", cx.theme().muted_foreground),
-    };
-    badge(label, color, cx)
-}
-
-/// gpui-component's `Badge` is a count/dot *overlay*, not a label pill, so the
-/// pill stays local until plan 045 owns the badge design.
-fn badge(label: &'static str, color: gpui::Hsla, cx: &App) -> impl IntoElement {
-    h_flex()
-        .items_center()
-        .gap(px(6.0))
-        .px(px(8.0))
-        .py(px(3.0))
-        .rounded(px(999.0))
-        .bg(cx.theme().muted)
-        .text_size(px(12.0))
-        .text_color(cx.theme().muted_foreground)
-        .child(div().size(px(8.0)).rounded_full().bg(color))
-        .child(label)
+fn reachability_tag(reachability: Reachability) -> Tag {
+    match reachability {
+        Reachability::Reachable => Tag::success().outline(),
+        Reachability::Unreachable => Tag::danger().outline(),
+        Reachability::Asleep => Tag::secondary(),
+    }
+    .small()
+    .rounded_full()
+    .child(match reachability {
+        Reachability::Reachable => "reachable",
+        Reachability::Unreachable => "unreachable",
+        Reachability::Asleep => "asleep",
+    })
 }
 
 fn health_color(health: EnvironmentHealth, cx: &App) -> gpui::Hsla {
@@ -442,64 +486,73 @@ fn health_color(health: EnvironmentHealth, cx: &App) -> gpui::Hsla {
     }
 }
 
+/// gpui-component's `Table` needs a delegate `Entity`, which `render_detail`
+/// (a `&App` render with no entity context) cannot build, so the strip is a
+/// bordered grid with a `Separator` under the header row.
 fn compare_strip(
     has_mismatch: bool,
     selected_id: &str,
     rows: &[CompareRow],
     cx: &App,
 ) -> impl IntoElement {
-    div()
+    let selected_build = rows
+        .iter()
+        .find(|row| row.id == selected_id)
+        .and_then(|row| row.build.clone());
+    v_flex()
         .mx(px(22.0))
         .mb(px(16.0))
-        .p(px(14.0))
-        .rounded(px(8.0))
+        .rounded(cx.theme().radius)
         .border_1()
         .border_color(cx.theme().border)
         .bg(cx.theme().muted)
         .child(
-            div()
-                .mb(px(8.0))
-                .text_size(px(12.0))
-                .text_color(cx.theme().muted_foreground)
-                .child("vs clone source"),
+            compare_row_cells(["Environment", "Build", "Drift", "Last clone"].map(str::to_owned))
+                .text_xs()
+                .text_color(cx.theme().muted_foreground),
         )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap(px(16.0))
-                .text_color(cx.theme().muted_foreground)
-                .children(
-                    rows.iter()
-                        .filter(|row| row.id != selected_id)
-                        .map(|row| div().child(compare_row_text(row))),
-                ),
-        )
+        .child(Separator::horizontal().color(cx.theme().border))
+        .children(rows.iter().map(|row| {
+            let mismatch = selected_build.is_some() && row.build != selected_build;
+            compare_row_cells([
+                row.label.clone(),
+                row.build.clone().unwrap_or_else(|| "\u{2014}".to_owned()),
+                row.drift.clone(),
+                row.last_clone.clone(),
+            ])
+            .text_sm()
+            .text_color(if mismatch {
+                cx.theme().warning
+            } else {
+                cx.theme().muted_foreground
+            })
+        }))
         .when(has_mismatch, |element| {
             element.child(
                 div()
-                    .mt(px(8.0))
+                    .px(px(14.0))
+                    .pb(px(10.0))
+                    .text_xs()
                     .text_color(cx.theme().warning)
-                    .text_size(px(12.0))
                     .child("build / drift mismatch"),
             )
         })
 }
 
-fn compare_row_text(row: &CompareRow) -> String {
-    let mut text = format!(
-        "{}: {}",
-        row.label,
-        row.build.as_deref().unwrap_or("\u{2014}")
-    );
-    if !row.drift.is_empty() {
-        text.push_str(&format!(" \u{b7} drift {}", row.drift));
-    }
-    if !row.last_clone.is_empty() {
-        text.push_str(&format!(" \u{b7} clone {}", row.last_clone));
-    }
-    text
+fn compare_row_cells(cells: [String; 4]) -> gpui::Div {
+    h_flex()
+        .w_full()
+        .px(px(14.0))
+        .py(px(8.0))
+        .gap(px(12.0))
+        .children(cells.into_iter().map(|cell| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(cell)
+        }))
 }
 
 fn sparkline(points: &[f64], color: gpui::Hsla) -> impl IntoElement {
@@ -534,5 +587,32 @@ fn paint_sparkline(bounds: Bounds<Pixels>, points: &[f64], color: gpui::Hsla, wi
     }
     if let Ok(path) = path.build() {
         window.paint_path(path, color);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_summary;
+
+    #[test]
+    fn split_summary_splits_value_from_context() {
+        assert_eq!(
+            split_summary("142 ms \u{b7} glide-zurich-patch3"),
+            ("142 ms".to_owned(), "glide-zurich-patch3".to_owned())
+        );
+        assert_eq!(
+            split_summary("38 errors / h"),
+            ("38".to_owned(), "errors / h".to_owned())
+        );
+        assert_eq!(
+            split_summary("source of truth"),
+            ("source of truth".to_owned(), String::new())
+        );
+        // A build-only availability summary has no numeric head: it stays whole
+        // on the value line, which clips rather than wraps.
+        assert_eq!(
+            split_summary("glide-zurich-patch3"),
+            ("glide-zurich-patch3".to_owned(), String::new())
+        );
     }
 }
