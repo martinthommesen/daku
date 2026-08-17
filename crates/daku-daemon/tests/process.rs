@@ -12,7 +12,6 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use daku_protocol::{Command as DaemonCommand, DaemonReady, PROTOCOL_VERSION, ResponsePayload};
-use uuid::Uuid;
 
 const DAEMON: &str = env!("CARGO_BIN_EXE_daku-daemon");
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -114,9 +113,7 @@ fn daemon_prints_one_ready_line_and_serves() {
 
     let client = daku_client::DaemonClient::connect(&ready.address, "test-token".into()).unwrap();
     assert!(matches!(
-        client
-            .request(Uuid::nil(), Uuid::nil(), DaemonCommand::Ping)
-            .unwrap(),
+        client.request(DaemonCommand::Ping).unwrap(),
         ResponsePayload::Ack
     ));
     drop(client);
@@ -166,9 +163,7 @@ fn supervisor_spawns_and_reaps_the_daemon() {
     let supervisor = daku_client::DaemonSupervisor::spawn(Path::new(DAEMON), false).unwrap();
     let client = supervisor.client();
     assert!(matches!(
-        client
-            .request(Uuid::nil(), Uuid::nil(), DaemonCommand::Ping)
-            .unwrap(),
+        client.request(DaemonCommand::Ping).unwrap(),
         ResponsePayload::Ack
     ));
 

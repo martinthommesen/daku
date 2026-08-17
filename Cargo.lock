@@ -1403,7 +1403,6 @@ dependencies = [
  "daku-protocol",
  "libc",
  "serde_json",
- "uuid",
 ]
 
 [[package]]

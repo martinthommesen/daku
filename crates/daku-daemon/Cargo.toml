@@ -30,4 +30,3 @@ libc = "0.2"
 
 [dev-dependencies]
 daku-client = { path = "../daku-client" }
-uuid = "1.18"
