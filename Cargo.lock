@@ -1398,10 +1398,12 @@ name = "daku-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "daku-client",
  "daku-core",
  "daku-protocol",
  "libc",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

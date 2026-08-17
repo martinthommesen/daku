@@ -27,3 +27,7 @@ daku-protocol = { path = "../daku-protocol" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+daku-client = { path = "../daku-client" }
+uuid = "1.18"

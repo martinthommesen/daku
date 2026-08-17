@@ -538,6 +538,44 @@ mod tests {
     }
 
     #[test]
+    fn exposure_validate_rejects_port_zero_and_empty_token() {
+        let settings = DaemonExposureSettings {
+            port: 0,
+            ..DaemonExposureSettings::default()
+        };
+        assert!(
+            settings
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("port")
+        );
+        let settings = DaemonExposureSettings {
+            token: "   ".into(),
+            ..DaemonExposureSettings::default()
+        };
+        assert!(
+            settings
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("token")
+        );
+        assert!(DaemonExposureSettings::default().validate().is_ok());
+    }
+
+    #[test]
+    fn ensure_token_mints_only_when_empty() {
+        let mut settings = DaemonExposureSettings::default();
+        let before = settings.token.clone();
+        assert!(!settings.ensure_token());
+        assert_eq!(settings.token, before);
+        settings.token.clear();
+        assert!(settings.ensure_token());
+        assert!(!settings.token.trim().is_empty());
+    }
+
+    #[test]
     fn daemon_log_opens_append_only_0600() {
         let home = std::env::temp_dir().join(format!("daku-log-{}", Uuid::new_v4()));
         let path = daemon_log_path(&home);
