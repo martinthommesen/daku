@@ -6,6 +6,7 @@ Landed on `main` (formerly orphan `research/*` branches). Read these instead of 
 |------|------|
 | ServiceNow health Signals / REST surfaces | [servicenow-signals.md](./servicenow-signals.md) |
 | ServiceNow API access for an external poller | [servicenow-api-access.md](./servicenow-api-access.md) |
+| Hosted-daemon seam decision note (option A: local-only) | [hosted-daemon.md](./hosted-daemon.md) |
 | Waku reuse survey (early; web lean **overridden** by ADR-0001) | [waku-reuse.md](./waku-reuse.md) |
 | Waku pin + partial-fork inventory | [waku-fork-inventory.md](./waku-fork-inventory.md) |
 

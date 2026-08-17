@@ -25,6 +25,8 @@ cargo check -p daku -p daku-core -p daku-daemon -p daku-protocol -p daku-client
 
 Daemon Hello auth uses env **`DAKU_DAEMON_TOKEN`**. Operator data/config lives under **`~/.daku/`** (directory `0700`, SQLite `app.db` `0600`). Override the DB path with **`DAKU_DB_PATH`**.
 
+**Attaching to a daemon you run yourself:** start `DAKU_DAEMON_TOKEN=<token> daku-daemon --bind 127.0.0.1:<port>` and launch the app with `DAKU_DAEMON_ADDRESS=127.0.0.1:<port> DAKU_DAEMON_TOKEN=<token>`. Both variables must be set together. Non-loopback binds need `--allow-non-loopback` and are outside the v1 support envelope — see [`docs/research/hosted-daemon.md`](docs/research/hosted-daemon.md).
+
 Copy [`environments.example.json`](environments.example.json) to `~/.daku/environments.json` and edit Environment URLs/labels. **Secrets stay in the macOS Keychain** (daku-owned service) — never in that JSON file or in SQLite.
 
 Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settings.json`, e.g. `{"poll_interval_secs": 60}` (default **120**; the daemon reads it at start — relaunch after editing). One shared `CollectorLoop` polls every Environment; Availability, jobs, syslog, MID/ECC, outbound, drift, and last-clone register onto it. After each tick the daemon broadcasts `EnvironmentsUpdated`, `SignalSnapshotsUpdated`, and `SignalSamplesUpdated` (jobs/syslog ≤24h) so the GPUI client never opens SQLite. The GPUI shell is sidebar + Environment detail; `DAKU_UI_FIXTURE=1` loads the same events as the dashboard_state tests (no ServiceNow).
