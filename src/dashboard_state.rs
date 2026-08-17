@@ -34,6 +34,23 @@ pub fn signal_label(signal_id: &str) -> &'static str {
 
 const TREND_SIGNALS: [&str; 2] = ["jobs", "syslog"];
 
+/// The Drill-in is a bounded region, not a table browser.
+const DRILL_IN_ROW_LIMIT: usize = 50;
+
+/// ServiceNow encoded-query operators are not legal in a URL; percent-encode
+/// the four the deep-link paths use verbatim.
+fn encode_query(path: &str) -> String {
+    path.chars()
+        .map(|c| match c {
+            '^' => "%5E".to_owned(),
+            '<' => "%3C".to_owned(),
+            '>' => "%3E".to_owned(),
+            ' ' => "%20".to_owned(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
 /// Older than this and the header tints "polled … ago" as stale.
 // ponytail: fixed threshold (2.5x default cadence); put poll_interval_secs on
 // EnvironmentsUpdated if Operators start tuning cadence.
@@ -67,6 +84,7 @@ pub struct DashboardState {
     connected: bool,
     environments: Vec<EnvironmentSummary>,
     selected_id: Option<String>,
+    selected_card: Option<&'static str>,
     snapshots: HashMap<String, HashMap<String, SignalSnapshotDto>>,
     samples: HashMap<(String, String), Vec<SamplePoint>>,
 }
@@ -93,6 +111,20 @@ pub struct SignalCard {
     pub signal_id: &'static str,
     pub status: String,
     pub sparkline: Vec<f64>,
+}
+
+/// Content of the Drill-in region under the Signal cards, built from what the
+/// snapshot payload already carries.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DrillIn {
+    Rows {
+        headers: Vec<&'static str>,
+        rows: Vec<Vec<String>>,
+        truncated: bool,
+    },
+    Trend(Vec<f64>),
+    Text(String),
+    Empty,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,6 +215,136 @@ impl DashboardState {
         self.environments
             .iter()
             .find(|environment| environment.id == id)
+    }
+
+    /// Clicking the open card closes the Drill-in; selecting an Environment
+    /// keeps the card open so the same Signal can be compared across them.
+    pub fn select_card(&mut self, signal_id: &str) {
+        let Some(&id) = SIGNAL_IDS.iter().find(|&&id| id == signal_id) else {
+            return;
+        };
+        self.selected_card = if self.selected_card == Some(id) {
+            None
+        } else {
+            Some(id)
+        };
+    }
+
+    pub fn selected_card(&self) -> Option<&'static str> {
+        self.selected_card
+    }
+
+    /// Deep link into the ServiceNow list the Signal is measured from, mirroring
+    /// the collectors' encoded queries. `None` without a selected Environment.
+    pub fn signal_url(&self, signal_id: &str) -> Option<String> {
+        let path = match signal_id {
+            "availability" => "/sys_properties_list.do?sysparm_query=name=glide.war",
+            "jobs" => {
+                "/sys_trigger_list.do?sysparm_query=state=0^next_action<javascript:gs.minutesAgoStart(15)"
+            }
+            "syslog" => {
+                "/syslog_list.do?sysparm_query=level=2^sys_created_on>javascript:gs.hoursAgoStart(1)"
+            }
+            "mid_ecc" => "/ecc_agent_list.do",
+            "outbound" => {
+                "/sys_outbound_http_log_list.do?sysparm_query=http_status>=400^sys_created_on>javascript:gs.hoursAgoStart(1)"
+            }
+            "drift" => "/v_plugin_list.do",
+            "last_clone" => "/clone_instance_list.do",
+            _ => return None,
+        };
+        let base = self.selected()?.instance_url.trim_end_matches('/');
+        Some(format!("{base}{}", encode_query(path)))
+    }
+
+    pub fn drill_in(&self, signal_id: &str) -> DrillIn {
+        let payload = self
+            .selected_id
+            .as_deref()
+            .and_then(|environment_id| self.snapshots.get(environment_id))
+            .and_then(|map| map.get(signal_id))
+            .map(|snapshot| snapshot.payload_json.as_str())
+            .unwrap_or("");
+        let value = serde_json::from_str::<serde_json::Value>(payload).unwrap_or_default();
+        let text = |value: &serde_json::Value, key: &str| {
+            value
+                .get(key)
+                .and_then(|item| item.as_str())
+                .unwrap_or("\u{2014}")
+                .to_owned()
+        };
+        match signal_id {
+            "drift" => {
+                let Some(list) = value.get("mismatch_list").and_then(|item| item.as_array()) else {
+                    return self.drill_in_text(signal_id);
+                };
+                DrillIn::Rows {
+                    headers: vec!["Plugin", "Source", "Here"],
+                    rows: list
+                        .iter()
+                        .take(DRILL_IN_ROW_LIMIT)
+                        .map(|entry| {
+                            vec![
+                                text(entry, "id"),
+                                text(entry, "source_version"),
+                                text(entry, "other_version"),
+                            ]
+                        })
+                        .collect(),
+                    truncated: value.get("mismatch_list_truncated")
+                        == Some(&serde_json::Value::Bool(true))
+                        || list.len() > DRILL_IN_ROW_LIMIT,
+                }
+            }
+            "last_clone" => {
+                if value
+                    .get("completed")
+                    .and_then(|item| item.as_str())
+                    .is_none()
+                {
+                    return self.drill_in_text(signal_id);
+                }
+                DrillIn::Rows {
+                    headers: vec!["Completed", "Age", "Source"],
+                    rows: vec![vec![
+                        text(&value, "completed"),
+                        summarize_payload(signal_id, payload),
+                        text(&value, "source_id"),
+                    ]],
+                    truncated: false,
+                }
+            }
+            "jobs" | "syslog" => {
+                let points: Vec<f64> = self
+                    .samples
+                    .get(&(
+                        self.selected_id.clone().unwrap_or_default(),
+                        signal_id.to_owned(),
+                    ))
+                    .map(|points| {
+                        points
+                            .iter()
+                            .map(|point| point.value_real.unwrap_or(0.0))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if points.len() < 2 {
+                    self.drill_in_text(signal_id)
+                } else {
+                    DrillIn::Trend(points)
+                }
+            }
+            _ => self.drill_in_text(signal_id),
+        }
+    }
+
+    fn drill_in_text(&self, signal_id: &str) -> DrillIn {
+        for line in [self.card_detail(signal_id), self.card_summary(signal_id)] {
+            if !line.is_empty() {
+                return DrillIn::Text(line);
+            }
+        }
+        DrillIn::Empty
     }
 
     pub fn sidebar(&self) -> Vec<SidebarRow> {
@@ -684,6 +846,98 @@ mod tests {
         state.set_connected(true);
         state.apply_all(&fixture_events());
         state
+    }
+
+    #[test]
+    fn select_card_toggles_and_survives_environment_selection() {
+        let mut state = loaded();
+        assert_eq!(state.selected_card(), None);
+        state.select_card("drift");
+        assert_eq!(state.selected_card(), Some("drift"));
+        state.select_card("jobs");
+        assert_eq!(state.selected_card(), Some("jobs"));
+        state.select_card("jobs");
+        assert_eq!(state.selected_card(), None);
+        state.select_card("nonsense");
+        assert_eq!(state.selected_card(), None);
+        state.select_card("drift");
+        state.select("test");
+        assert_eq!(state.selected_card(), Some("drift"));
+    }
+
+    #[test]
+    fn signal_url_encodes_query_operators() {
+        let mut state = loaded();
+        state.select("test");
+        assert_eq!(
+            state.signal_url("syslog").unwrap(),
+            "https://test.example.service-now.com/syslog_list.do?sysparm_query=level=2%5Esys_created_on%3Ejavascript:gs.hoursAgoStart(1)"
+        );
+        assert_eq!(
+            state.signal_url("drift").unwrap(),
+            "https://test.example.service-now.com/v_plugin_list.do"
+        );
+        assert!(state.signal_url("nonsense").is_none());
+        assert!(DashboardState::new().signal_url("drift").is_none());
+    }
+
+    #[test]
+    fn drill_in_drift_lists_mismatched_plugins() {
+        let mut state = loaded();
+        state.select("test");
+        let DrillIn::Rows {
+            headers,
+            rows,
+            truncated,
+        } = state.drill_in("drift")
+        else {
+            panic!("drift drill-in must be rows");
+        };
+        assert_eq!(headers, vec!["Plugin", "Source", "Here"]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            vec!["com.example.plugin_a", "1.0.0", "1.1.0"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(rows[1][2], "\u{2014}");
+        assert!(!truncated);
+        // The clone source has no mismatch list.
+        state.select("prod");
+        assert_eq!(
+            state.drill_in("drift"),
+            DrillIn::Text("source of truth".into())
+        );
+    }
+
+    #[test]
+    fn drill_in_trends_and_text() {
+        let mut state = loaded();
+        assert_eq!(state.drill_in("jobs"), DrillIn::Trend(vec![1.0, 2.0, 3.0]));
+        // prod carries no syslog samples: fall back to the one-line summary.
+        assert_eq!(
+            state.drill_in("syslog"),
+            DrillIn::Text("38 errors / h".into())
+        );
+        state.select("test");
+        assert_eq!(state.drill_in("outbound"), DrillIn::Text("HTTP 429".into()));
+        assert_eq!(
+            state.drill_in("last_clone"),
+            DrillIn::Rows {
+                headers: vec!["Completed", "Age", "Source"],
+                rows: vec![vec![
+                    "2026-08-05 09:00:00".to_owned(),
+                    "12 days ago".to_owned(),
+                    "prod".to_owned(),
+                ]],
+                truncated: false,
+            }
+        );
+        // prod has no last_clone snapshot at all.
+        state.select("prod");
+        assert_eq!(state.drill_in("last_clone"), DrillIn::Empty);
     }
 
     #[test]

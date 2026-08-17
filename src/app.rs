@@ -9,6 +9,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Sizable as _, TitleBar, h_flex,
+    link::Link,
     separator::Separator,
     sidebar::{
         Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
@@ -20,7 +21,7 @@ use gpui_component::{
 };
 
 use crate::dashboard_state::{
-    CompareRow, DashboardState, SignalCard, fixture_events, freshness, signal_label,
+    CompareRow, DashboardState, DrillIn, SignalCard, fixture_events, freshness, signal_label,
     ui_fixture_enabled,
 };
 use crate::{CloseWindow, ToggleFpsCounter};
@@ -140,7 +141,18 @@ fn listen_dashboard(supervisor: &DaemonSupervisor, cx: &mut Context<Daku>) {
 impl Render for Daku {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = self.render_sidebar(cx);
-        let detail = self.render_detail(cx);
+        // Cards carry click listeners, so they are built here (where
+        // `Context<Self>` is available) and handed to the `&App` detail render.
+        let cards: Vec<gpui::AnyElement> = if self.state.selected().is_some() {
+            self.state
+                .cards()
+                .into_iter()
+                .map(|card| self.signal_card(card, cx))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let detail = self.render_detail(cards, cx);
         div()
             .track_focus(&self.focus_handle)
             .size_full()
@@ -214,12 +226,8 @@ impl Daku {
             .into_any_element()
     }
 
-    fn render_detail(&self, cx: &App) -> gpui::AnyElement {
+    fn render_detail(&self, cards: Vec<gpui::AnyElement>, cx: &App) -> gpui::AnyElement {
         let selected = self.state.selected().cloned();
-        let cards = selected
-            .as_ref()
-            .map(|_| self.state.cards())
-            .unwrap_or_default();
         let strip = self.state.compare_strip();
         let rows = self.state.compare_rows();
         div()
@@ -289,8 +297,15 @@ impl Daku {
                             .flex_wrap()
                             .gap(px(12.0))
                             .p(px(22.0))
-                            .children(cards.into_iter().map(|card| self.signal_card(card, cx))),
+                            .children(cards),
                     )
+                    .when_some(self.state.selected_card(), |element, signal_id| {
+                        element.child(drill_in_region(
+                            signal_id,
+                            self.state.drill_in(signal_id),
+                            cx,
+                        ))
+                    })
                     .when(strip.visible, |element| {
                         element.child(compare_strip(
                             strip.has_mismatch,
@@ -316,7 +331,10 @@ impl Daku {
             .into_any_element()
     }
 
-    fn signal_card(&self, card: SignalCard, cx: &App) -> gpui::AnyElement {
+    fn signal_card(&self, card: SignalCard, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let signal_id = card.signal_id;
+        let selected = self.state.selected_card() == Some(signal_id);
+        let url = self.state.signal_url(signal_id);
         let summary = self.state.card_summary(card.signal_id);
         let detail = self.state.card_detail(card.signal_id);
         let mismatch_lines = if card.signal_id == "drift" {
@@ -341,9 +359,18 @@ impl Daku {
             .p(px(14.0))
             .rounded(cx.theme().radius)
             .border_1()
-            .border_color(cx.theme().border)
+            .border_color(if selected {
+                cx.theme().primary
+            } else {
+                cx.theme().border
+            })
             .bg(cx.theme().secondary)
             .text_color(cx.theme().secondary_foreground)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.state.select_card(signal_id);
+                cx.notify();
+            }))
             .child(
                 h_flex()
                     .items_center()
@@ -351,7 +378,17 @@ impl Daku {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(div().size(px(8.0)).rounded_full().bg(color))
-                    .child(signal_label(card.signal_id)),
+                    .child(signal_label(card.signal_id))
+                    .child(div().flex_1())
+                    // `Link` stops the mouse-down, so opening the instance does
+                    // not also toggle the Drill-in.
+                    .when_some(url, |element, url| {
+                        element.child(
+                            Link::new(SharedString::from(format!("open-{signal_id}")))
+                                .href(url)
+                                .child("Open \u{2197}"),
+                        )
+                    }),
             )
             .child(if waiting {
                 Skeleton::new()
@@ -394,7 +431,7 @@ impl Daku {
                 )
             })
             .when(card.sparkline.len() >= 2, |element| {
-                element.child(sparkline(&card.sparkline, color))
+                element.child(sparkline(&card.sparkline, color, px(28.0)))
             })
             .into_any_element()
     }
@@ -486,6 +523,73 @@ fn health_color(health: EnvironmentHealth, cx: &App) -> gpui::Hsla {
     }
 }
 
+/// The Drill-in: a bounded region under the cards showing the rows, trend or
+/// text the selected Signal's snapshot already carries.
+fn drill_in_region(signal_id: &str, content: DrillIn, cx: &App) -> impl IntoElement {
+    v_flex()
+        .mx(px(22.0))
+        .mb(px(16.0))
+        .pb(px(10.0))
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().muted)
+        .child(
+            div()
+                .px(px(14.0))
+                .py(px(10.0))
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(signal_label(signal_id)),
+        )
+        .map(|element| match content {
+            DrillIn::Rows {
+                headers,
+                rows,
+                truncated,
+            } => element
+                .child(
+                    compare_row_cells(headers.into_iter().map(str::to_owned))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground),
+                )
+                .child(Separator::horizontal().color(cx.theme().border))
+                .children(rows.into_iter().map(|row| {
+                    compare_row_cells(row)
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                }))
+                .when(truncated, |element| {
+                    element.child(
+                        div()
+                            .px(px(14.0))
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("\u{2026} more on the instance"),
+                    )
+                }),
+            DrillIn::Trend(points) => element.child(div().px(px(14.0)).child(sparkline(
+                &points,
+                cx.theme().primary,
+                px(80.0),
+            ))),
+            DrillIn::Text(text) => element.child(
+                div()
+                    .px(px(14.0))
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(text),
+            ),
+            DrillIn::Empty => element.child(
+                div()
+                    .px(px(14.0))
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Nothing recorded yet."),
+            ),
+        })
+}
+
 /// gpui-component's `Table` needs a delegate `Entity`, which `render_detail`
 /// (a `&App` render with no entity context) cannot build, so the strip is a
 /// bordered grid with a `Separator` under the header row.
@@ -539,7 +643,7 @@ fn compare_strip(
         })
 }
 
-fn compare_row_cells(cells: [String; 4]) -> gpui::Div {
+fn compare_row_cells(cells: impl IntoIterator<Item = String>) -> gpui::Div {
     h_flex()
         .w_full()
         .px(px(14.0))
@@ -555,13 +659,13 @@ fn compare_row_cells(cells: [String; 4]) -> gpui::Div {
         }))
 }
 
-fn sparkline(points: &[f64], color: gpui::Hsla) -> impl IntoElement {
+fn sparkline(points: &[f64], color: gpui::Hsla, height: Pixels) -> impl IntoElement {
     let points = points.to_vec();
     canvas(
         move |_, _, _| {},
         move |bounds, _, window, _| paint_sparkline(bounds, &points, color, window),
     )
-    .h(px(28.0))
+    .h(height)
     .w_full()
     .mt(px(8.0))
 }
