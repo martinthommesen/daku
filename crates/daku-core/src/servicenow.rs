@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use base64::Engine;
 use serde::Deserialize;
 
@@ -234,6 +234,37 @@ fn join_url(instance_url: &str, path: &str) -> String {
     format!("{}{}", instance_url.trim_end_matches('/'), path)
 }
 
+/// Count-only Aggregate API body: `{ "result": { "stats": { "count": "N" } } }`.
+/// `count` is a string in the documented envelope; a JSON number is also accepted.
+pub fn parse_aggregate_count(body: &[u8]) -> anyhow::Result<u64> {
+    let value: serde_json::Value = serde_json::from_slice(body)?;
+    let count = value
+        .pointer("/result/stats/count")
+        .ok_or_else(|| anyhow!("aggregate response missing result.stats.count"))?;
+    match count {
+        serde_json::Value::String(text) => text
+            .parse()
+            .with_context(|| format!("aggregate count {text:?}")),
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .ok_or_else(|| anyhow!("aggregate count {number} is not a u64")),
+        other => Err(anyhow!("aggregate count {other} is not a string or number")),
+    }
+}
+
+pub fn fetch_aggregate_count(
+    client: &ServiceNowClient,
+    environment: &EnvironmentConfig,
+    credentials: &dyn CredentialStore,
+    path: &str,
+) -> anyhow::Result<u64> {
+    let response = client.request(environment, credentials, "GET", path, None)?;
+    if response.status != 200 {
+        anyhow::bail!("HTTP {}", response.status);
+    }
+    parse_aggregate_count(response.body.as_bytes())
+}
+
 fn urlencode(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -317,6 +348,14 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::config::MemoryCredentialStore;
+
+    #[test]
+    fn parse_aggregate_count_reads_stats_count_string() {
+        let zero = include_bytes!("../tests/fixtures/jobs/count_0.json");
+        let two = include_bytes!("../tests/fixtures/jobs/count_2.json");
+        assert_eq!(parse_aggregate_count(zero).unwrap(), 0);
+        assert_eq!(parse_aggregate_count(two).unwrap(), 2);
+    }
 
     struct ScriptedTransport {
         responses: Mutex<VecDeque<HttpResponse>>,
@@ -443,10 +482,7 @@ mod tests {
         let transport = ScriptedTransport::new(vec![
             HttpResponse {
                 status: 429,
-                headers: vec![(
-                    "Retry-After".into(),
-                    "Tue, 14 Nov 2023 22:13:30 GMT".into(),
-                )],
+                headers: vec![("Retry-After".into(), "Tue, 14 Nov 2023 22:13:30 GMT".into())],
                 body: String::new(),
             },
             ok_table(),
@@ -457,7 +493,13 @@ mod tests {
         let client = ServiceNowClient::new(transport, clock.clone());
         assert_eq!(
             client
-                .request(&basic_env(), &credentials, "GET", "/api/now/table/sys_properties", None)
+                .request(
+                    &basic_env(),
+                    &credentials,
+                    "GET",
+                    "/api/now/table/sys_properties",
+                    None
+                )
                 .unwrap()
                 .status,
             200
@@ -484,7 +526,13 @@ mod tests {
         credentials.insert("dev", r#"{"username":"reader","password":"secret"}"#);
         let client = ServiceNowClient::new(transport, RecordingClock::default());
         let response = client
-            .request(&basic_env(), &credentials, "GET", "/api/now/table/sys_properties", None)
+            .request(
+                &basic_env(),
+                &credentials,
+                "GET",
+                "/api/now/table/sys_properties",
+                None,
+            )
             .unwrap();
         assert_eq!(response.status, 429);
     }

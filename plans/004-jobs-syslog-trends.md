@@ -104,11 +104,11 @@ Stuck jobs and syslog errors are core Operator pains (spec §5). Spec requires *
 
 ## Done criteria
 
-- [ ] Listed `cargo test` filters exit 0
-- [ ] `cargo check -p daku-core -p daku-daemon` exit 0
-- [ ] `rg -n 'signal_samples' crates/daku-core` → write + prune paths exist
-- [ ] No private interval in jobs/syslog modules (Step 5 rg)
-- [ ] `plans/README.md` row 004 Status = `DONE`
+- [x] Listed `cargo test` filters exit 0
+- [x] `cargo check -p daku-core -p daku-daemon` exit 0
+- [x] `rg -n 'signal_samples' crates/daku-core` → write + prune paths exist
+- [x] No private interval in jobs/syslog modules (Step 5 rg)
+- [x] `plans/README.md` row 004 Status = `DONE`
 
 ## STOP conditions
 

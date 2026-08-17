@@ -12,8 +12,7 @@ use crate::persistence::{self, StateStore};
 use crate::servicenow::ServiceNowClient;
 
 pub const AVAILABILITY_SIGNAL_ID: &str = "availability";
-pub const GLIDE_WAR_PATH: &str =
-    "/api/now/table/sys_properties?sysparm_query=name=glide.war&sysparm_fields=value&sysparm_limit=1";
+pub const GLIDE_WAR_PATH: &str = "/api/now/table/sys_properties?sysparm_query=name=glide.war&sysparm_fields=value&sysparm_limit=1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reachability {
@@ -151,7 +150,7 @@ pub fn persist_availability_snapshot(
 pub struct AvailabilityCollector {
     environments: Vec<EnvironmentConfig>,
     credentials: Arc<dyn CredentialStore>,
-    client: ServiceNowClient,
+    client: Arc<ServiceNowClient>,
     store: StateStore,
 }
 
@@ -159,13 +158,13 @@ impl AvailabilityCollector {
     pub fn new(
         environments: Vec<EnvironmentConfig>,
         credentials: Arc<dyn CredentialStore>,
-        client: ServiceNowClient,
+        client: impl Into<Arc<ServiceNowClient>>,
         store: StateStore,
     ) -> Self {
         Self {
             environments,
             credentials,
-            client,
+            client: client.into(),
             store,
         }
     }
@@ -266,12 +265,8 @@ mod tests {
 
     #[test]
     fn classify_availability_200_empty_result_is_reachable() {
-        let observation = classify_availability_response(
-            200,
-            "application/json",
-            r#"{"result":[]}"#,
-            10,
-        );
+        let observation =
+            classify_availability_response(200, "application/json", r#"{"result":[]}"#, 10);
         assert_eq!(observation.reachability, Reachability::Reachable);
         assert_eq!(observation.build, None);
         assert_eq!(observation.error, None);

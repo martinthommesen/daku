@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use daku_protocol::identity::DATA_DIRECTORY_NAME;
 
@@ -85,6 +85,7 @@ pub fn ensure_daku_dir(db_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct StateStore {
     path: PathBuf,
 }
@@ -184,6 +185,81 @@ pub fn load_signal_snapshot(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalSample {
+    pub environment_id: String,
+    pub signal_id: String,
+    pub observed_at: i64,
+    pub value_real: Option<f64>,
+    pub value_json: Option<String>,
+}
+
+pub fn persist_signal_sample(
+    connection: &Connection,
+    environment_id: &str,
+    signal_id: &str,
+    observed_at: i64,
+    value_real: Option<f64>,
+    value_json: Option<&str>,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "INSERT INTO signal_samples (
+                environment_id, signal_id, observed_at, value_real, value_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                environment_id,
+                signal_id,
+                observed_at,
+                value_real,
+                value_json
+            ],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+pub fn load_signal_samples(
+    connection: &Connection,
+    environment_id: &str,
+    signal_id: &str,
+) -> io::Result<Vec<SignalSample>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT environment_id, signal_id, observed_at, value_real, value_json
+             FROM signal_samples
+             WHERE environment_id = ?1 AND signal_id = ?2
+             ORDER BY observed_at ASC",
+        )
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![environment_id, signal_id])
+        .map_err(to_io_error)?;
+    let mut samples = Vec::new();
+    while let Some(row) = rows.next().map_err(to_io_error)? {
+        samples.push(SignalSample {
+            environment_id: row.get(0).map_err(to_io_error)?,
+            signal_id: row.get(1).map_err(to_io_error)?,
+            observed_at: row.get(2).map_err(to_io_error)?,
+            value_real: row.get(3).map_err(to_io_error)?,
+            value_json: row.get(4).map_err(to_io_error)?,
+        });
+    }
+    Ok(samples)
+}
+
+pub const SAMPLE_RETENTION_SECS: i64 = 24 * 60 * 60;
+
+pub fn prune_signal_samples(connection: &Connection, now: i64) -> io::Result<usize> {
+    let cutoff = now.saturating_sub(SAMPLE_RETENTION_SECS);
+    connection
+        .execute(
+            "DELETE FROM signal_samples WHERE observed_at < ?1",
+            params![cutoff],
+        )
+        .map_err(to_io_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +312,46 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_signal_samples_drops_older_than_24h() {
+        let path = temp_db_path("prune");
+        let _ = fs::remove_file(&path);
+        let store = StateStore::daemon(path.clone());
+        let connection = store.open().unwrap();
+        let now = 1_700_000_000;
+        persist_signal_sample(
+            &connection,
+            "prod",
+            "jobs",
+            now - 25 * 60 * 60,
+            Some(1.0),
+            None,
+        )
+        .unwrap();
+        persist_signal_sample(&connection, "prod", "jobs", now, Some(2.0), None).unwrap();
+        persist_signal_sample(
+            &connection,
+            "prod",
+            "syslog",
+            now - 25 * 60 * 60,
+            Some(3.0),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(prune_signal_samples(&connection, now).unwrap(), 2);
+
+        let jobs = load_signal_samples(&connection, "prod", "jobs").unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].observed_at, now);
+        assert_eq!(jobs[0].value_real, Some(2.0));
+        assert!(
+            load_signal_samples(&connection, "prod", "syslog")
+                .unwrap()
+                .is_empty()
+        );
+        let _ = fs::remove_file(path);
     }
 }

@@ -2,18 +2,20 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use daku_protocol::settings::DaemonSettings;
 
 use crate::availability::AvailabilityCollector;
 use crate::config::{
-    load_environments, CredentialStore, EnvironmentConfig, KeychainCredentialStore,
+    CredentialStore, EnvironmentConfig, KeychainCredentialStore, load_environments,
 };
+use crate::jobs::JobsCollector;
 use crate::persistence::StateStore;
 use crate::servicenow::{Clock, ServiceNowClient, SystemClock, UreqTransport};
+use crate::syslog::SyslogCollector;
 
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 120;
 pub const POLL_INTERVAL_SECS_KEY: &str = "poll_interval_secs";
@@ -90,8 +92,21 @@ pub fn build_default_loop(
     interval: Duration,
     client: ServiceNowClient,
 ) -> CollectorLoop {
+    let client = Arc::new(client);
     let mut loop_ = CollectorLoop::new(interval);
     loop_.register(AvailabilityCollector::new(
+        environments.clone(),
+        credentials.clone(),
+        client.clone(),
+        store.clone(),
+    ));
+    loop_.register(JobsCollector::new(
+        environments.clone(),
+        credentials.clone(),
+        client.clone(),
+        store.clone(),
+    ));
+    loop_.register(SyslogCollector::new(
         environments,
         credentials,
         client,
@@ -157,7 +172,7 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::availability::{AvailabilityCollector, AVAILABILITY_SIGNAL_ID};
+    use crate::availability::{AVAILABILITY_SIGNAL_ID, AvailabilityCollector};
     use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore};
     use crate::persistence::{self, StateStore};
     use crate::servicenow::{
