@@ -26,11 +26,13 @@ use crate::syslog::SyslogCollector;
 
 pub use daku_protocol::settings::DEFAULT_POLL_INTERVAL_SECS;
 
+/// Fastest cadence the daemon will poll at, however low the setting is.
+pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
+
 pub fn poll_interval_secs(settings: &DaemonSettings) -> u64 {
-    if settings.poll_interval_secs == 0 {
-        DEFAULT_POLL_INTERVAL_SECS
-    } else {
-        settings.poll_interval_secs
+    match settings.poll_interval_secs {
+        0 => DEFAULT_POLL_INTERVAL_SECS,
+        secs => secs.max(MIN_POLL_INTERVAL_SECS),
     }
 }
 
@@ -251,6 +253,18 @@ mod tests {
             poll_interval_secs(&DaemonSettings::default()),
             DEFAULT_POLL_INTERVAL_SECS
         );
+    }
+
+    #[test]
+    fn poll_interval_secs_is_floored_at_30() {
+        let interval = |secs: u64| {
+            poll_interval_secs(&DaemonSettings {
+                poll_interval_secs: secs,
+            })
+        };
+        assert_eq!(interval(5), MIN_POLL_INTERVAL_SECS);
+        assert_eq!(interval(30), 30);
+        assert_eq!(interval(31), 31);
     }
 
     #[test]

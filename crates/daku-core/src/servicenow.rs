@@ -131,6 +131,11 @@ impl ServiceNowClient {
         environment: &EnvironmentConfig,
         credentials: &dyn CredentialStore,
     ) -> anyhow::Result<Vec<(String, String)>> {
+        if environment.auth_method == AuthMethod::OauthClientCredentials {
+            if let Some(access) = self.cached_access_token(&environment.id) {
+                return Ok(vec![("Authorization".into(), format!("Bearer {access}"))]);
+            }
+        }
         let blob = credentials
             .get(&environment.id)?
             .ok_or_else(|| anyhow!("no credential for environment {}", environment.id))?;
@@ -150,14 +155,17 @@ impl ServiceNowClient {
         }
     }
 
+    fn cached_access_token(&self, environment_id: &str) -> Option<String> {
+        let cache = self.tokens.lock().expect("token cache");
+        cache
+            .get(environment_id)
+            .filter(|cached| self.clock.now() < cached.valid_until)
+            .map(|cached| cached.access_token.clone())
+    }
+
     fn oauth_access(&self, environment: &EnvironmentConfig, blob: &str) -> anyhow::Result<String> {
-        {
-            let cache = self.tokens.lock().expect("token cache");
-            if let Some(cached) = cache.get(&environment.id) {
-                if self.clock.now() < cached.valid_until {
-                    return Ok(cached.access_token.clone());
-                }
-            }
+        if let Some(access) = self.cached_access_token(&environment.id) {
+            return Ok(access);
         }
         let parsed: OauthCred = serde_json::from_str(blob).context("oauth credential JSON")?;
         let body = format!(
@@ -377,6 +385,7 @@ fn read_ureq_response(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::config::MemoryCredentialStore;
 
@@ -643,6 +652,58 @@ mod tests {
             1
         );
         assert_eq!(urls.len(), 3);
+    }
+
+    #[derive(Default)]
+    struct CountingCredentialStore {
+        inner: MemoryCredentialStore,
+        gets: AtomicUsize,
+    }
+
+    impl CredentialStore for CountingCredentialStore {
+        fn get(&self, environment_id: &str) -> anyhow::Result<Option<String>> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(environment_id)
+        }
+    }
+
+    #[test]
+    fn servicenow_http_oauth_reads_keychain_once_while_token_is_cached() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            token_ok("tok-1"),
+            ok_table(),
+            ok_table(),
+        ]));
+        let credentials = CountingCredentialStore::default();
+        credentials
+            .inner
+            .insert("prod", r#"{"client_id":"id","client_secret":"secret"}"#);
+        let client = ServiceNowClient::new(
+            SharedTransport(transport.clone()),
+            RecordingClock::default(),
+        );
+        let path = "/api/now/table/sys_properties";
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .request(&oauth_env(), &credentials, "GET", path, None)
+                    .unwrap()
+                    .status,
+                200
+            );
+        }
+        let urls: Vec<_> = transport
+            .requests()
+            .into_iter()
+            .map(|request| request.url)
+            .collect();
+        assert_eq!(
+            urls.iter()
+                .filter(|url| url.contains("oauth_token.do"))
+                .count(),
+            1
+        );
+        assert_eq!(credentials.gets.load(Ordering::SeqCst), 1);
     }
 
     #[test]
