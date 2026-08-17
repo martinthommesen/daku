@@ -15,7 +15,7 @@ const daemonPath = join(
   targetDir,
   `debug/daku-debug-daemon${process.platform === "win32" ? ".exe" : ""}`,
 );
-const watchedDirectories = ["src", "crates", "assets", "resources", "locales"];
+const watchedDirectories = ["src", "crates", "resources", "locales"];
 const watchedFiles = ["Cargo.toml", "Cargo.lock", "build.rs"];
 const rebuildDebounceMs = 1_000;
 type BuildTarget = "app" | "daemon";
