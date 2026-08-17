@@ -21,7 +21,7 @@ Dead MID Servers and ECC backlog are v1 Signal #3. Empty MID lists on a baseline
 
 ## Current state
 
-- Research ([servicenow-signals](https://github.com/martinthommesen/daku/blob/research/servicenow-signals/docs/research/servicenow-signals.md)):
+- Research ([docs/research/servicenow-signals.md](../docs/research/servicenow-signals.md)):
   - **MID:** Table API `ecc_agent` fields `status`, `validated`, `version`, `host_name`. Unhealthy if `status≠Up` or `validated` is not true.
   - **ECC:** Aggregate `ecc_queue`: `queue=output^state=ready` count; `state=error` count; date-bound (~7 days).
 - Point-in-time Signal (no samples required).
@@ -54,8 +54,10 @@ Dead MID Servers and ECC backlog are v1 Signal #3. Empty MID lists on a baseline
 
 ## Git workflow
 
-- Branch: `plan/005-mid-ecc-signal`
-- Commit example: `Add MID/ECC Signal collector with fixtures`
+- Work on `main` (trunk-based). No PRs; no GitHub Actions — see `docs/agents/git-workflow.md`.
+- Optional disposable local branch for isolation; merge to `main` locally and delete the branch. Do not push topic branches to `origin`.
+- Commit example: keep the imperative message named in each plan's Steps.
+
 
 ## Steps
 

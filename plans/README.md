@@ -56,8 +56,7 @@ Drift checks use `567179a..HEAD` against each plan’s **Scope** paths (not only
 
 - Vocabulary: `CONTEXT.md` (Platform, Environment, Signal, Credential, Operator, Environment health).
 - Licence: GPL-3.0-only (ADR-0002); keep `LICENSE` from waku copy.
-- Branch naming: `plan/NNN-short-slug` unless the operator says otherwise.
+- **Git**: trunk-based on `main` — no PRs, no GitHub Actions (`docs/agents/git-workflow.md`). Commit on `main` (or a disposable local branch you delete after merging locally); push `main` only when the Operator wants remote updated.
 - Commit style: imperative summary like existing `main`.
-- Do **not** push/PR unless asked.
-- Live ServiceNow calls are **Operator-local smoke** only; CI uses fixtures.
+- Live ServiceNow calls are **Operator-local smoke** only; verification is local (`cargo test` / plan Done criteria), not Actions.
 - Daemon Hello env: **`DAKU_DAEMON_TOKEN`** (locked in 001).

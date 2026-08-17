@@ -23,7 +23,7 @@ Stuck jobs and syslog errors are core Operator pains (spec §5). Spec requires *
 
 - 003: `ServiceNowClient` (OAuth/basic, 429), `CollectorLoop` (~120s), `signal_snapshots`.
 - 002: `signal_samples` table ready.
-- Research ([servicenow-signals](https://github.com/martinthommesen/daku/blob/research/servicenow-signals/docs/research/servicenow-signals.md)):
+- Research ([docs/research/servicenow-signals.md](../docs/research/servicenow-signals.md)):
 
   **Jobs** — Aggregate/Table on `sys_trigger`:
   - Overdue Ready: `state=0^next_action<javascript:gs.minutesAgoStart(15)`
@@ -65,8 +65,10 @@ Stuck jobs and syslog errors are core Operator pains (spec §5). Spec requires *
 
 ## Git workflow
 
-- Branch: `plan/004-jobs-syslog-trends`
-- Commit example: `Add jobs and syslog Signals with 24h samples`
+- Work on `main` (trunk-based). No PRs; no GitHub Actions — see `docs/agents/git-workflow.md`.
+- Optional disposable local branch for isolation; merge to `main` locally and delete the branch. Do not push topic branches to `origin`.
+- Commit example: keep the imperative message named in each plan's Steps.
+
 
 ## Steps
 

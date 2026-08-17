@@ -84,8 +84,10 @@ After each collector tick: recompute rollup; broadcast the three event types as 
 
 ## Git workflow
 
-- Branch: `plan/008-health-rollup-protocol`
-- Commit example: `Add Environment health rollup and dashboard protocol events`
+- Work on `main` (trunk-based). No PRs; no GitHub Actions — see `docs/agents/git-workflow.md`.
+- Optional disposable local branch for isolation; merge to `main` locally and delete the branch. Do not push topic branches to `origin`.
+- Commit example: keep the imperative message named in each plan's Steps.
+
 
 ## Steps
 

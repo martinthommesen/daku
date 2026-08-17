@@ -53,8 +53,10 @@ Post-clone drift and last-clone date are Signals #5–#6. Drift compares Environ
 
 ## Git workflow
 
-- Branch: `plan/007-drift-last-clone`
-- Commit example: `Add drift and last-clone Signals`
+- Work on `main` (trunk-based). No PRs; no GitHub Actions — see `docs/agents/git-workflow.md`.
+- Optional disposable local branch for isolation; merge to `main` locally and delete the branch. Do not push topic branches to `origin`.
+- Commit example: keep the imperative message named in each plan's Steps.
+
 
 ## Steps
 

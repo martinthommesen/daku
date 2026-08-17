@@ -12,6 +12,10 @@ Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-
 
 Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
+### Git workflow
+
+Trunk-based on `main` only — **no pull requests**, **no GitHub Actions**. See `docs/agents/git-workflow.md`.
+
 ### ServiceNow
 
 Always use the `now-sdk` skill (`.claude/skills/now-sdk/SKILL.md`) for anything to do with ServiceNow or Fluent.

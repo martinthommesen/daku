@@ -53,8 +53,10 @@ If `bundle.sh` has no `--unsigned`, use: `SKIP_CODESIGN=1 ./scripts/bundle.sh` a
 
 ## Git workflow
 
-- Branch: `plan/010-dmg-sparkle-homebrew`
-- Commit example: `Add daku DMG/Sparkle packaging and Homebrew cask draft`
+- Work on `main` (trunk-based). No PRs; no GitHub Actions — see `docs/agents/git-workflow.md`.
+- Optional disposable local branch for isolation; merge to `main` locally and delete the branch. Do not push topic branches to `origin`.
+- Commit example: keep the imperative message named in each plan's Steps.
+
 
 ## Steps
 

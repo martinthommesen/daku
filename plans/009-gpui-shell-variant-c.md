@@ -21,7 +21,7 @@ v1 Operator UI is macOS GPUI (ADR-0001) with **sidebar + Environment detail** (A
 
 ## Current state
 
-- Visual reference only: `prototypes/environments-overview/index.html?variant=C` (or branch `prototype/environments-overview`). Do not paste HTML into Rust.
+- Visual reference only: `prototypes/environments-overview/index.html?variant=C`. Do not paste HTML into Rust.
 - Theme: keep forked light tokens (research cites canvas `#F6F5F6`, text `#242424`, accent `#C85F44`) via surviving theme module.
 - Protocol: `EnvironmentsUpdated`, `SignalSnapshotsUpdated`, `SignalSamplesUpdated`.
 - Health: healthy | degraded | down. Reachability: reachable | unreachable | asleep (header badge, not a fourth health dot).
@@ -51,8 +51,10 @@ v1 Operator UI is macOS GPUI (ADR-0001) with **sidebar + Environment detail** (A
 
 ## Git workflow
 
-- Branch: `plan/009-gpui-shell-variant-c`
-- Commit example: `Add GPUI Environments sidebar and detail shell`
+- Work on `main` (trunk-based). No PRs; no GitHub Actions — see `docs/agents/git-workflow.md`.
+- Optional disposable local branch for isolation; merge to `main` locally and delete the branch. Do not push topic branches to `origin`.
+- Commit example: keep the imperative message named in each plan's Steps.
+
 
 ## Steps
 

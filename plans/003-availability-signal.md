@@ -24,7 +24,7 @@ Availability is Signal #1: up/latency + build via Table API on `sys_properties` 
 - Daemon + SQLite: `signal_snapshots` / `signal_samples`; config SoT = `~/.daku/environments.json`.
 - Probe (do not invent):  
   `GET /api/now/table/sys_properties?sysparm_query=name=glide.war&sysparm_fields=value&sysparm_limit=1`  
-  — [servicenow-signals](https://github.com/martinthommesen/daku/blob/research/servicenow-signals/docs/research/servicenow-signals.md), spec §5–6.
+  — [docs/research/servicenow-signals.md](../docs/research/servicenow-signals.md), spec §5–6.
 - Auth (ADR-0004 / spec §6): **OAuth 2.0 client credentials** for real Environments; **basic** only for PDI stand-ins. Secrets in macOS Keychain (service `daku`, account = environment `id`).
 - Outcomes: **reachable** / **unreachable** / **asleep** — distinct from Environment health and from Signal state (003 stores reachability in availability payload; plan 008 must not map asleep → degraded).
 - Poll cadence: **one shared loop**, default **120s**, all Environments, all registered collectors (004–007 only register; they do not start their own timers).
@@ -66,8 +66,10 @@ Availability is Signal #1: up/latency + build via Table API on `sys_properties` 
 
 ## Git workflow
 
-- Branch: `plan/003-availability-signal`
-- Commit example: `Add availability Signal, OAuth HTTP client, and collector loop`
+- Work on `main` (trunk-based). No PRs; no GitHub Actions — see `docs/agents/git-workflow.md`.
+- Optional disposable local branch for isolation; merge to `main` locally and delete the branch. Do not push topic branches to `origin`.
+- Commit example: keep the imperative message named in each plan's Steps.
+
 
 ## Steps
 

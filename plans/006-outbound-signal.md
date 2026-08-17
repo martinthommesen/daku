@@ -46,8 +46,10 @@ Silent integration failure is v1 Signal #7. v1 uses Aggregate counts on outbound
 
 ## Git workflow
 
-- Branch: `plan/006-outbound-signal`
-- Commit example: `Add outbound HTTP failures Signal`
+- Work on `main` (trunk-based). No PRs; no GitHub Actions — see `docs/agents/git-workflow.md`.
+- Optional disposable local branch for isolation; merge to `main` locally and delete the branch. Do not push topic branches to `origin`.
+- Commit example: keep the imperative message named in each plan's Steps.
+
 
 ## Steps
 

@@ -70,7 +70,7 @@ daku v1 is a one-time partial fork of egoist/waku (GPUI + Rust daemon), not a cl
 | Env `WAKU_*` / upstream daemon auth env | Prefix **`DAKU_`**. Lock daemon shared-secret env name to **`DAKU_DAEMON_TOKEN`** (Hello auth). |
 | `Waku Debug.app` | `daku Debug.app` |
 
-Reference (optional): [waku-fork-inventory](https://github.com/martinthommesen/daku/blob/research/waku-fork-inventory/docs/research/waku-fork-inventory.md) — must not contradict the tables above; if it does, prefer this plan and STOP to report drift.
+Reference (optional): [docs/research/waku-fork-inventory.md](../docs/research/waku-fork-inventory.md) — must not contradict the tables above; if it does, prefer this plan and STOP to report drift.
 
 ## Commands you will need
 
@@ -90,9 +90,10 @@ Reference (optional): [waku-fork-inventory](https://github.com/martinthommesen/d
 
 ## Git workflow
 
-- Branch: `plan/001-import-waku-strip-agent`
-- Commit example: `Import waku pin and rename crates to daku`
-- Do not push/PR unless asked.
+- Work on `main` (trunk-based). No PRs; no GitHub Actions — see `docs/agents/git-workflow.md`.
+- Optional disposable local branch for isolation; merge to `main` locally and delete the branch. Do not push topic branches to `origin`.
+- Commit example: keep the imperative message named in each plan's Steps.
+
 
 ## Steps
 

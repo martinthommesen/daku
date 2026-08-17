@@ -58,8 +58,10 @@ Spec §7 / ADR-0007 require local SQLite under `~/.daku/` (0700/0600) for Signal
 
 ## Git workflow
 
-- Branch: `plan/002-daemon-sqlite-skeleton`
-- Commit example: `Add daku SQLite schema and ~/.daku daemon paths`
+- Work on `main` (trunk-based). No PRs; no GitHub Actions — see `docs/agents/git-workflow.md`.
+- Optional disposable local branch for isolation; merge to `main` locally and delete the branch. Do not push topic branches to `origin`.
+- Commit example: keep the imperative message named in each plan's Steps.
+
 
 ## Steps
 
