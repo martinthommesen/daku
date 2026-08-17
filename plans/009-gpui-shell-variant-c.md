@@ -91,13 +91,13 @@ No GPUI pixel tests required.
 
 ## Done criteria
 
-- [ ] `cargo test -p daku dashboard_state` exit 0
-- [ ] `cargo check -p daku` exit 0
-- [ ] `rg -n 'Waiting' src` → ≥1 hit
-- [ ] `rg -n 'sparkline|SignalSamples|samples' src` → ≥1 hit (trends surface)
-- [ ] `rg -n 'Reachability|asleep|reachability' src` → ≥1 hit
-- [ ] `rg -n 'Unknown|Health::Unknown' src crates/daku-protocol` → no Environment health unknown
-- [ ] `plans/README.md` row 009 Status = `DONE`
+- [x] `cargo test -p daku dashboard_state` exit 0
+- [x] `cargo check -p daku` exit 0
+- [x] `rg -n 'Waiting' src` → ≥1 hit
+- [x] `rg -n 'sparkline|SignalSamples|samples' src` → ≥1 hit (trends surface)
+- [x] `rg -n 'Reachability|asleep|reachability' src` → ≥1 hit
+- [x] `rg -n 'Unknown|Health::Unknown' src crates/daku-protocol` → no Environment health unknown
+- [x] `plans/README.md` row 009 Status = `DONE`
 
 ## STOP conditions
 

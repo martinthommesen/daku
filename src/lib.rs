@@ -20,6 +20,7 @@ macro_rules! tr {
 mod app;
 mod assets;
 pub mod daemon;
+mod dashboard_state;
 mod platform;
 mod theme;
 
@@ -108,10 +109,15 @@ impl DakuApplicationExt for Application {
 }
 
 pub fn run() {
-    let daemon = crate::daemon::start_process()
-        .unwrap_or_else(|error| panic!("failed to start daku daemon: {error:#}"));
-    // Keep the supervisor alive for the process lifetime; Signal UI wires it later.
-    std::mem::forget(daemon);
+    let fixture = crate::dashboard_state::ui_fixture_enabled();
+    let daemon = if fixture {
+        None
+    } else {
+        Some(
+            crate::daemon::start_process()
+                .unwrap_or_else(|error| panic!("failed to start daku daemon: {error:#}")),
+        )
+    };
 
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
@@ -150,15 +156,12 @@ pub fn run() {
                         app_id: Some(APP_ID.to_owned()),
                         window_bounds: Some(window_bounds),
                         display_id,
-                        window_min_size: Some(size(
-                            px(MIN_WINDOW_WIDTH),
-                            px(MIN_WINDOW_HEIGHT),
-                        )),
+                        window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
                         ..Default::default()
                     },
                     move |window, cx| {
                         crate::platform::configure_main_window_close_behavior(window, cx);
-                        Daku::new(window, cx)
+                        Daku::new(window, cx, daemon)
                     },
                 )
                 .expect("failed to open daku window");
