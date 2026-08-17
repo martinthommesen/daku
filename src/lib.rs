@@ -78,7 +78,6 @@ pub fn run() {
         .with_main_window_reopen()
         .run(move |cx: &mut App| {
             cx.set_app_identity(APP_ID, APP_NAME);
-            crate::assets::register_fonts(cx).expect("failed to register bundled fonts");
             crate::theme::init(cx);
             crate::platform::init_reduce_motion(cx);
 
