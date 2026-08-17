@@ -1,7 +1,11 @@
 //! Daemon-owned, user-editable configuration.
 
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub use daku_protocol::settings::DaemonSettings;
@@ -92,8 +96,17 @@ fn write_atomic(path: &Path, settings: &DaemonSettings) -> io::Result<()> {
     }
     let data = serde_json::to_vec_pretty(settings).map_err(to_io_error)?;
     let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, data)?;
-    fs::rename(temporary, path)
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary)?;
+    file.write_all(&data)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 fn to_io_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
@@ -104,6 +117,17 @@ fn to_io_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Err
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_settings_file_is_0600() {
+        let path = std::env::temp_dir().join(format!("daku-settings-{}.json", Uuid::new_v4()));
+        let store = DaemonSettingsStore::open(path.clone()).unwrap();
+        store.replace(DaemonSettings::default()).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_file(&path);
+        assert_eq!(mode, 0o600);
+    }
 
     #[test]
     fn legacy_combined_settings_keep_only_daemon_fields() {

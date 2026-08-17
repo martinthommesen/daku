@@ -41,8 +41,36 @@ pub fn load_environments(path: &Path) -> anyhow::Result<Vec<EnvironmentConfig>> 
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let mut environments: Vec<EnvironmentConfig> =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    for environment in &environments {
+        validate_instance_url(&environment.id, &environment.instance_url)?;
+    }
     environments.sort_by_key(|environment| environment.sort_order);
     Ok(environments)
+}
+
+/// Environment URLs carry Credentials on every request: https only, no
+/// userinfo, no query/fragment. Trailing `/` is tolerated (`join_url` trims it).
+fn validate_instance_url(id: &str, url: &str) -> anyhow::Result<()> {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err(anyhow!(
+            "environment {id}: instance_url must start with https://"
+        ));
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        return Err(anyhow!("environment {id}: instance_url has no host"));
+    }
+    if host.contains('@') {
+        return Err(anyhow!(
+            "environment {id}: instance_url must not contain userinfo"
+        ));
+    }
+    if rest.contains('?') || rest.contains('#') {
+        return Err(anyhow!(
+            "environment {id}: instance_url must not contain a query or fragment"
+        ));
+    }
+    Ok(())
 }
 
 /// Looks up the secret blob for an Environment id.
@@ -124,5 +152,56 @@ mod tests {
                 .iter()
                 .all(|environment| environment.instance_url.contains("example.service-now.com"))
         );
+    }
+
+    fn write_temp(json: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("daku-env-{}.json", uuid::Uuid::new_v4()));
+        fs::write(&path, json).unwrap();
+        path
+    }
+
+    fn one_environment(instance_url: &str) -> String {
+        format!(
+            r#"[{{"id":"dev","label":"Dev","instance_url":"{instance_url}","auth_method":"basic","sort_order":0}}]"#
+        )
+    }
+
+    #[test]
+    fn load_environments_rejects_http_url() {
+        let path = write_temp(&one_environment("http://acme-dev.example.service-now.com"));
+        let error = load_environments(&path).unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+        assert!(error.contains("must start with https://"), "{error}");
+    }
+
+    #[test]
+    fn load_environments_rejects_userinfo() {
+        let path = write_temp(&one_environment(
+            "https://user:pw@acme.example.service-now.com",
+        ));
+        let error = load_environments(&path).unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+        assert!(error.contains("userinfo"), "{error}");
+    }
+
+    #[test]
+    fn load_environments_rejects_query_and_fragment() {
+        for url in [
+            "https://acme.example.service-now.com/?x=1",
+            "https://acme.example.service-now.com/#frag",
+        ] {
+            let path = write_temp(&one_environment(url));
+            let error = load_environments(&path).unwrap_err().to_string();
+            let _ = fs::remove_file(&path);
+            assert!(error.contains("query or fragment"), "{error}");
+        }
+    }
+
+    #[test]
+    fn load_environments_accepts_trailing_slash() {
+        let path = write_temp(&one_environment("https://acme.example.service-now.com/"));
+        let environments = load_environments(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(environments.len(), 1);
     }
 }

@@ -27,7 +27,7 @@ Daemon Hello auth uses env **`DAKU_DAEMON_TOKEN`**. Operator data/config lives u
 
 **Attaching to a daemon you run yourself:** start `DAKU_DAEMON_TOKEN=<token> daku-daemon --bind 127.0.0.1:<port>` and launch the app with `DAKU_DAEMON_ADDRESS=127.0.0.1:<port> DAKU_DAEMON_TOKEN=<token>`. Both variables must be set together. Non-loopback binds need `--allow-non-loopback` and are outside the v1 support envelope — see [`docs/research/hosted-daemon.md`](docs/research/hosted-daemon.md).
 
-Copy [`environments.example.json`](environments.example.json) to `~/.daku/environments.json` and edit Environment URLs/labels. **Secrets stay in the macOS Keychain** (daku-owned service) — never in that JSON file or in SQLite.
+Copy [`environments.example.json`](environments.example.json) to `~/.daku/environments.json` (`chmod 600` it — the daemon only enforces `0700` on the directory and `0600` on files it writes) and edit Environment URLs/labels. URLs must be `https://` with no user:password part. **Secrets stay in the macOS Keychain** (daku-owned service) — never in that JSON file or in SQLite.
 
 Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settings.json`, e.g. `{"poll_interval_secs": 60}` (default **120**; the daemon reads it at start — relaunch after editing). One shared `CollectorLoop` polls every Environment; Availability, jobs, syslog, MID/ECC, outbound, drift, and last-clone register onto it. After each tick the daemon broadcasts `EnvironmentsUpdated`, `SignalSnapshotsUpdated`, and `SignalSamplesUpdated` (jobs/syslog ≤24h) so the GPUI client never opens SQLite. The GPUI shell is sidebar + Environment detail; `DAKU_UI_FIXTURE=1` loads the same events as the dashboard_state tests (no ServiceNow).
 

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use rusqlite::{Connection, params};
 
@@ -69,20 +69,36 @@ pub fn apply_migrations(connection: &Connection) -> io::Result<usize> {
     Ok(applied)
 }
 
-/// Ensures the db file exists as `0o600`. When the parent is `.daku`, also set it `0o700`.
+/// Ensures the db file exists as `0o600`. Sets the parent `0o700` when daku
+/// created it, or when it is literally named `.daku` — never a pre-existing
+/// directory the Operator pointed `DAKU_DB_PATH` at.
 pub fn ensure_daku_dir(db_path: &Path) -> io::Result<()> {
-    if let Some(parent) = db_path.parent() {
+    if let Some(parent) = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        #[cfg(unix)]
+        let existed = parent.exists();
         fs::create_dir_all(parent)?;
         #[cfg(unix)]
-        if parent
-            .file_name()
-            .is_some_and(|name| name == std::ffi::OsStr::new(".daku"))
+        if !existed
+            || parent
+                .file_name()
+                .is_some_and(|name| name == std::ffi::OsStr::new(".daku"))
         {
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
     }
     if !db_path.exists() {
-        fs::File::create(db_path)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(db_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
     }
     #[cfg(unix)]
     fs::set_permissions(db_path, fs::Permissions::from_mode(0o600))?;
@@ -343,16 +359,25 @@ mod tests {
         let db_path = root.join(".daku").join("app.db");
         ensure_daku_dir(&db_path).unwrap();
 
+        let custom_db = root.join("custom").join("app.db");
+        ensure_daku_dir(&custom_db).unwrap();
+
+        let pre = root.join("pre");
+        fs::create_dir_all(&pre).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&pre, fs::Permissions::from_mode(0o755)).unwrap();
+        let pre_db = pre.join("app.db");
+        ensure_daku_dir(&pre_db).unwrap();
+
         #[cfg(unix)]
         {
-            let dir_mode = fs::metadata(db_path.parent().unwrap())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            let db_mode = fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(dir_mode, 0o700);
-            assert_eq!(db_mode, 0o600);
+            let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode_of(db_path.parent().unwrap()), 0o700);
+            assert_eq!(mode_of(&db_path), 0o600);
+            assert_eq!(mode_of(custom_db.parent().unwrap()), 0o700);
+            assert_eq!(mode_of(&custom_db), 0o600);
+            assert_eq!(mode_of(&pre), 0o755);
+            assert_eq!(mode_of(&pre_db), 0o600);
         }
 
         let _ = fs::remove_dir_all(root);
