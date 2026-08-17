@@ -336,18 +336,35 @@ impl Default for UreqTransport {
     }
 }
 
+/// ureq 3 parses URLs as strict RFC 3986 `http::Uri`s, so the ServiceNow
+/// encoded-query characters the Signals use verbatim (`^`, `<`, `>`, space)
+/// must be percent-encoded at the wire; unreserved, reserved and `%` pass through.
+fn percent_encode_url(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    for byte in url.bytes() {
+        let keep = byte.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=%".contains(&byte);
+        if keep {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 impl HttpTransport for UreqTransport {
     fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+        let url = percent_encode_url(&request.url);
         let response = match request.method.as_str() {
             "GET" => {
-                let mut call = self.agent.get(&request.url);
+                let mut call = self.agent.get(&url);
                 for (name, value) in &request.headers {
                     call = call.header(name.as_str(), value.as_str());
                 }
                 call.call()
             }
             "POST" => {
-                let mut call = self.agent.post(&request.url);
+                let mut call = self.agent.post(&url);
                 for (name, value) in &request.headers {
                     call = call.header(name.as_str(), value.as_str());
                 }
@@ -384,6 +401,17 @@ fn read_ureq_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_encode_url_encodes_servicenow_query_operators_only() {
+        assert_eq!(
+            percent_encode_url(
+                "https://x.service-now.com/api/now/stats/sys_trigger?sysparm_count=true&sysparm_query=state=0^next_action<javascript:gs.minutesAgo(5) 1&sysparm_fields=a,b"
+            ),
+            "https://x.service-now.com/api/now/stats/sys_trigger?sysparm_count=true&sysparm_query=state=0%5Enext_action%3Cjavascript:gs.minutesAgo(5)%201&sysparm_fields=a,b"
+        );
+        assert_eq!(percent_encode_url("https://x/a?b=%5E"), "https://x/a?b=%5E");
+    }
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
