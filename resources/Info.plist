@@ -24,6 +24,10 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <!-- Sparkle feed on GitHub Releases. Add SUPublicEDKey after generating
+         the Ed25519 keypair (docs/packaging.md). Never commit the private key. -->
+    <key>SUFeedURL</key>
+    <string>https://github.com/martinthommesen/daku/releases/latest/download/appcast.xml</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>

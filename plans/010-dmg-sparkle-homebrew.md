@@ -13,7 +13,8 @@
 - **Depends on**: plans/009-gpui-shell-variant-c.md
 - **Category**: direction
 - **Planned at**: commit `567179a`, 2026-08-17
-- **Issue**: https://github.com/martinthommesen/daku/issues/23
+- **Issue**: https://github.com/martinthommesen/daku/issues/33
+- **Done**: unsigned `Daku.app`, Sparkle path + Homebrew no-op, cask draft; notarisation left to Appendix A (no Developer ID in this environment)
 
 ## Why this matters
 
@@ -99,11 +100,11 @@ Lock app dir name to **`Daku.app`**. Document exact unsigned command in `docs/pa
 
 ## Done criteria
 
-- [ ] `test -d dist/Daku.app` after documented unsigned command (CI may skip dist artifact — then require the command to be documented and dry-runnable with `--help` exit 0 **and** a `scripts/bundle.sh` that contains `Daku.app`)
-- [ ] `cargo test -p daku updater_channel` exit 0
-- [ ] `test -f homebrew/daku.rb && test -f docs/packaging.md`
-- [ ] `rg -n 'BEGIN .*PRIVATE' scripts resources docs` → no matches
-- [ ] `plans/README.md` row 010 Status = `DONE` (or `BLOCKED` with reason `notarisation credentials missing` **only if** unsigned+cask+docs already meet the bullets above)
+- [x] `test -d dist/Daku.app` after documented unsigned command (CI may skip dist artifact — then require the command to be documented and dry-runnable with `--help` exit 0 **and** a `scripts/bundle.sh` that contains `Daku.app`)
+- [x] `cargo test -p daku updater_channel` exit 0
+- [x] `test -f homebrew/daku.rb && test -f docs/packaging.md`
+- [x] `rg -n 'BEGIN .*PRIVATE' scripts resources docs` → no matches
+- [x] `plans/README.md` row 010 Status = `DONE` (or `BLOCKED` with reason `notarisation credentials missing` **only if** unsigned+cask+docs already meet the bullets above)
 
 ## STOP conditions
 

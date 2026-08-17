@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun ./scripts/dev.ts",
+    "release": "bun ./scripts/release.ts",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "lint": "oxlint -c oxlint.config.ts ."

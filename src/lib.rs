@@ -23,6 +23,7 @@ pub mod daemon;
 mod dashboard_state;
 mod platform;
 mod theme;
+mod updater;
 
 pub use daku_client::{i18n, identity, persistence};
 
@@ -34,7 +35,10 @@ use gpui::{
 use crate::app::Daku;
 use crate::identity::{APP_ID, APP_NAME};
 
-actions!(daku, [Quit, About, CloseWindow, ToggleFpsCounter]);
+actions!(
+    daku,
+    [Quit, About, CloseWindow, CheckForUpdates, ToggleFpsCounter]
+);
 
 const DEFAULT_WINDOW_WIDTH: f32 = 1380.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 880.0;
@@ -128,6 +132,14 @@ pub fn run() {
             crate::theme::init(cx);
             crate::platform::init_reduce_motion(cx);
 
+            let updater = crate::updater::Updater::init();
+            let updater_available = updater.is_some();
+            cx.set_global(crate::updater::UpdaterState(updater));
+            cx.on_action(|_: &CheckForUpdates, cx| {
+                if let Some(updater) = &cx.global::<crate::updater::UpdaterState>().0 {
+                    updater.check_for_updates();
+                }
+            });
             cx.on_action(|_: &About, _| crate::platform::show_about_panel());
             cx.bind_keys([
                 KeyBinding::new("secondary-q", Quit, None),
@@ -176,20 +188,27 @@ pub fn run() {
                 })
                 .ok();
 
-            set_app_menus(cx);
+            set_app_menus(cx, updater_available);
         });
 }
 
-pub(crate) fn set_app_menus(cx: &mut App) {
+pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
     cx.set_menus(vec![
         Menu {
             name: APP_NAME.into(),
             disabled: false,
-            items: vec![
-                MenuItem::action(tr!("menu.about", app = APP_NAME), About),
-                MenuItem::separator(),
-                MenuItem::action(tr!("menu.quit", app = APP_NAME), Quit),
-            ],
+            items: {
+                let mut items = vec![MenuItem::action(tr!("menu.about", app = APP_NAME), About)];
+                if updater_available {
+                    items.push(MenuItem::action(
+                        tr!("menu.check_for_updates"),
+                        CheckForUpdates,
+                    ));
+                }
+                items.push(MenuItem::separator());
+                items.push(MenuItem::action(tr!("menu.quit", app = APP_NAME), Quit));
+                items
+            },
         },
         Menu {
             name: tr!("menu.window").into(),

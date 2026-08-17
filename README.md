@@ -58,6 +58,19 @@ Dev watcher (macOS Debug.app):
 bun run dev
 ```
 
+## Packaging
+
+Unsigned `Daku.app` (no Developer ID):
+
+```sh
+./scripts/bundle.sh --unsigned
+```
+
+Writes `dist/Daku.app`. Sparkle is the primary updater. Homebrew cask
+(`homebrew/daku.rb`) installs `Daku-x.y.z-homebrew.dmg` built with
+`DAKU_CHANNEL=homebrew` so Sparkle is a compile-time no-op. Human
+notarisation checklist: [`docs/packaging.md`](docs/packaging.md).
+
 ## Licence
 
 GPL-3.0-only — see [`LICENSE`](LICENSE).
