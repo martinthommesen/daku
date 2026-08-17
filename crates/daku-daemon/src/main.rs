@@ -46,11 +46,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let task_path = daku_core::persistence::StateStore::default_path();
-    let settings = daku_core::DaemonSettingsStore::open_with_legacy(
-        daku_core::DaemonSettings::default_path(),
-        [task_path.with_file_name("settings.json")],
-    )
-    .context("could not load daemon settings")?;
+    let settings = daku_core::DaemonSettingsStore::open(daku_core::DaemonSettings::default_path())
+        .context("could not load daemon settings")?;
     let task_store = daku_core::persistence::StateStore::daemon(task_path.clone());
     let dashboard_events = daku_core::start_default_loop(
         &daku_core::default_environments_path(),

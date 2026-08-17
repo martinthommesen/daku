@@ -19,14 +19,7 @@ pub struct DaemonSettingsStore {
 
 impl DaemonSettingsStore {
     pub fn open(path: PathBuf) -> io::Result<Self> {
-        Self::open_with_legacy(path, std::iter::empty())
-    }
-
-    pub fn open_with_legacy(
-        path: PathBuf,
-        legacy_paths: impl IntoIterator<Item = PathBuf>,
-    ) -> io::Result<Self> {
-        let (mut settings, write_current) = match fs::read(&path) {
+        let (settings, write_current) = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(settings) => (settings, false),
                 Err(error) => {
@@ -39,28 +32,10 @@ impl DaemonSettingsStore {
                 }
             },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let mut restored: Option<DaemonSettings> = None;
-                for legacy_path in legacy_paths {
-                    if legacy_path == path {
-                        continue;
-                    }
-                    match fs::read(legacy_path) {
-                        Ok(bytes) => {
-                            if let Ok(settings) = serde_json::from_slice(&bytes) {
-                                restored = Some(settings);
-                                break;
-                            }
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                let migrated = restored.is_some();
-                (restored.unwrap_or_default(), migrated)
+                (DaemonSettings::default(), false)
             }
             Err(error) => return Err(error),
         };
-        settings.discard_legacy_app_keys();
         if write_current {
             write_atomic(&path, &settings)?;
         }
@@ -74,8 +49,7 @@ impl DaemonSettingsStore {
         self.settings.lock().clone()
     }
 
-    pub fn replace(&self, mut settings: DaemonSettings) -> io::Result<()> {
-        settings.discard_legacy_app_keys();
+    pub fn replace(&self, settings: DaemonSettings) -> io::Result<()> {
         let mut current = self.settings.lock();
         write_atomic(&self.path, &settings)?;
         *current = settings;
@@ -118,35 +92,65 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    fn temp_directory() -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("daku-settings-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
     #[cfg(unix)]
     #[test]
     fn daemon_settings_file_is_0600() {
-        let path = std::env::temp_dir().join(format!("daku-settings-{}.json", Uuid::new_v4()));
+        let directory = temp_directory();
+        let path = directory.join("settings.json");
         let store = DaemonSettingsStore::open(path.clone()).unwrap();
         store.replace(DaemonSettings::default()).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        let _ = fs::remove_file(&path);
+        fs::remove_dir_all(directory).ok();
         assert_eq!(mode, 0o600);
     }
 
     #[test]
-    fn legacy_combined_settings_keep_only_daemon_fields() {
-        let path = std::env::temp_dir().join(format!("daku-settings-{}.json", Uuid::new_v4()));
+    fn settings_file_with_unknown_keys_loads_and_rewrites_typed() {
+        let directory = temp_directory();
+        let path = directory.join("settings.json");
         fs::write(
             &path,
-            r#"{"theme":"dark","analytics_enabled":false,"future":42}"#,
+            r#"{"theme":"dark","poll_interval_secs":45,"future":42}"#,
         )
         .unwrap();
 
         let store = DaemonSettingsStore::open(path.clone()).unwrap();
-        let settings = store.get();
-        assert_eq!(settings.extra.get("future"), Some(&Value::from(42)));
-        assert!(!settings.extra.contains_key("analytics_enabled"));
-        store.replace(settings).unwrap();
+        assert_eq!(store.get().poll_interval_secs, 45);
+        store.replace(store.get()).unwrap();
 
         let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(value.get("analytics_enabled").is_none());
-        assert_eq!(value["future"], 42);
-        fs::remove_file(path).ok();
+        assert_eq!(value["poll_interval_secs"], 45);
+        assert!(value.get("theme").is_none());
+        assert!(value.get("future").is_none());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn corrupt_settings_are_quarantined() {
+        let directory = temp_directory();
+        let path = directory.join("settings.json");
+        fs::write(&path, "not json").unwrap();
+
+        let store = DaemonSettingsStore::open(path.clone()).unwrap();
+        assert_eq!(store.get(), DaemonSettings::default());
+        let quarantined = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("settings.json.corrupt-")
+            })
+            .count();
+        assert_eq!(quarantined, 1);
+        serde_json::from_slice::<DaemonSettings>(&fs::read(&path).unwrap()).unwrap();
+        fs::remove_dir_all(directory).ok();
     }
 }

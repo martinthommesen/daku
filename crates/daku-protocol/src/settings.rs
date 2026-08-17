@@ -1,27 +1,22 @@
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::i18n::AppLanguage;
-use crate::theme::ThemePreference;
+pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 120;
 
+/// Daemon-owned settings (`~/.daku/settings.json`). Unknown keys are ignored
+/// on load and dropped on write.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct DaemonSettings {
-    pub theme: ThemePreference,
-    pub language: AppLanguage,
-    #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
-    pub extra: BTreeMap<String, Value>,
+    /// Shared collector cadence in seconds; `0` means the default.
+    pub poll_interval_secs: u64,
 }
 
 impl Default for DaemonSettings {
     fn default() -> Self {
         Self {
-            theme: ThemePreference::default(),
-            language: AppLanguage::default(),
-            extra: BTreeMap::new(),
+            poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
         }
     }
 }
@@ -32,11 +27,5 @@ impl DaemonSettings {
             .unwrap_or_else(std::env::temp_dir)
             .join(".daku")
             .join("settings.json")
-    }
-
-    pub fn discard_legacy_app_keys(&mut self) {
-        for key in ["analytics_enabled", "favorite_models"] {
-            self.extra.remove(key);
-        }
     }
 }

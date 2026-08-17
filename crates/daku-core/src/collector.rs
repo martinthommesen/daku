@@ -24,16 +24,14 @@ use crate::persistence::StateStore;
 use crate::servicenow::{Clock, ServiceNowClient, SystemClock, UreqTransport};
 use crate::syslog::SyslogCollector;
 
-pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 120;
-pub const POLL_INTERVAL_SECS_KEY: &str = "poll_interval_secs";
+pub use daku_protocol::settings::DEFAULT_POLL_INTERVAL_SECS;
 
 pub fn poll_interval_secs(settings: &DaemonSettings) -> u64 {
-    settings
-        .extra
-        .get(POLL_INTERVAL_SECS_KEY)
-        .and_then(|value| value.as_u64())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
+    if settings.poll_interval_secs == 0 {
+        DEFAULT_POLL_INTERVAL_SECS
+    } else {
+        settings.poll_interval_secs
+    }
 }
 
 pub trait SignalCollector: Send + Sync {
@@ -245,15 +243,19 @@ mod tests {
     }
 
     #[test]
-    fn poll_interval_secs_falls_back_to_default_for_zero_or_non_number() {
+    fn poll_interval_secs_zero_means_default() {
         let zero: DaemonSettings = serde_json::from_str(r#"{"poll_interval_secs": 0}"#).unwrap();
         assert_eq!(poll_interval_secs(&zero), DEFAULT_POLL_INTERVAL_SECS);
-        let text: DaemonSettings =
-            serde_json::from_str(r#"{"poll_interval_secs": "fast"}"#).unwrap();
-        assert_eq!(poll_interval_secs(&text), DEFAULT_POLL_INTERVAL_SECS);
         assert_eq!(
             poll_interval_secs(&DaemonSettings::default()),
             DEFAULT_POLL_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn poll_interval_secs_rejects_non_number() {
+        assert!(
+            serde_json::from_str::<DaemonSettings>(r#"{"poll_interval_secs":"fast"}"#).is_err()
         );
     }
 
