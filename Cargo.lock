@@ -1338,7 +1338,6 @@ name = "daku"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "block2 0.6.2",
  "daku-client",
  "daku-protocol",
  "gpui",
