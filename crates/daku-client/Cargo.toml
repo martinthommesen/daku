@@ -22,3 +22,6 @@ daku-protocol = { path = "../daku-protocol" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+daku-core = { path = "../daku-core" }

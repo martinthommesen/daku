@@ -552,8 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn handshake_rejects_wrong_protocol_version() {
-        assert_eq!(PROTOCOL_VERSION, 1);
+    fn token_matches_is_exact() {
         assert!(token_matches("secret", "secret"));
         assert!(!token_matches("secret", "other"));
     }
