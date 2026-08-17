@@ -4,7 +4,7 @@ use anyhow::Context;
 use crossbeam_channel::Sender;
 use daku_protocol::{
     EnvironmentHealth, EnvironmentSummary, Reachability, SamplePoint, ServerMessage,
-    SignalSnapshotDto,
+    SignalSnapshotDto, SignalState,
 };
 
 use crate::availability::AVAILABILITY_SIGNAL_ID;
@@ -16,7 +16,10 @@ use crate::syslog::SYSLOG_SIGNAL_ID;
 
 pub const SERVICENOW_PLATFORM_ID: &str = "servicenow";
 
-pub fn health_rollup(reachability: Reachability, signals: &[(&str, &str)]) -> EnvironmentHealth {
+pub fn health_rollup(
+    reachability: Reachability,
+    signals: &[(&str, SignalState)],
+) -> EnvironmentHealth {
     match reachability {
         // Reachability is reported separately; a sleeping Environment cannot
         // be observed, so its Signals must not vote.
@@ -26,10 +29,10 @@ pub fn health_rollup(reachability: Reachability, signals: &[(&str, &str)]) -> En
     }
     let mut health = EnvironmentHealth::Healthy;
     for &(signal_id, state) in signals {
-        if signal_id == LAST_CLONE_SIGNAL_ID || state == persistence::SKIPPED_STATE {
+        if signal_id == LAST_CLONE_SIGNAL_ID || state == SignalState::Skipped {
             continue;
         }
-        if state == "down" || state == "degraded" {
+        if matches!(state, SignalState::Down | SignalState::Degraded) {
             health = EnvironmentHealth::Degraded;
         }
     }
@@ -40,11 +43,11 @@ fn wire_reachability(payload_json: &str) -> Reachability {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) else {
         return Reachability::Reachable;
     };
-    match value.get("reachability").and_then(|item| item.as_str()) {
-        Some("unreachable") => Reachability::Unreachable,
-        Some("asleep") => Reachability::Asleep,
-        _ => Reachability::Reachable,
-    }
+    value
+        .get("reachability")
+        .and_then(|item| item.as_str())
+        .and_then(Reachability::parse)
+        .unwrap_or(Reachability::Reachable)
 }
 
 pub fn publish_dashboard(
@@ -70,7 +73,13 @@ pub fn publish_dashboard(
             .unwrap_or(Reachability::Reachable);
         let votes: Vec<_> = env_snaps
             .iter()
-            .map(|snapshot| (snapshot.signal_id.as_str(), snapshot.state.as_str()))
+            .map(|snapshot| {
+                (
+                    snapshot.signal_id.as_str(),
+                    // Unknown state text never votes.
+                    SignalState::parse(&snapshot.state).unwrap_or(SignalState::Skipped),
+                )
+            })
             .collect();
         summaries.push(EnvironmentSummary {
             id: environment.id.clone(),
@@ -128,7 +137,7 @@ mod tests {
     #[test]
     fn health_rollup_unreachable_is_down() {
         assert_eq!(
-            health_rollup(Reachability::Unreachable, &[("jobs", "healthy")]),
+            health_rollup(Reachability::Unreachable, &[("jobs", SignalState::Healthy)]),
             EnvironmentHealth::Down
         );
     }
@@ -137,7 +146,10 @@ mod tests {
     fn health_rollup_asleep_without_degraded_signals_is_healthy() {
         let health = health_rollup(
             Reachability::Asleep,
-            &[("availability", "healthy"), ("jobs", "healthy")],
+            &[
+                ("availability", SignalState::Healthy),
+                ("jobs", SignalState::Healthy),
+            ],
         );
         assert_eq!(health, EnvironmentHealth::Healthy);
         assert_ne!(health, EnvironmentHealth::Degraded);
@@ -156,7 +168,10 @@ mod tests {
         assert_eq!(
             health_rollup(
                 Reachability::Reachable,
-                &[("availability", "healthy"), ("jobs", "degraded")]
+                &[
+                    ("availability", SignalState::Healthy),
+                    ("jobs", SignalState::Degraded)
+                ]
             ),
             EnvironmentHealth::Degraded
         );
@@ -167,7 +182,10 @@ mod tests {
         assert_eq!(
             health_rollup(
                 Reachability::Reachable,
-                &[("availability", "healthy"), ("jobs", "healthy")]
+                &[
+                    ("availability", SignalState::Healthy),
+                    ("jobs", SignalState::Healthy)
+                ]
             ),
             EnvironmentHealth::Healthy
         );
@@ -183,19 +201,18 @@ mod tests {
 
     #[test]
     fn health_rollup_last_clone_never_votes_degraded() {
-        assert_eq!(
-            health_rollup(
-                Reachability::Reachable,
-                &[(LAST_CLONE_SIGNAL_ID, "degraded")]
-            ),
-            EnvironmentHealth::Healthy
-        );
+        for state in [SignalState::Degraded, SignalState::Down] {
+            assert_eq!(
+                health_rollup(Reachability::Reachable, &[(LAST_CLONE_SIGNAL_ID, state)]),
+                EnvironmentHealth::Healthy
+            );
+        }
     }
 
     #[test]
     fn health_rollup_skips_missing_and_skipped_signals() {
         assert_eq!(
-            health_rollup(Reachability::Reachable, &[("drift", "skipped")]),
+            health_rollup(Reachability::Reachable, &[("drift", SignalState::Skipped)]),
             EnvironmentHealth::Healthy
         );
     }
@@ -203,13 +220,13 @@ mod tests {
     #[test]
     fn health_rollup_asleep_ignores_signal_votes() {
         assert_eq!(
-            health_rollup(Reachability::Asleep, &[("jobs", "degraded")]),
+            health_rollup(Reachability::Asleep, &[("jobs", SignalState::Degraded)]),
             EnvironmentHealth::Healthy
         );
         assert_eq!(
             health_rollup(
                 Reachability::Asleep,
-                &[("jobs", "down"), ("syslog", "down")]
+                &[("jobs", SignalState::Down), ("syslog", SignalState::Down)]
             ),
             EnvironmentHealth::Healthy
         );
@@ -218,7 +235,7 @@ mod tests {
     #[test]
     fn health_rollup_reachable_signal_down_is_degraded() {
         assert_eq!(
-            health_rollup(Reachability::Reachable, &[("jobs", "down")]),
+            health_rollup(Reachability::Reachable, &[("jobs", SignalState::Down)]),
             EnvironmentHealth::Degraded
         );
     }
@@ -241,7 +258,7 @@ mod tests {
             "prod",
             "availability",
             now,
-            "healthy",
+            SignalState::Healthy,
             r#"{"reachability":"asleep"}"#,
         )
         .unwrap();
@@ -250,7 +267,7 @@ mod tests {
             "prod",
             JOBS_SIGNAL_ID,
             now,
-            "healthy",
+            SignalState::Healthy,
             r#"{"overdue_ready":0}"#,
         )
         .unwrap();
@@ -259,7 +276,7 @@ mod tests {
             "prod",
             LAST_CLONE_SIGNAL_ID,
             now,
-            "degraded",
+            SignalState::Degraded,
             r#"{"supported":true}"#,
         )
         .unwrap();

@@ -1,15 +1,9 @@
 //! Syslog error-rate Signal: 1h Error count on the rotated `syslog` table.
 
-use std::io;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use daku_protocol::SignalState;
 
-use rusqlite::Connection;
-
-use crate::availability::{REACHABILITY_REUSE_SECS, Reachability, recent_reachability};
-use crate::collector::SignalCollector;
+use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig};
-use crate::persistence::{self, StateStore};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
 pub const SYSLOG_SIGNAL_ID: &str = "syslog";
@@ -21,143 +15,42 @@ pub fn syslog_error_path() -> String {
     )
 }
 
-pub fn syslog_state(error_count_1h: u64) -> &'static str {
+pub fn syslog_state(error_count_1h: u64) -> SignalState {
     if error_count_1h > 0 {
-        "degraded"
+        SignalState::Degraded
     } else {
-        "healthy"
+        SignalState::Healthy
     }
 }
 
-pub struct SyslogCollector {
-    environments: Vec<EnvironmentConfig>,
-    credentials: Arc<dyn CredentialStore>,
-    client: Arc<ServiceNowClient>,
-    store: StateStore,
-}
+#[derive(Default)]
+pub struct SyslogSignal;
 
-impl SyslogCollector {
-    pub fn new(
-        environments: Vec<EnvironmentConfig>,
-        credentials: Arc<dyn CredentialStore>,
-        client: impl Into<Arc<ServiceNowClient>>,
-        store: StateStore,
-    ) -> Self {
-        Self {
-            environments,
-            credentials,
-            client: client.into(),
-            store,
-        }
+pub type SyslogCollector = PerEnvironmentCollector<SyslogSignal>;
+
+impl Signal for SyslogSignal {
+    fn id(&self) -> &'static str {
+        SYSLOG_SIGNAL_ID
     }
-}
 
-impl SignalCollector for SyslogCollector {
-    fn collect(&self) -> anyhow::Result<()> {
-        let connection = self.store.open()?;
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
-        let path = syslog_error_path();
-        let mut first_error = None;
-        for environment in &self.environments {
-            if let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
-                recent_reachability(
-                    &connection,
-                    &environment.id,
-                    observed_at,
-                    REACHABILITY_REUSE_SECS,
-                )
-            {
-                if let Err(error) = persistence::persist_signal_skipped(
-                    &connection,
-                    &environment.id,
-                    SYSLOG_SIGNAL_ID,
-                    observed_at,
-                    reachability.as_str(),
-                ) {
-                    first_error.get_or_insert_with(|| anyhow::Error::from(error));
-                }
-                continue;
-            }
-            let count =
-                fetch_aggregate_count(&self.client, environment, self.credentials.as_ref(), &path);
-            if let Err(error) = collect_syslog(&connection, environment, observed_at, count) {
-                first_error.get_or_insert(error);
-            }
-        }
-        if let Err(error) = persistence::prune_signal_samples(&connection, observed_at) {
-            first_error.get_or_insert_with(|| anyhow::Error::from(error));
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+    fn keeps_samples(&self) -> bool {
+        true
     }
-}
 
-fn collect_syslog(
-    connection: &Connection,
-    environment: &EnvironmentConfig,
-    observed_at: i64,
-    count: anyhow::Result<u64>,
-) -> anyhow::Result<()> {
-    match count {
-        Ok(error_count_1h) => {
-            persist_syslog_ok(connection, &environment.id, error_count_1h, observed_at)
-                .map_err(anyhow::Error::from)
-        }
-        Err(error) => {
-            persist_syslog_down(connection, &environment.id, &error.to_string(), observed_at)
-                .map_err(anyhow::Error::from)
-        }
+    fn probe(
+        &self,
+        client: &ServiceNowClient,
+        credentials: &dyn CredentialStore,
+        environment: &EnvironmentConfig,
+    ) -> anyhow::Result<Observation> {
+        let error_count_1h =
+            fetch_aggregate_count(client, environment, credentials, &syslog_error_path())?;
+        Ok(Observation {
+            state: syslog_state(error_count_1h),
+            payload: serde_json::json!({ "error_count_1h": error_count_1h }),
+            sample: Some(error_count_1h as f64),
+        })
     }
-}
-
-fn persist_syslog_ok(
-    connection: &Connection,
-    environment_id: &str,
-    error_count_1h: u64,
-    observed_at: i64,
-) -> io::Result<()> {
-    let payload = serde_json::json!({ "error_count_1h": error_count_1h });
-    persistence::persist_signal_snapshot(
-        connection,
-        environment_id,
-        SYSLOG_SIGNAL_ID,
-        observed_at,
-        syslog_state(error_count_1h),
-        &payload.to_string(),
-    )?;
-    persistence::persist_signal_sample(
-        connection,
-        environment_id,
-        SYSLOG_SIGNAL_ID,
-        observed_at,
-        Some(error_count_1h as f64),
-        None,
-    )
-}
-
-fn persist_syslog_down(
-    connection: &Connection,
-    environment_id: &str,
-    message: &str,
-    observed_at: i64,
-) -> io::Result<()> {
-    let payload = serde_json::json!({
-        "reachability": "unreachable",
-        "detail": message,
-    });
-    persistence::persist_signal_snapshot(
-        connection,
-        environment_id,
-        SYSLOG_SIGNAL_ID,
-        observed_at,
-        "down",
-        &payload.to_string(),
-    )
 }
 
 #[cfg(test)]
@@ -276,16 +169,12 @@ mod tests {
 
     #[test]
     fn syslog_signal_skips_when_availability_asleep() {
-        use crate::availability::{
-            AvailabilityObservation, Reachability, SignalState, persist_availability_snapshot,
-        };
+        use crate::availability::{AvailabilityObservation, persist_availability_snapshot};
+        use daku_protocol::{Reachability, SignalState};
 
         let db = TempDb::new("syslog-asleep");
         let store = db.store();
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
+        let observed_at = crate::collector::unix_now();
         {
             let connection = store.open().unwrap();
             persist_availability_snapshot(

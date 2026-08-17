@@ -1,15 +1,10 @@
 //! Scheduled jobs Signal: overdue Ready and Error counts on `sys_trigger`.
 
-use std::io;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use anyhow::anyhow;
+use daku_protocol::SignalState;
 
-use rusqlite::Connection;
-
-use crate::availability::{REACHABILITY_REUSE_SECS, Reachability, recent_reachability};
-use crate::collector::SignalCollector;
+use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig};
-use crate::persistence::{self, StateStore};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
 pub const JOBS_SIGNAL_ID: &str = "jobs";
@@ -17,169 +12,55 @@ pub const JOBS_OVERDUE_PATH: &str = "/api/now/stats/sys_trigger?sysparm_count=tr
 pub const JOBS_ERROR_PATH: &str =
     "/api/now/stats/sys_trigger?sysparm_count=true&sysparm_query=state=3";
 
-pub fn jobs_state(overdue_ready: u64) -> &'static str {
+pub fn jobs_state(overdue_ready: u64) -> SignalState {
     if overdue_ready > 0 {
-        "degraded"
+        SignalState::Degraded
     } else {
-        "healthy"
+        SignalState::Healthy
     }
 }
 
-pub struct JobsCollector {
-    environments: Vec<EnvironmentConfig>,
-    credentials: Arc<dyn CredentialStore>,
-    client: Arc<ServiceNowClient>,
-    store: StateStore,
-}
+#[derive(Default)]
+pub struct JobsSignal;
 
-impl JobsCollector {
-    pub fn new(
-        environments: Vec<EnvironmentConfig>,
-        credentials: Arc<dyn CredentialStore>,
-        client: impl Into<Arc<ServiceNowClient>>,
-        store: StateStore,
-    ) -> Self {
-        Self {
-            environments,
-            credentials,
-            client: client.into(),
-            store,
-        }
+pub type JobsCollector = PerEnvironmentCollector<JobsSignal>;
+
+impl Signal for JobsSignal {
+    fn id(&self) -> &'static str {
+        JOBS_SIGNAL_ID
     }
-}
 
-impl SignalCollector for JobsCollector {
-    fn collect(&self) -> anyhow::Result<()> {
-        let connection = self.store.open()?;
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
-        let mut first_error = None;
-        for environment in &self.environments {
-            if let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
-                recent_reachability(
-                    &connection,
-                    &environment.id,
-                    observed_at,
-                    REACHABILITY_REUSE_SECS,
-                )
-            {
-                if let Err(error) = persistence::persist_signal_skipped(
-                    &connection,
-                    &environment.id,
-                    JOBS_SIGNAL_ID,
-                    observed_at,
-                    reachability.as_str(),
-                ) {
-                    first_error.get_or_insert_with(|| anyhow::Error::from(error));
-                }
-                continue;
+    fn keeps_samples(&self) -> bool {
+        true
+    }
+
+    fn probe(
+        &self,
+        client: &ServiceNowClient,
+        credentials: &dyn CredentialStore,
+        environment: &EnvironmentConfig,
+    ) -> anyhow::Result<Observation> {
+        let overdue_ready =
+            fetch_aggregate_count(client, environment, credentials, JOBS_OVERDUE_PATH);
+        let error = fetch_aggregate_count(client, environment, credentials, JOBS_ERROR_PATH);
+        let (overdue_ready, error) = match (overdue_ready, error) {
+            (Ok(overdue_ready), Ok(error)) => (overdue_ready, error),
+            (overdue_ready, error) => {
+                return Err(match overdue_ready.err().or_else(|| error.err()) {
+                    Some(error) => error,
+                    None => anyhow!("jobs probe failed"),
+                });
             }
-            if let Err(error) = collect_jobs(
-                &connection,
-                environment,
-                observed_at,
-                fetch_aggregate_count(
-                    &self.client,
-                    environment,
-                    self.credentials.as_ref(),
-                    JOBS_OVERDUE_PATH,
-                ),
-                fetch_aggregate_count(
-                    &self.client,
-                    environment,
-                    self.credentials.as_ref(),
-                    JOBS_ERROR_PATH,
-                ),
-            ) {
-                first_error.get_or_insert(error);
-            }
-        }
-        if let Err(error) = persistence::prune_signal_samples(&connection, observed_at) {
-            first_error.get_or_insert_with(|| anyhow::Error::from(error));
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        };
+        Ok(Observation {
+            state: jobs_state(overdue_ready),
+            payload: serde_json::json!({
+                "overdue_ready": overdue_ready,
+                "error": error,
+            }),
+            sample: Some((overdue_ready + error) as f64),
+        })
     }
-}
-
-fn collect_jobs(
-    connection: &Connection,
-    environment: &EnvironmentConfig,
-    observed_at: i64,
-    overdue_ready: anyhow::Result<u64>,
-    error: anyhow::Result<u64>,
-) -> anyhow::Result<()> {
-    match (overdue_ready, error) {
-        (Ok(overdue_ready), Ok(error)) => persist_jobs_ok(
-            connection,
-            &environment.id,
-            overdue_ready,
-            error,
-            observed_at,
-        )
-        .map_err(anyhow::Error::from),
-        (overdue_ready, error) => {
-            let message = match overdue_ready.err().or_else(|| error.err()) {
-                Some(error) => error.to_string(),
-                None => "jobs probe failed".into(),
-            };
-            persist_jobs_down(connection, &environment.id, &message, observed_at)
-                .map_err(anyhow::Error::from)
-        }
-    }
-}
-
-fn persist_jobs_ok(
-    connection: &Connection,
-    environment_id: &str,
-    overdue_ready: u64,
-    error: u64,
-    observed_at: i64,
-) -> io::Result<()> {
-    let payload = serde_json::json!({
-        "overdue_ready": overdue_ready,
-        "error": error,
-    });
-    persistence::persist_signal_snapshot(
-        connection,
-        environment_id,
-        JOBS_SIGNAL_ID,
-        observed_at,
-        jobs_state(overdue_ready),
-        &payload.to_string(),
-    )?;
-    persistence::persist_signal_sample(
-        connection,
-        environment_id,
-        JOBS_SIGNAL_ID,
-        observed_at,
-        Some((overdue_ready + error) as f64),
-        None,
-    )
-}
-
-fn persist_jobs_down(
-    connection: &Connection,
-    environment_id: &str,
-    message: &str,
-    observed_at: i64,
-) -> io::Result<()> {
-    let payload = serde_json::json!({
-        "reachability": "unreachable",
-        "detail": message,
-    });
-    persistence::persist_signal_snapshot(
-        connection,
-        environment_id,
-        JOBS_SIGNAL_ID,
-        observed_at,
-        "down",
-        &payload.to_string(),
-    )
 }
 
 #[cfg(test)]
@@ -335,16 +216,12 @@ mod tests {
 
     #[test]
     fn jobs_signal_skips_when_availability_asleep() {
-        use crate::availability::{
-            AvailabilityObservation, Reachability, SignalState, persist_availability_snapshot,
-        };
+        use crate::availability::{AvailabilityObservation, persist_availability_snapshot};
+        use daku_protocol::{Reachability, SignalState};
 
         let db = TempDb::new("jobs-asleep");
         let store = db.store();
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
+        let observed_at = crate::collector::unix_now();
         {
             let connection = store.open().unwrap();
             persist_availability_snapshot(

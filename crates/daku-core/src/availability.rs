@@ -1,52 +1,18 @@
 //! Availability Signal: reachability + build/latency from `glide.war`.
 
 use std::io;
-use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
+use daku_protocol::{Reachability, SignalState};
 use rusqlite::Connection;
 
-use crate::collector::SignalCollector;
+use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig};
-use crate::persistence::{self, StateStore};
+use crate::persistence;
 use crate::servicenow::ServiceNowClient;
 
 pub const AVAILABILITY_SIGNAL_ID: &str = "availability";
 pub const GLIDE_WAR_PATH: &str = "/api/now/table/sys_properties?sysparm_query=name=glide.war&sysparm_fields=value&sysparm_limit=1";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reachability {
-    Reachable,
-    Unreachable,
-    Asleep,
-}
-
-impl Reachability {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Reachable => "reachable",
-            Self::Unreachable => "unreachable",
-            Self::Asleep => "asleep",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignalState {
-    Healthy,
-    Degraded,
-    Down,
-}
-
-impl SignalState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Healthy => "healthy",
-            Self::Degraded => "degraded",
-            Self::Down => "down",
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailabilityObservation {
@@ -146,15 +112,20 @@ pub fn recent_reachability(
         return None;
     }
     let payload: serde_json::Value = serde_json::from_str(&snapshot.payload_json).ok()?;
-    match payload
-        .get("reachability")
-        .and_then(|value| value.as_str())?
-    {
-        "reachable" => Some(Reachability::Reachable),
-        "unreachable" => Some(Reachability::Unreachable),
-        "asleep" => Some(Reachability::Asleep),
-        _ => None,
-    }
+    Reachability::parse(
+        payload
+            .get("reachability")
+            .and_then(|value| value.as_str())?,
+    )
+}
+
+fn availability_payload(observation: &AvailabilityObservation) -> serde_json::Value {
+    serde_json::json!({
+        "reachability": observation.reachability.as_str(),
+        "rtt_ms": observation.rtt_ms,
+        "build": observation.build,
+        "error": observation.error,
+    })
 }
 
 pub fn persist_availability_snapshot(
@@ -163,53 +134,31 @@ pub fn persist_availability_snapshot(
     observation: &AvailabilityObservation,
     observed_at: i64,
 ) -> io::Result<()> {
-    let payload = serde_json::json!({
-        "reachability": observation.reachability.as_str(),
-        "rtt_ms": observation.rtt_ms,
-        "build": observation.build,
-        "error": observation.error,
-    });
     persistence::persist_signal_snapshot(
         connection,
         environment_id,
         AVAILABILITY_SIGNAL_ID,
         observed_at,
-        observation.state.as_str(),
-        &payload.to_string(),
+        observation.state,
+        &availability_payload(observation).to_string(),
     )
 }
 
-pub struct AvailabilityCollector {
-    environments: Vec<EnvironmentConfig>,
-    credentials: Arc<dyn CredentialStore>,
-    client: Arc<ServiceNowClient>,
-    store: StateStore,
-}
+/// Availability is the Signal every other Signal defers to, so it never skips.
+#[derive(Default)]
+pub struct AvailabilitySignal;
 
-impl AvailabilityCollector {
-    pub fn new(
-        environments: Vec<EnvironmentConfig>,
-        credentials: Arc<dyn CredentialStore>,
-        client: impl Into<Arc<ServiceNowClient>>,
-        store: StateStore,
-    ) -> Self {
-        Self {
-            environments,
-            credentials,
-            client: client.into(),
-            store,
-        }
-    }
+pub type AvailabilityCollector = PerEnvironmentCollector<AvailabilitySignal>;
 
-    pub fn probe(&self, environment: &EnvironmentConfig) -> AvailabilityObservation {
+impl AvailabilitySignal {
+    pub fn observe(
+        &self,
+        client: &ServiceNowClient,
+        credentials: &dyn CredentialStore,
+        environment: &EnvironmentConfig,
+    ) -> AvailabilityObservation {
         let started = Instant::now();
-        match self.client.request(
-            environment,
-            self.credentials.as_ref(),
-            "GET",
-            GLIDE_WAR_PATH,
-            None,
-        ) {
+        match client.request(environment, credentials, "GET", GLIDE_WAR_PATH, None) {
             Ok(response) => classify_availability_response(
                 response.status,
                 response.header("content-type").unwrap_or(""),
@@ -227,28 +176,35 @@ impl AvailabilityCollector {
     }
 }
 
-impl SignalCollector for AvailabilityCollector {
-    fn collect(&self) -> anyhow::Result<()> {
-        let connection = self.store.open()?;
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
-        let mut first_error = None;
-        for environment in &self.environments {
-            if let Err(error) = persist_availability_snapshot(
-                &connection,
-                &environment.id,
-                &self.probe(environment),
-                observed_at,
-            ) {
-                first_error.get_or_insert_with(|| anyhow::Error::from(error));
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+impl Signal for AvailabilitySignal {
+    fn id(&self) -> &'static str {
+        AVAILABILITY_SIGNAL_ID
+    }
+
+    fn gated_by_availability(&self) -> bool {
+        false
+    }
+
+    fn probe(
+        &self,
+        client: &ServiceNowClient,
+        credentials: &dyn CredentialStore,
+        environment: &EnvironmentConfig,
+    ) -> anyhow::Result<Observation> {
+        let observed = self.observe(client, credentials, environment);
+        Ok(Observation {
+            state: observed.state,
+            payload: availability_payload(&observed),
+            sample: None,
+        })
+    }
+}
+
+impl AvailabilityCollector {
+    /// Live probe without persisting — `doctor` reads config, never SQLite.
+    pub fn probe(&self, environment: &EnvironmentConfig) -> AvailabilityObservation {
+        self.signal()
+            .observe(self.client(), self.credentials(), environment)
     }
 }
 

@@ -2,11 +2,11 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use daku_protocol::SignalState;
 use rusqlite::Connection;
 
-use crate::collector::SignalCollector;
+use crate::collector::{SignalCollector, unix_now};
 use crate::config::{CredentialStore, EnvironmentConfig};
 use crate::persistence::{self, StateStore};
 use crate::servicenow::ServiceNowClient;
@@ -78,10 +78,7 @@ impl SignalCollector for LastCloneCollector {
             return Ok(());
         };
         let connection = self.store.open()?;
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
+        let observed_at = unix_now();
         match self.client.request(
             source,
             self.credentials.as_ref(),
@@ -129,28 +126,25 @@ fn persist_last_clone(
         environment_id,
         LAST_CLONE_SIGNAL_ID,
         observed_at,
-        "healthy",
+        SignalState::Healthy,
         &payload.to_string(),
     )
 }
 
+/// A failed read renders `down` — the Signal never votes in the rollup, so a
+/// red card is informational, not a health regression.
 fn persist_last_clone_unreachable(
     connection: &Connection,
     environment_id: &str,
     message: &str,
     observed_at: i64,
 ) -> io::Result<()> {
-    let payload = serde_json::json!({
-        "reachability": "unreachable",
-        "detail": message,
-    });
-    persistence::persist_signal_snapshot(
+    persistence::persist_signal_down(
         connection,
         environment_id,
         LAST_CLONE_SIGNAL_ID,
         observed_at,
-        "healthy",
-        &payload.to_string(),
+        message,
     )
 }
 
@@ -299,13 +293,13 @@ mod tests {
     }
 
     #[test]
-    fn last_clone_signal_probe_failure_is_healthy_unreachable() {
+    fn last_clone_signal_probe_failure_is_down_unreachable() {
         let (_db, store) = collect_last_clone(500, r#"{"error":{"message":"boom"}}"#);
         let connection = store.open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", LAST_CLONE_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
-        assert_eq!(row.state, "healthy");
+        assert_eq!(row.state, "down");
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["reachability"], "unreachable");
         assert!(payload.get("supported").is_none());

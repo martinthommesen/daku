@@ -12,6 +12,6 @@ pub use protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
     EnvironmentHealth, EnvironmentSummary, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, Reachability,
     Request, ResponseOutcome, ResponsePayload, RpcError, SamplePoint, ServerMessage,
-    SignalSnapshotDto,
+    SignalSnapshotDto, SignalState,
 };
 pub use settings::DaemonSettings;

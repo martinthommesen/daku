@@ -3,13 +3,14 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::anyhow;
+use daku_protocol::SignalState;
 use rusqlite::Connection;
 
 use crate::availability::{AVAILABILITY_SIGNAL_ID, GLIDE_WAR_PATH, classify_availability_response};
-use crate::collector::SignalCollector;
+use crate::collector::{SignalCollector, unix_now};
 use crate::config::{CredentialStore, EnvironmentConfig};
 use crate::persistence::{self, StateStore};
 use crate::servicenow::ServiceNowClient;
@@ -24,11 +25,11 @@ pub const SYS_STORE_APP_PATH: &str = "/api/now/table/sys_store_app?sysparm_field
 /// often. Builds are still compared every tick via the availability snapshot.
 pub const INVENTORY_REFRESH_SECS: i64 = 30 * 60;
 
-pub fn drift_state(build_matches: bool, mismatches: u64) -> &'static str {
+pub fn drift_state(build_matches: bool, mismatches: u64) -> SignalState {
     if build_matches && mismatches == 0 {
-        "healthy"
+        SignalState::Healthy
     } else {
-        "degraded"
+        SignalState::Degraded
     }
 }
 
@@ -166,10 +167,7 @@ impl DriftCollector {
 impl SignalCollector for DriftCollector {
     fn collect(&self) -> anyhow::Result<()> {
         let connection = self.store.open()?;
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
+        let observed_at = unix_now();
         let Some(source) = self
             .environments
             .iter()
@@ -328,7 +326,7 @@ fn persist_drift_source(
         environment_id,
         DRIFT_SIGNAL_ID,
         observed_at,
-        "healthy",
+        SignalState::Healthy,
         &serde_json::json!({ "role": "source" }).to_string(),
     )
 }
@@ -379,13 +377,12 @@ fn persist_drift_skipped(
     environment_id: &str,
     observed_at: i64,
 ) -> io::Result<()> {
-    persistence::persist_signal_snapshot(
+    persistence::persist_signal_skipped(
         connection,
         environment_id,
         DRIFT_SIGNAL_ID,
         observed_at,
-        "healthy",
-        &serde_json::json!({ "skipped": "need_two_environments" }).to_string(),
+        "need_two_environments",
     )
 }
 
@@ -395,17 +392,12 @@ fn persist_drift_down(
     message: &str,
     observed_at: i64,
 ) -> io::Result<()> {
-    let payload = serde_json::json!({
-        "reachability": "unreachable",
-        "detail": message,
-    });
-    persistence::persist_signal_snapshot(
+    persistence::persist_signal_down(
         connection,
         environment_id,
         DRIFT_SIGNAL_ID,
         observed_at,
-        "down",
-        &payload.to_string(),
+        message,
     )
 }
 
@@ -630,7 +622,7 @@ mod tests {
         let row = persistence::load_signal_snapshot(&connection, "prod", DRIFT_SIGNAL_ID)
             .unwrap()
             .expect("snapshot");
-        assert_eq!(row.state, "healthy");
+        assert_eq!(row.state, "skipped");
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["skipped"], "need_two_environments");
     }
@@ -666,7 +658,7 @@ mod tests {
             let row = persistence::load_signal_snapshot(&connection, id, DRIFT_SIGNAL_ID)
                 .unwrap()
                 .expect("snapshot");
-            assert_eq!(row.state, "healthy");
+            assert_eq!(row.state, "skipped");
             let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
             assert_eq!(payload["skipped"], "need_two_environments");
         }

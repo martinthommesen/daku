@@ -10,6 +10,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use rusqlite::{Connection, params};
 
+use daku_protocol::SignalState;
 use daku_protocol::identity::DATA_DIRECTORY_NAME;
 
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
@@ -20,9 +21,6 @@ const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS migrations (
      )";
 
 const DAKU_DB_PATH_ENV: &str = "DAKU_DB_PATH";
-
-/// Snapshot state for a Signal that deliberately did not probe this tick.
-pub const SKIPPED_STATE: &str = "skipped";
 
 fn unix_time() -> u64 {
     SystemTime::now()
@@ -178,7 +176,29 @@ pub fn persist_signal_skipped(
         environment_id,
         signal_id,
         observed_at,
-        SKIPPED_STATE,
+        SignalState::Skipped,
+        &payload.to_string(),
+    )
+}
+
+/// The standard "probe failed" snapshot every Signal writes.
+pub fn persist_signal_down(
+    connection: &Connection,
+    environment_id: &str,
+    signal_id: &str,
+    observed_at: i64,
+    message: &str,
+) -> io::Result<()> {
+    let payload = serde_json::json!({
+        "reachability": "unreachable",
+        "detail": message,
+    });
+    persist_signal_snapshot(
+        connection,
+        environment_id,
+        signal_id,
+        observed_at,
+        SignalState::Down,
         &payload.to_string(),
     )
 }
@@ -188,7 +208,7 @@ pub fn persist_signal_snapshot(
     environment_id: &str,
     signal_id: &str,
     observed_at: i64,
-    state: &str,
+    state: SignalState,
     payload_json: &str,
 ) -> io::Result<()> {
     connection
@@ -200,7 +220,13 @@ pub fn persist_signal_snapshot(
                 observed_at = excluded.observed_at,
                 state = excluded.state,
                 payload_json = excluded.payload_json",
-            params![environment_id, signal_id, observed_at, state, payload_json],
+            params![
+                environment_id,
+                signal_id,
+                observed_at,
+                state.as_str(),
+                payload_json
+            ],
         )
         .map_err(to_io_error)?;
     Ok(())

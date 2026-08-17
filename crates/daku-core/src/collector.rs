@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, unbounded};
-use daku_protocol::ServerMessage;
 use daku_protocol::settings::DaemonSettings;
+use daku_protocol::{Reachability, ServerMessage, SignalState};
+use rusqlite::Connection;
 
-use crate::availability::AvailabilityCollector;
+use crate::availability::{AvailabilityCollector, REACHABILITY_REUSE_SECS, recent_reachability};
 use crate::config::{
     CredentialStore, EnvironmentConfig, KeychainCredentialStore, load_environments,
 };
@@ -20,7 +21,7 @@ use crate::jobs::JobsCollector;
 use crate::last_clone::LastCloneCollector;
 use crate::mid_ecc::MidEccCollector;
 use crate::outbound::OutboundCollector;
-use crate::persistence::StateStore;
+use crate::persistence::{self, StateStore};
 use crate::servicenow::{Clock, ServiceNowClient, SystemClock, UreqTransport};
 use crate::syslog::SyslogCollector;
 
@@ -38,6 +39,171 @@ pub fn poll_interval_secs(settings: &DaemonSettings) -> u64 {
 
 pub trait SignalCollector: Send + Sync {
     fn collect(&self) -> anyhow::Result<()>;
+}
+
+/// Seconds since the epoch, the timestamp every Signal stamps its snapshot with.
+pub(crate) fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// What one probe of one Environment produced. `sample` is appended to the
+/// 24 h ring for trend Signals (jobs, syslog).
+pub struct Observation {
+    pub state: SignalState,
+    pub payload: serde_json::Value,
+    pub sample: Option<f64>,
+}
+
+/// One Signal's per-Environment logic. The loop, `observed_at`, the asleep /
+/// unreachable gate, the down snapshot, and sample pruning live in
+/// `PerEnvironmentCollector`; implementations only probe.
+pub trait Signal: Send + Sync {
+    fn id(&self) -> &'static str;
+
+    /// Probes one Environment. `Err` is persisted as a `down` snapshot with the
+    /// error text as `detail`; every classified outcome is an `Ok(Observation)`.
+    fn probe(
+        &self,
+        client: &ServiceNowClient,
+        credentials: &dyn CredentialStore,
+        environment: &EnvironmentConfig,
+    ) -> anyhow::Result<Observation>;
+
+    /// Whether to skip probing when Availability reported the Environment
+    /// asleep or unreachable this tick. Availability itself returns false.
+    fn gated_by_availability(&self) -> bool {
+        true
+    }
+
+    /// Whether this Signal writes samples (and therefore prunes them).
+    fn keeps_samples(&self) -> bool {
+        false
+    }
+}
+
+pub struct PerEnvironmentCollector<S: Signal> {
+    environments: Vec<EnvironmentConfig>,
+    credentials: Arc<dyn CredentialStore>,
+    client: Arc<ServiceNowClient>,
+    store: StateStore,
+    signal: S,
+}
+
+impl<S: Signal + Default> PerEnvironmentCollector<S> {
+    pub fn new(
+        environments: Vec<EnvironmentConfig>,
+        credentials: Arc<dyn CredentialStore>,
+        client: impl Into<Arc<ServiceNowClient>>,
+        store: StateStore,
+    ) -> Self {
+        Self {
+            environments,
+            credentials,
+            client: client.into(),
+            store,
+            signal: S::default(),
+        }
+    }
+}
+
+impl<S: Signal> PerEnvironmentCollector<S> {
+    pub(crate) fn signal(&self) -> &S {
+        &self.signal
+    }
+
+    pub(crate) fn client(&self) -> &ServiceNowClient {
+        &self.client
+    }
+
+    pub(crate) fn credentials(&self) -> &dyn CredentialStore {
+        self.credentials.as_ref()
+    }
+
+    fn collect_environment(
+        &self,
+        connection: &Connection,
+        environment: &EnvironmentConfig,
+        observed_at: i64,
+    ) -> anyhow::Result<()> {
+        if self.signal.gated_by_availability() {
+            if let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
+                recent_reachability(
+                    connection,
+                    &environment.id,
+                    observed_at,
+                    REACHABILITY_REUSE_SECS,
+                )
+            {
+                return persistence::persist_signal_skipped(
+                    connection,
+                    &environment.id,
+                    self.signal.id(),
+                    observed_at,
+                    reachability.as_str(),
+                )
+                .map_err(anyhow::Error::from);
+            }
+        }
+        match self
+            .signal
+            .probe(&self.client, self.credentials.as_ref(), environment)
+        {
+            Ok(observation) => {
+                persistence::persist_signal_snapshot(
+                    connection,
+                    &environment.id,
+                    self.signal.id(),
+                    observed_at,
+                    observation.state,
+                    &observation.payload.to_string(),
+                )?;
+                if observation.sample.is_some() {
+                    persistence::persist_signal_sample(
+                        connection,
+                        &environment.id,
+                        self.signal.id(),
+                        observed_at,
+                        observation.sample,
+                        None,
+                    )?;
+                }
+                Ok(())
+            }
+            Err(error) => persistence::persist_signal_down(
+                connection,
+                &environment.id,
+                self.signal.id(),
+                observed_at,
+                &error.to_string(),
+            )
+            .map_err(anyhow::Error::from),
+        }
+    }
+}
+
+impl<S: Signal + 'static> SignalCollector for PerEnvironmentCollector<S> {
+    fn collect(&self) -> anyhow::Result<()> {
+        let connection = self.store.open()?;
+        let observed_at = unix_now();
+        let mut first_error = None;
+        for environment in &self.environments {
+            if let Err(error) = self.collect_environment(&connection, environment, observed_at) {
+                first_error.get_or_insert(error);
+            }
+        }
+        if self.signal.keeps_samples() {
+            if let Err(error) = persistence::prune_signal_samples(&connection, observed_at) {
+                first_error.get_or_insert_with(|| anyhow::Error::from(error));
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
 }
 
 pub struct CollectorLoop {
@@ -241,10 +407,7 @@ pub fn start_default_loop(
         ServiceNowClient::new(UreqTransport::default(), SystemClock),
     );
     spawn_collector_loop(loop_, shutdown, move || {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
+        let now = unix_now();
         if let Err(error) = publish_dashboard(
             &dashboard_environments,
             &dashboard_store,
@@ -551,6 +714,186 @@ mod tests {
         assert_eq!(loop_.groups.len(), 2);
         assert_eq!(loop_.groups[0].len(), 5);
         assert_eq!(loop_.shared.len(), 2, "drift and last-clone stay shared");
+    }
+
+    enum Behaviour {
+        Ok(SignalState, Option<f64>),
+        Fail,
+        Panic,
+    }
+
+    struct FakeSignal {
+        behaviour: Behaviour,
+        keeps_samples: bool,
+    }
+
+    impl Signal for FakeSignal {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        fn keeps_samples(&self) -> bool {
+            self.keeps_samples
+        }
+
+        fn probe(
+            &self,
+            _client: &ServiceNowClient,
+            _credentials: &dyn CredentialStore,
+            _environment: &EnvironmentConfig,
+        ) -> anyhow::Result<Observation> {
+            match self.behaviour {
+                Behaviour::Ok(state, sample) => Ok(Observation {
+                    state,
+                    payload: serde_json::json!({ "probed": true }),
+                    sample,
+                }),
+                Behaviour::Fail => anyhow::bail!("probe exploded"),
+                Behaviour::Panic => panic!("must not probe an asleep Environment"),
+            }
+        }
+    }
+
+    fn fake_collector(
+        store: StateStore,
+        behaviour: Behaviour,
+        keeps_samples: bool,
+    ) -> PerEnvironmentCollector<FakeSignal> {
+        PerEnvironmentCollector {
+            environments: vec![prod()],
+            credentials: Arc::new(MemoryCredentialStore::default()),
+            client: Arc::new(ServiceNowClient::new(FixtureTransport, SystemClock)),
+            store,
+            signal: FakeSignal {
+                behaviour,
+                keeps_samples,
+            },
+        }
+    }
+
+    #[test]
+    fn per_environment_collector_persists_ok_observation() {
+        let db = TempDb::new("per-env-ok");
+        fake_collector(
+            db.store(),
+            Behaviour::Ok(SignalState::Degraded, Some(3.0)),
+            true,
+        )
+        .collect()
+        .unwrap();
+
+        let connection = db.store().open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, "prod", "fake")
+            .unwrap()
+            .expect("snapshot");
+        assert_eq!(row.state, "degraded");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        assert_eq!(payload["probed"], true);
+        let samples = persistence::load_signal_samples(&connection, "prod", "fake").unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].value_real, Some(3.0));
+    }
+
+    #[test]
+    fn per_environment_collector_persists_down_on_probe_error() {
+        let db = TempDb::new("per-env-down");
+        fake_collector(db.store(), Behaviour::Fail, false)
+            .collect()
+            .unwrap();
+
+        let connection = db.store().open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, "prod", "fake")
+            .unwrap()
+            .expect("snapshot");
+        assert_eq!(row.state, "down");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        assert_eq!(payload["reachability"], "unreachable");
+        assert_eq!(payload["detail"], "probe exploded");
+        assert!(
+            persistence::load_signal_samples(&connection, "prod", "fake")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn per_environment_collector_skips_when_asleep() {
+        use crate::availability::{AvailabilityObservation, persist_availability_snapshot};
+        use daku_protocol::Reachability;
+
+        let db = TempDb::new("per-env-asleep");
+        let observed_at = unix_now();
+        {
+            let connection = db.store().open().unwrap();
+            persist_availability_snapshot(
+                &connection,
+                "prod",
+                &AvailabilityObservation {
+                    reachability: Reachability::Asleep,
+                    state: SignalState::Healthy,
+                    build: None,
+                    rtt_ms: 0,
+                    error: None,
+                },
+                observed_at,
+            )
+            .unwrap();
+        }
+        fake_collector(db.store(), Behaviour::Panic, false)
+            .collect()
+            .unwrap();
+
+        let connection = db.store().open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, "prod", "fake")
+            .unwrap()
+            .expect("snapshot");
+        assert_eq!(row.state, "skipped");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        assert_eq!(payload["skipped"], "asleep");
+    }
+
+    #[test]
+    fn per_environment_collector_prunes_only_when_keeps_samples() {
+        let stale = |store: &StateStore| {
+            let connection = store.open().unwrap();
+            persistence::persist_signal_sample(
+                &connection,
+                "prod",
+                "fake",
+                unix_now() - 25 * 60 * 60,
+                Some(1.0),
+                None,
+            )
+            .unwrap();
+        };
+        let remaining = |store: &StateStore| {
+            let connection = store.open().unwrap();
+            persistence::load_signal_samples(&connection, "prod", "fake")
+                .unwrap()
+                .len()
+        };
+
+        let kept = TempDb::new("per-env-noprune");
+        stale(&kept.store());
+        fake_collector(
+            kept.store(),
+            Behaviour::Ok(SignalState::Healthy, None),
+            false,
+        )
+        .collect()
+        .unwrap();
+        assert_eq!(remaining(&kept.store()), 1, "no pruning without samples");
+
+        let pruned = TempDb::new("per-env-prune");
+        stale(&pruned.store());
+        fake_collector(
+            pruned.store(),
+            Behaviour::Ok(SignalState::Healthy, None),
+            true,
+        )
+        .collect()
+        .unwrap();
+        assert_eq!(remaining(&pruned.store()), 0);
     }
 
     #[test]

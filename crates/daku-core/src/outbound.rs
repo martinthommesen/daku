@@ -1,152 +1,48 @@
 //! Outbound / integration-failures Signal: 1h HTTP 4xx/5xx count on `sys_outbound_http_log`.
 
-use std::io;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use daku_protocol::SignalState;
 
-use rusqlite::Connection;
-
-use crate::availability::{REACHABILITY_REUSE_SECS, Reachability, recent_reachability};
-use crate::collector::SignalCollector;
+use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig};
-use crate::persistence::{self, StateStore};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
 pub const OUTBOUND_SIGNAL_ID: &str = "outbound";
 pub const OUTBOUND_HTTP_PATH: &str = "/api/now/stats/sys_outbound_http_log?sysparm_count=true&sysparm_query=http_status>=400^sys_created_on>javascript:gs.hoursAgoStart(1)";
 
-pub fn outbound_state(outbound_http_4xx_5xx_1h: u64) -> &'static str {
+pub fn outbound_state(outbound_http_4xx_5xx_1h: u64) -> SignalState {
     if outbound_http_4xx_5xx_1h == 0 {
-        "healthy"
+        SignalState::Healthy
     } else {
-        "degraded"
+        SignalState::Degraded
     }
 }
 
-pub struct OutboundCollector {
-    environments: Vec<EnvironmentConfig>,
-    credentials: Arc<dyn CredentialStore>,
-    client: Arc<ServiceNowClient>,
-    store: StateStore,
-}
+#[derive(Default)]
+pub struct OutboundSignal;
 
-impl OutboundCollector {
-    pub fn new(
-        environments: Vec<EnvironmentConfig>,
-        credentials: Arc<dyn CredentialStore>,
-        client: impl Into<Arc<ServiceNowClient>>,
-        store: StateStore,
-    ) -> Self {
-        Self {
-            environments,
-            credentials,
-            client: client.into(),
-            store,
-        }
+pub type OutboundCollector = PerEnvironmentCollector<OutboundSignal>;
+
+impl Signal for OutboundSignal {
+    fn id(&self) -> &'static str {
+        OUTBOUND_SIGNAL_ID
     }
-}
 
-impl SignalCollector for OutboundCollector {
-    fn collect(&self) -> anyhow::Result<()> {
-        let connection = self.store.open()?;
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
-        let mut first_error = None;
-        for environment in &self.environments {
-            if let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
-                recent_reachability(
-                    &connection,
-                    &environment.id,
-                    observed_at,
-                    REACHABILITY_REUSE_SECS,
-                )
-            {
-                if let Err(error) = persistence::persist_signal_skipped(
-                    &connection,
-                    &environment.id,
-                    OUTBOUND_SIGNAL_ID,
-                    observed_at,
-                    reachability.as_str(),
-                ) {
-                    first_error.get_or_insert_with(|| anyhow::Error::from(error));
-                }
-                continue;
-            }
-            let count = fetch_aggregate_count(
-                &self.client,
-                environment,
-                self.credentials.as_ref(),
-                OUTBOUND_HTTP_PATH,
-            );
-            if let Err(error) = collect_outbound(&connection, environment, observed_at, count) {
-                first_error.get_or_insert(error);
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+    fn probe(
+        &self,
+        client: &ServiceNowClient,
+        credentials: &dyn CredentialStore,
+        environment: &EnvironmentConfig,
+    ) -> anyhow::Result<Observation> {
+        let outbound_http_4xx_5xx_1h =
+            fetch_aggregate_count(client, environment, credentials, OUTBOUND_HTTP_PATH)?;
+        Ok(Observation {
+            state: outbound_state(outbound_http_4xx_5xx_1h),
+            payload: serde_json::json!({
+                "outbound_http_4xx_5xx_1h": outbound_http_4xx_5xx_1h
+            }),
+            sample: None,
+        })
     }
-}
-
-fn collect_outbound(
-    connection: &Connection,
-    environment: &EnvironmentConfig,
-    observed_at: i64,
-    count: anyhow::Result<u64>,
-) -> anyhow::Result<()> {
-    match count {
-        Ok(outbound_http_4xx_5xx_1h) => persist_outbound_ok(
-            connection,
-            &environment.id,
-            outbound_http_4xx_5xx_1h,
-            observed_at,
-        )
-        .map_err(anyhow::Error::from),
-        Err(error) => {
-            persist_outbound_down(connection, &environment.id, &error.to_string(), observed_at)
-                .map_err(anyhow::Error::from)
-        }
-    }
-}
-
-fn persist_outbound_ok(
-    connection: &Connection,
-    environment_id: &str,
-    outbound_http_4xx_5xx_1h: u64,
-    observed_at: i64,
-) -> io::Result<()> {
-    let payload = serde_json::json!({ "outbound_http_4xx_5xx_1h": outbound_http_4xx_5xx_1h });
-    persistence::persist_signal_snapshot(
-        connection,
-        environment_id,
-        OUTBOUND_SIGNAL_ID,
-        observed_at,
-        outbound_state(outbound_http_4xx_5xx_1h),
-        &payload.to_string(),
-    )
-}
-
-fn persist_outbound_down(
-    connection: &Connection,
-    environment_id: &str,
-    message: &str,
-    observed_at: i64,
-) -> io::Result<()> {
-    let payload = serde_json::json!({
-        "reachability": "unreachable",
-        "detail": message,
-    });
-    persistence::persist_signal_snapshot(
-        connection,
-        environment_id,
-        OUTBOUND_SIGNAL_ID,
-        observed_at,
-        "down",
-        &payload.to_string(),
-    )
 }
 
 #[cfg(test)]
@@ -165,12 +61,12 @@ mod tests {
 
     #[test]
     fn outbound_signal_zero_is_healthy() {
-        assert_eq!(outbound_state(0), "healthy");
+        assert_eq!(outbound_state(0), SignalState::Healthy);
     }
 
     #[test]
     fn outbound_signal_nonzero_is_degraded() {
-        assert_eq!(outbound_state(3), "degraded");
+        assert_eq!(outbound_state(3), SignalState::Degraded);
     }
 
     struct OutboundCountTransport {
@@ -300,16 +196,12 @@ mod tests {
 
     #[test]
     fn outbound_signal_skips_when_availability_asleep() {
-        use crate::availability::{
-            AvailabilityObservation, Reachability, SignalState, persist_availability_snapshot,
-        };
+        use crate::availability::{AvailabilityObservation, persist_availability_snapshot};
+        use daku_protocol::{Reachability, SignalState};
 
         let db = TempDb::new("outbound-asleep");
         let store = db.store();
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
+        let observed_at = crate::collector::unix_now();
         {
             let connection = store.open().unwrap();
             persist_availability_snapshot(

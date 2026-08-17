@@ -1,16 +1,10 @@
 //! MID / ECC Signal: `ecc_agent` health plus `ecc_queue` ready/error counts.
 
-use std::io;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::anyhow;
-use rusqlite::Connection;
+use daku_protocol::SignalState;
 
-use crate::availability::{REACHABILITY_REUSE_SECS, Reachability, recent_reachability};
-use crate::collector::SignalCollector;
+use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig};
-use crate::persistence::{self, StateStore};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
 pub const MID_ECC_SIGNAL_ID: &str = "mid_ecc";
@@ -47,90 +41,54 @@ fn is_validated_true(value: Option<&serde_json::Value>) -> bool {
     }
 }
 
-pub fn mid_ecc_state(agents_unhealthy: u64, ecc_error: u64, ecc_output_ready: u64) -> &'static str {
+pub fn mid_ecc_state(agents_unhealthy: u64, ecc_error: u64, ecc_output_ready: u64) -> SignalState {
     if agents_unhealthy == 0 && ecc_error == 0 && ecc_output_ready < ECC_READY_DEGRADED_AT {
-        "healthy"
+        SignalState::Healthy
     } else {
-        "degraded"
+        SignalState::Degraded
     }
 }
 
-pub struct MidEccCollector {
-    environments: Vec<EnvironmentConfig>,
-    credentials: Arc<dyn CredentialStore>,
-    client: Arc<ServiceNowClient>,
-    store: StateStore,
-}
+#[derive(Default)]
+pub struct MidEccSignal;
 
-impl MidEccCollector {
-    pub fn new(
-        environments: Vec<EnvironmentConfig>,
-        credentials: Arc<dyn CredentialStore>,
-        client: impl Into<Arc<ServiceNowClient>>,
-        store: StateStore,
-    ) -> Self {
-        Self {
-            environments,
-            credentials,
-            client: client.into(),
-            store,
-        }
+pub type MidEccCollector = PerEnvironmentCollector<MidEccSignal>;
+
+impl Signal for MidEccSignal {
+    fn id(&self) -> &'static str {
+        MID_ECC_SIGNAL_ID
     }
-}
 
-impl SignalCollector for MidEccCollector {
-    fn collect(&self) -> anyhow::Result<()> {
-        let connection = self.store.open()?;
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
-        let mut first_error = None;
-        for environment in &self.environments {
-            if let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
-                recent_reachability(
-                    &connection,
-                    &environment.id,
-                    observed_at,
-                    REACHABILITY_REUSE_SECS,
-                )
-            {
-                if let Err(error) = persistence::persist_signal_skipped(
-                    &connection,
-                    &environment.id,
-                    MID_ECC_SIGNAL_ID,
-                    observed_at,
-                    reachability.as_str(),
-                ) {
-                    first_error.get_or_insert_with(|| anyhow::Error::from(error));
+    fn probe(
+        &self,
+        client: &ServiceNowClient,
+        credentials: &dyn CredentialStore,
+        environment: &EnvironmentConfig,
+    ) -> anyhow::Result<Observation> {
+        let agents = fetch_mid_agents(client, environment, credentials);
+        let ready = fetch_aggregate_count(client, environment, credentials, ECC_OUTPUT_READY_PATH);
+        let error = fetch_aggregate_count(client, environment, credentials, ECC_ERROR_PATH);
+        let ((agents_total, agents_unhealthy), ecc_output_ready, ecc_error) =
+            match (agents, ready, error) {
+                (Ok(agents), Ok(ready), Ok(error)) => (agents, ready, error),
+                (agents, ready, error) => {
+                    return Err(agents
+                        .err()
+                        .or_else(|| ready.err())
+                        .or_else(|| error.err())
+                        .unwrap_or_else(|| anyhow!("mid_ecc probe failed")));
                 }
-                continue;
-            }
-            if let Err(error) = collect_mid_ecc(
-                &connection,
-                environment,
-                observed_at,
-                fetch_mid_agents(&self.client, environment, self.credentials.as_ref()),
-                fetch_aggregate_count(
-                    &self.client,
-                    environment,
-                    self.credentials.as_ref(),
-                    ECC_OUTPUT_READY_PATH,
-                ),
-                fetch_aggregate_count(
-                    &self.client,
-                    environment,
-                    self.credentials.as_ref(),
-                    ECC_ERROR_PATH,
-                ),
-            ) {
-                first_error.get_or_insert(error);
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+            };
+        Ok(Observation {
+            state: mid_ecc_state(agents_unhealthy, ecc_error, ecc_output_ready),
+            payload: serde_json::json!({
+                "agents_total": agents_total,
+                "agents_unhealthy": agents_unhealthy,
+                "ecc_output_ready": ecc_output_ready,
+                "ecc_error": ecc_error,
+            }),
+            sample: None,
+        })
     }
 }
 
@@ -144,85 +102,6 @@ fn fetch_mid_agents(
         anyhow::bail!("HTTP {}", response.status);
     }
     classify_mid_agents(response.body.as_bytes())
-}
-
-fn collect_mid_ecc(
-    connection: &Connection,
-    environment: &EnvironmentConfig,
-    observed_at: i64,
-    agents: anyhow::Result<(u64, u64)>,
-    ready: anyhow::Result<u64>,
-    error: anyhow::Result<u64>,
-) -> anyhow::Result<()> {
-    match (agents, ready, error) {
-        (Ok((agents_total, agents_unhealthy)), Ok(ecc_output_ready), Ok(ecc_error)) => {
-            persist_mid_ecc_ok(
-                connection,
-                &environment.id,
-                agents_total,
-                agents_unhealthy,
-                ecc_output_ready,
-                ecc_error,
-                observed_at,
-            )
-            .map_err(anyhow::Error::from)
-        }
-        (agents, ready, error) => {
-            let message = agents
-                .err()
-                .or_else(|| ready.err())
-                .or_else(|| error.err())
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "mid_ecc probe failed".into());
-            persist_mid_ecc_down(connection, &environment.id, &message, observed_at)
-                .map_err(anyhow::Error::from)
-        }
-    }
-}
-
-fn persist_mid_ecc_ok(
-    connection: &Connection,
-    environment_id: &str,
-    agents_total: u64,
-    agents_unhealthy: u64,
-    ecc_output_ready: u64,
-    ecc_error: u64,
-    observed_at: i64,
-) -> io::Result<()> {
-    let payload = serde_json::json!({
-        "agents_total": agents_total,
-        "agents_unhealthy": agents_unhealthy,
-        "ecc_output_ready": ecc_output_ready,
-        "ecc_error": ecc_error,
-    });
-    persistence::persist_signal_snapshot(
-        connection,
-        environment_id,
-        MID_ECC_SIGNAL_ID,
-        observed_at,
-        mid_ecc_state(agents_unhealthy, ecc_error, ecc_output_ready),
-        &payload.to_string(),
-    )
-}
-
-fn persist_mid_ecc_down(
-    connection: &Connection,
-    environment_id: &str,
-    message: &str,
-    observed_at: i64,
-) -> io::Result<()> {
-    let payload = serde_json::json!({
-        "reachability": "unreachable",
-        "detail": message,
-    });
-    persistence::persist_signal_snapshot(
-        connection,
-        environment_id,
-        MID_ECC_SIGNAL_ID,
-        observed_at,
-        "down",
-        &payload.to_string(),
-    )
 }
 
 #[cfg(test)]
@@ -452,16 +331,12 @@ mod tests {
 
     #[test]
     fn mid_ecc_signal_skips_when_availability_asleep() {
-        use crate::availability::{
-            AvailabilityObservation, Reachability, SignalState, persist_availability_snapshot,
-        };
+        use crate::availability::{AvailabilityObservation, persist_availability_snapshot};
+        use daku_protocol::{Reachability, SignalState};
 
         let db = TempDb::new("mid-ecc-asleep");
         let store = db.store();
-        let observed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
+        let observed_at = crate::collector::unix_now();
         {
             let connection = store.open().unwrap();
             persist_availability_snapshot(

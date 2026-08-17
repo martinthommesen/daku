@@ -68,6 +68,58 @@ pub enum Reachability {
     Asleep,
 }
 
+/// Per-Signal snapshot state. `Skipped` means the Signal deliberately did not
+/// probe this tick (asleep/unreachable Environment, or not applicable); it
+/// never votes in the Environment health rollup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalState {
+    Healthy,
+    Degraded,
+    Down,
+    Skipped,
+}
+
+impl SignalState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Down => "down",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "healthy" => Self::Healthy,
+            "degraded" => Self::Degraded,
+            "down" => Self::Down,
+            "skipped" => Self::Skipped,
+            _ => return None,
+        })
+    }
+}
+
+impl Reachability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::Unreachable => "unreachable",
+            Self::Asleep => "asleep",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "reachable" => Self::Reachable,
+            "unreachable" => Self::Unreachable,
+            "asleep" => Self::Asleep,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentSummary {
@@ -189,6 +241,33 @@ impl From<anyhow::Error> for RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_state_round_trips_strings() {
+        for state in [
+            SignalState::Healthy,
+            SignalState::Degraded,
+            SignalState::Down,
+            SignalState::Skipped,
+        ] {
+            assert_eq!(SignalState::parse(state.as_str()), Some(state));
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{}\"", state.as_str())
+            );
+        }
+        assert_eq!(SignalState::parse("bogus"), None);
+        for reachability in [
+            Reachability::Reachable,
+            Reachability::Unreachable,
+            Reachability::Asleep,
+        ] {
+            assert_eq!(
+                Reachability::parse(reachability.as_str()),
+                Some(reachability)
+            );
+        }
+    }
 
     #[test]
     fn handshake_field_names_are_stable() {
