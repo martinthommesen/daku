@@ -6,17 +6,14 @@
     "dev": "bun ./scripts/dev.ts",
     "release": "bun ./scripts/release.ts",
     "db:generate": "drizzle-kit generate",
-    "db:push": "drizzle-kit push",
     "lint": "oxlint -c oxlint.config.ts .",
     "check": "cargo fmt --all --check && cargo test --workspace --no-fail-fast && oxlint -c oxlint.config.ts ."
   },
   "devDependencies": {
-    "@libsql/client": "^0.17.4",
     "@oxlint/plugins": "1.78.0",
-    "@types/bun": "latest",
+    "@types/bun": "1.3.14",
     "drizzle-kit": "^0.31.10",
     "drizzle-orm": "^0.45.2",
-    "oxlint": "1.78.0",
-    "typescript": "^7.0.2"
+    "oxlint": "1.78.0"
   }
 }

@@ -6,6 +6,10 @@
  * (see `apply_migrations` in `crates/daku-core`). drizzle-orm never ships in
  * the binary — Rust owns every query.
  *
+ * Never edit or regenerate a migration that has shipped — only append a new
+ * `NNNN_*.sql`; the Rust runner identifies applied migrations by the numeric
+ * prefix.
+ *
  * Environments live in `~/.daku/environments.json` (ADR-0004), not here.
  * Credentials stay in the macOS Keychain — never SQLite.
  */

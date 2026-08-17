@@ -39,10 +39,14 @@ pub fn apply_migrations(connection: &Connection) -> io::Result<usize> {
         .map_err(to_io_error)?;
     let mut applied = 0;
     for (tag, sql) in MIGRATIONS {
+        // Identity is the numeric prefix build.rs enforces (`0000_…`), not
+        // drizzle's random suffix, so regenerating a migration's name never
+        // re-applies it on an existing database.
+        let prefix = tag.split('_').next().unwrap_or(tag);
         let already_applied: bool = connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM migrations WHERE tag = ?1)",
-                params![tag],
+                "SELECT EXISTS(SELECT 1 FROM migrations WHERE substr(tag, 1, ?1) = ?2)",
+                params![prefix.len() as i64, prefix],
                 |row| row.get(0),
             )
             .map_err(to_io_error)?;
@@ -312,6 +316,24 @@ mod tests {
         assert!(!table_exists(&connection, "environments"));
         assert!(!table_exists(&connection, "projects"));
         assert_eq!(apply_migrations(&connection).unwrap(), 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn apply_migrations_matches_by_numeric_prefix() {
+        let path = temp_db_path("prefix");
+        let _ = fs::remove_file(&path);
+        let connection = Connection::open(&path).unwrap();
+        assert!(apply_migrations(&connection).unwrap() >= 1);
+        // Simulate a regenerated migration name for the same index.
+        connection
+            .execute(
+                "UPDATE migrations SET tag = '0000_renamed_by_regeneration'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(apply_migrations(&connection).unwrap(), 0);
+        assert!(table_exists(&connection, "signal_snapshots"));
         let _ = fs::remove_file(path);
     }
 
