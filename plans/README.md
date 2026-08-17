@@ -106,8 +106,8 @@ Recommended order = table order (tiers: **A** baseline/bugs, **B** tests+debt fo
 | [038](038-signal-detail-render-error-and-drill-in.md) | Show why a Signal is red (render `error`/`detail`), then decide drill-in (decision note) ([#61](https://github.com/martinthommesen/daku/issues/61)) | P2 | S | 011, 013 | DONE |
 | [039](039-header-freshness-url-and-compare-strip.md) | Header freshness ("polled Ns ago") + `instance_url` on `EnvironmentSummary` (protocol bump) + richer compare strip ([#62](https://github.com/martinthommesen/daku/issues/62)) | P2 | S–M | 011, 014 | DONE |
 | [041](041-daemon-doctor-command.md) | `daku-daemon doctor` — per-Environment config / Credential presence / reachability / build ([#63](https://github.com/martinthommesen/daku/issues/63)) | P2 | S | 011; soft 019, 020 | DONE |
-| [043](043-drift-mismatch-list-payload.md) | Drift persists a bounded `mismatch_list` and renders it under the drift card ([#64](https://github.com/martinthommesen/daku/issues/64)) | P2 | M | 011; soft 038, 031 | TODO |
-| [040](040-last-clone-per-target-with-age.md) | Last-clone per clone target with `age_days` (spike on `clone_instance.target`, then build) ([#65](https://github.com/martinthommesen/daku/issues/65)) | P2 | M | 011; soft 013, 031 | TODO |
+| [043](043-drift-mismatch-list-payload.md) | Drift persists a bounded `mismatch_list` and renders it under the drift card ([#64](https://github.com/martinthommesen/daku/issues/64)) | P2 | M | 011; soft 038, 031 | DONE |
+| [040](040-last-clone-per-target-with-age.md) | Last-clone per clone target with `age_days` (spike on `clone_instance.target`, then build) ([#65](https://github.com/martinthommesen/daku/issues/65)) | P2 | M | 011; soft 013, 031 | DONE |
 | [042](042-hosted-daemon-seam-spike.md) | Hosted-daemon seam spike — README attach path + `docs/research/hosted-daemon.md` decision note ([#66](https://github.com/martinthommesen/daku/issues/66)) | P3 | S | 011, 014; soft 020 | DONE |
 
 ### Dependency notes
