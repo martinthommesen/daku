@@ -161,7 +161,7 @@ impl DaemonProcess {
             .env(APP_EXECUTABLE_ENV, app_executable)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(daemon_log_stdio())
             .spawn()
             .with_context(|| format!("could not launch {}", executable.display()))?;
         let stdout = child
@@ -252,6 +252,38 @@ impl DaemonProcess {
 impl Drop for DaemonProcess {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+fn daemon_log_path(home: &Path) -> PathBuf {
+    home.join(".daku").join("daemon.log")
+}
+
+fn open_daemon_log(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// `~/.daku/daemon.log`, append-only, 0600. The daemon writes its diagnostics
+/// to stderr; a packaged app has no terminal, so the supervisor points stderr
+/// here. Falls back to inheriting stderr when the file cannot be opened.
+fn daemon_log_stdio() -> Stdio {
+    let path = daemon_log_path(&dirs::home_dir().unwrap_or_else(std::env::temp_dir));
+    match open_daemon_log(&path) {
+        Ok(file) => Stdio::from(file),
+        Err(error) => {
+            eprintln!("could not open {} for daemon logs: {error}", path.display());
+            Stdio::inherit()
+        }
     }
 }
 
@@ -640,5 +672,23 @@ mod tests {
             "127.0.0.1:34123"
         );
         assert_eq!(desktop_client_address("[::]:34123").unwrap(), "[::1]:34123");
+    }
+
+    #[test]
+    fn daemon_log_opens_append_only_0600() {
+        let home = std::env::temp_dir().join(format!("daku-log-{}", Uuid::new_v4()));
+        let path = daemon_log_path(&home);
+        for line in ["first\n", "second\n"] {
+            let mut file = open_daemon_log(&path).unwrap();
+            std::io::Write::write_all(&mut file, line.as_bytes()).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

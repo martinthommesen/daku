@@ -33,7 +33,7 @@ Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settin
 
 ### Operator smoke (local)
 
-1. Copy the example file to `~/.daku/environments.json`. Use your own Environment URLs locally — do not commit them.
+1. Copy the example file to `~/.daku/environments.json`. Use your own Environment URLs locally — do not commit them. The daemon reads this file at start — relaunch daku after creating or editing it. Daemon diagnostics (missing config, Keychain misses, HTTP errors) are appended to `~/.daku/daemon.log`.
 2. Store Credentials in Keychain, service `daku`, account = Environment `id`:
    - OAuth: `{"client_id":"…","client_secret":"…"}`
    - Basic (PDI stand-in only): `{"username":"…","password":"…"}`

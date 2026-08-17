@@ -77,6 +77,10 @@ impl DashboardState {
         self.connected
     }
 
+    pub fn has_environments(&self) -> bool {
+        !self.environments.is_empty()
+    }
+
     pub fn apply_all(&mut self, messages: &[ServerMessage]) {
         for message in messages {
             self.apply(message);
@@ -498,6 +502,12 @@ mod tests {
         state.set_connected(true);
         state.apply_all(&fixture_events());
         state
+    }
+
+    #[test]
+    fn has_environments_reflects_loaded_state() {
+        assert!(!DashboardState::new().has_environments());
+        assert!(loaded().has_environments());
     }
 
     #[test]

@@ -15,5 +15,8 @@ The desktop supervises this process. Debug builds use the feature-gated
 `daku-debug-daemon` target at `target/debug/daku-debug-daemon`. Release
 distributions place the signed `daku-daemon` beside the desktop executable.
 
+When launched by the desktop, stderr is redirected to `~/.daku/daemon.log`
+(append, 0600). Run the binary by hand to see diagnostics in the terminal.
+
 A non-loopback bind is refused unless `--allow-non-loopback` is also present.
 Browser handshakes need an exact `--allow-origin`; native clients send no Origin.

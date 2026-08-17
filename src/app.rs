@@ -234,11 +234,16 @@ impl Daku {
                     })
             })
             .when(self.state.selected().is_none(), |element| {
+                let message = if self.state.connected() && !self.state.has_environments() {
+                    "No Environments configured \u{2014} copy environments.example.json to ~/.daku/environments.json, then relaunch daku. Daemon diagnostics: ~/.daku/daemon.log"
+                } else {
+                    "No Environment selected."
+                };
                 element.child(
                     div()
                         .p(px(22.0))
                         .text_color(theme.text_tertiary)
-                        .child("No Environment selected."),
+                        .child(message),
                 )
             })
     }
