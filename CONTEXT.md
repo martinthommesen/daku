@@ -27,3 +27,21 @@ _Avoid_: user, admin, viewer (those imply daku-side accounts we are not building
 **Environment health**:
 A rolled-up status for an Environment derived from its Signals: **healthy**, **degraded**, or **down**. v1 uses hard-coded defaults (not Operator-configured alert rules).
 _Avoid_: severity, priority, alert state
+
+### Screen
+
+**Environment detail**:
+The main pane showing one selected Environment: its health, its Signal cards, and the compare strip. The sidebar lists Environments; selecting one shows its detail.
+_Avoid_: dashboard (that is the whole window), page, view
+
+**Signal card**:
+The tile that shows one Signal for the selected Environment — its state, a one-line summary, and any diagnostic detail the daemon persisted.
+_Avoid_: tile, widget, KPI, stat
+
+**Compare strip**:
+The row under the Signal cards that lines up build, drift, and last-clone across the other Environments.
+_Avoid_: matrix (deferred secondary view — ADR-0005), comparison table
+
+**Drill-in**:
+The region that opens when a Signal card is selected and shows that Signal's rows (mismatched plugins, clone rows, a larger trend) with a link into the Environment itself.
+_Avoid_: inspector, detail pane, panel, popup
