@@ -60,3 +60,82 @@ Drift checks use `567179a..HEAD` against each plan’s **Scope** paths (not only
 - Commit style: imperative summary like existing `main`.
 - Live ServiceNow calls are **Operator-local smoke** only; verification is local (`cargo test` / plan Done criteria), not Actions.
 - Daemon Hello env: **`DAKU_DAEMON_TOKEN`** (locked in 001).
+
+---
+
+## Advisor audit — 2026-08-17 (`/improve deep`, planned at `f7fdbe7`)
+
+Full-repo audit (correctness, security, perf, tests, tech debt, deps, DX/docs, direction) after plans 001–010 landed. Every vetted finding now has a plan (011–043); the maintainer asked for all of them. Numbering continues monotonically from 010. Drift checks for 011+ use `f7fdbe7..HEAD` against each plan's Scope paths.
+
+**Tracking issue:** [#67](https://github.com/martinthommesen/daku/issues/67). **Gate for 011+:** `bun run check` (introduced by 011; 032 adds clippy `-D warnings`) must exit 0 as a done criterion.
+**Protocol bumps:** 020, 029 and 039 each bump `PROTOCOL_VERSION` — always increment the live value, never set a fixed number.
+
+### Execution order & status
+
+Recommended order = table order (tiers: **A** baseline/bugs, **B** tests+debt foundations, **C** perf/deps, **D** direction). Within a tier, plans are independent unless "Depends on" says otherwise.
+
+| Plan | Title | Priority | Effort | Depends on | Status |
+|------|-------|----------|--------|------------|--------|
+| [011](011-green-baseline-check-gate.md) | Make the local verification gate one command and green (fix `extra` flatten test, fmt, lint; `bun run check`) ([#34](https://github.com/martinthommesen/daku/issues/34)) | P1 | S | — | TODO |
+| [012](012-bound-server-controlled-durations-and-token.md) | Cap `Retry-After` / OAuth `expires_in`; refuse an empty daemon token ([#35](https://github.com/martinthommesen/daku/issues/35)) | P1 | S | 011 | TODO |
+| [014](014-replay-dashboard-on-subscribe.md) | Replay latest dashboard state to new subscribers; publish before first tick ([#36](https://github.com/martinthommesen/daku/issues/36)) | P1 | S | 011 | TODO |
+| [013](013-asleep-never-degrades.md) | Asleep Environment never rolls up degraded; secondary Signals skip probing it ([#37](https://github.com/martinthommesen/daku/issues/37)) | P1 | M | 011 (land after 014) | TODO |
+| [015](015-release-pipeline-sparkle-fixes.md) | Fix Sparkle release path: `CFBundleVersion`, checksum abort, DMG path, ZIP in checklist ([#38](https://github.com/martinthommesen/daku/issues/38)) | P1 | S | 011 | TODO |
+| [016](016-pin-gpui-and-trim-root-deps.md) | Pin GPUI `rev`, drop `test-support` from release, trim unused root deps ([#39](https://github.com/martinthommesen/daku/issues/39)) | P2 | S | 011 | TODO |
+| [017](017-https-only-instance-urls-and-0600-at-create.md) | Reject non-HTTPS Environment URLs at load; create daemon files 0600 from the start ([#40](https://github.com/martinthommesen/daku/issues/40)) | P2 | S | 011 | TODO |
+| [019](019-daemon-log-file-and-empty-state.md) | Daemon stderr → `~/.daku/daemon.log` (0600, append); empty Environment list explains itself ([#41](https://github.com/martinthommesen/daku/issues/41)) | P2 | S | 011 | TODO |
+| [018](018-supervisor-backoff-and-remote-reconnect.md) | Supervisor restarts with bounded backoff; remote daemons reconnect ([#42](https://github.com/martinthommesen/daku/issues/42)) | P2 | M | 011, 014 | TODO |
+| [020](020-settings-cleanup-typed-poll-interval.md) | Typed `DaemonSettings { poll_interval_secs }`; delete desktop settings mirror + dead window/preference plumbing; protocol bump ([#43](https://github.com/martinthommesen/daku/issues/43)) | P2 | M | 011 (supersedes 011's `extra` tests) | TODO |
+| [021](021-updater-standard-driver.md) | Sparkle via `SPUStandardUpdaterController`; delete custom `UserDriver`/events/status/preview ([#44](https://github.com/martinthommesen/daku/issues/44)) | P2 | M | 011, 015 | TODO |
+| [028](028-temp-db-test-helper-and-collector-isolation.md) | `test_support::{TempDb, prod()}`; migrate ~19 temp-DB sites; collector isolation test ([#45](https://github.com/martinthommesen/daku/issues/45)) | P3 | S | 011 (before 031; ideally before 013/022/023) | TODO |
+| [025](025-loopback-websocket-integration-test.md) | Loopback WebSocket integration test (auth, Ping/Ack, Origin, Shutdown, dashboard, disconnect) ([#46](https://github.com/martinthommesen/daku/issues/46)) | P2 | M | 011 (adapt if 029 lands first) | TODO |
+| [026](026-daemon-process-blackbox-test.md) | Black-box daemon process test (ready line, token refusal, spawn→Ping→drop reaps, parent watchdog) ([#47](https://github.com/martinthommesen/daku/issues/47)) | P2 | M | 011, 012 | TODO |
+| [029](029-delete-waku-replay-machinery.md) | Delete inherited waku session/runtime replay machinery from protocol, hub, client; protocol bump ([#48](https://github.com/martinthommesen/daku/issues/48)) | P2 | M | 011, 014 | TODO |
+| [030](030-delete-unused-assets-fonts-i18n.md) | Delete unreferenced icons/fonts/CoreText FFI; shrink i18n to six menu strings, embed once ([#49](https://github.com/martinthommesen/daku/issues/49)) | P2 | S–M | 011 (soft 020) | TODO |
+| [031](031-collector-consolidation-typed-signal-state.md) | One per-Environment collector loop (`Signal` trait) + typed `SignalState`; last-clone unreachable → down; absorbs 013's gate ([#51](https://github.com/martinthommesen/daku/issues/51)) | P2 | M–L | 011, 013, 028 (see 022 note) | TODO |
+| [022](022-per-environment-collector-concurrency.md) | Poll Environments concurrently (per-Environment collector groups on scoped threads; SQLite busy_timeout; tick-overrun warning) ([#50](https://github.com/martinthommesen/daku/issues/50)) | P2 | M | 011, 013, 014 | TODO |
+| [023](023-drift-inventory-throttle-and-mid-aggregate.md) | Cache drift plugin/store-app inventories for 30 min instead of refetching every tick ([#52](https://github.com/martinthommesen/daku/issues/52)) | P2 | S | 011 | TODO |
+| [024](024-poll-interval-floor-and-credential-memo.md) | Floor `poll_interval_secs` at 30 s; check the OAuth token cache before reading the Keychain ([#53](https://github.com/martinthommesen/daku/issues/53)) | P3 | S | 011 (soft 020) | TODO |
+| [027](027-unit-test-gap-fill.md) | Unit-test gap fill: DashboardState branches, ServiceNow failure modes, `load_environments` negatives, client persistence, vacuous tests ([#54](https://github.com/martinthommesen/daku/issues/54)) | P3 | M | 011; ordering vs 012/013/017/020/021 stated per section | TODO |
+| [032](032-delete-dead-platform-theme-code-clippy-gate.md) | Delete rustc-flagged dead platform/theme code, fix sidebar tint width, add clippy `-D warnings` to the gate ([#55](https://github.com/martinthommesen/daku/issues/55)) | P2 | S–M | 011, 016, 020, 021, 029, 030 (last debt plan) | TODO |
+| [033](033-protocol-crate-hygiene-and-hollow-scaffolding.md) | `daku-protocol` free of dirs/OS/i18n deps; explicit client re-exports; `HollowBackend`→`SettingsBackend`; drop `export_types` stub ([#56](https://github.com/martinthommesen/daku/issues/56)) | P3 | M | 011, 020, 029, 030 | TODO |
+| [034](034-ureq-3-native-roots.md) | ServiceNow HTTP transport on `ureq` 3 with platform root certificates (+ optional rusqlite bump) ([#57](https://github.com/martinthommesen/daku/issues/57)) | P2 | S–M | 011 | TODO |
+| [035](035-cargo-config-profile-and-block-patch.md) | Clean `.cargo/config.toml`; keep release symbols (`.dSYM`); try dropping the personal-fork `block` patch ([#58](https://github.com/martinthommesen/daku/issues/58)) | P3 | S | 011, 015, 016 | TODO |
+| [036](036-db-tooling-and-migration-identity.md) | Trim Bun DB tooling; key applied migrations on numeric prefix ([#59](https://github.com/martinthommesen/daku/issues/59)) | P3 | S | 011 | TODO |
+| [037](037-onboarding-docs-and-env-var-table.md) | Document fresh-clone prerequisites and every environment variable daku reads ([#60](https://github.com/martinthommesen/daku/issues/60)) | P3 | S | 011, 016; soft 019, 035 | TODO |
+| [038](038-signal-detail-render-error-and-drill-in.md) | Show why a Signal is red (render `error`/`detail`), then decide drill-in (decision note) ([#61](https://github.com/martinthommesen/daku/issues/61)) | P2 | S | 011, 013 | TODO |
+| [039](039-header-freshness-url-and-compare-strip.md) | Header freshness ("polled Ns ago") + `instance_url` on `EnvironmentSummary` (protocol bump) + richer compare strip ([#62](https://github.com/martinthommesen/daku/issues/62)) | P2 | S–M | 011, 014 | TODO |
+| [041](041-daemon-doctor-command.md) | `daku-daemon doctor` — per-Environment config / Credential presence / reachability / build ([#63](https://github.com/martinthommesen/daku/issues/63)) | P2 | S | 011; soft 019, 020 | TODO |
+| [043](043-drift-mismatch-list-payload.md) | Drift persists a bounded `mismatch_list` and renders it under the drift card ([#64](https://github.com/martinthommesen/daku/issues/64)) | P2 | M | 011; soft 038, 031 | TODO |
+| [040](040-last-clone-per-target-with-age.md) | Last-clone per clone target with `age_days` (spike on `clone_instance.target`, then build) ([#65](https://github.com/martinthommesen/daku/issues/65)) | P2 | M | 011; soft 013, 031 | TODO |
+| [042](042-hosted-daemon-seam-spike.md) | Hosted-daemon seam spike — README attach path + `docs/research/hosted-daemon.md` decision note ([#66](https://github.com/martinthommesen/daku/issues/66)) | P3 | S | 011, 014; soft 020 | TODO |
+
+### Dependency notes
+
+- **011 first, always**: every later plan's done criteria call `bun run check`, and it turns the one red test green.
+- 014 before 013 and 018 and 022 (all touch `crates/daku-core/src/collector.rs` `run`/`tick` or rely on replay); 014 before 029 (029 must keep 014's dashboard cache).
+- 020 supersedes 011's `poll_interval_secs` README line and `extra` tests; 024's floor is written for both the `extra` and the typed shape.
+- 028 (temp-DB helper) should precede 031 and ideally 013/022/023 so new tests use it.
+- 031 vs 022: 022 lands first (collector.rs-only, adds `register_group`); 031 must preserve the per-Environment group structure — see 031's Depends-on note.
+- 032 lands last among debt plans (016, 020, 021, 029, 030 delete dead code first) and then turns on clippy in the gate.
+- 033 after 020, 029, 030 (they decide what leaves `daku-protocol`).
+- 035 after 015 (both edit `scripts/release.ts`/`bundle.sh`); 037 after 016/019/035 (documents what they change).
+- 038 before 043 (drift list renders under the card detail); 039's `instance_url` unblocks 038's deep-link option and 040's target matching.
+- Protocol bumps in 020, 029, 039: each increments the live `PROTOCOL_VERSION`; desktop and daemon ship together.
+
+### Findings considered and rejected
+
+- "No CI / no PRs" — decided in `docs/agents/git-workflow.md`; the gate is local (`bun run check`).
+- Loopback-only daemon, token via env, unsigned builds, Keychain service `daku`, Basic auth for PDIs, `DAKU_DB_PATH` override — by design (ADR-0004/0006, README).
+- Thread-per-request in `server.rs`, unbounded outgoing channel — authenticated + loopback; revisit only if `--allow-non-loopback` becomes supported (see 042).
+- SQLite per-row autocommit, `store.open()` per collector, missing index on `prune` — tables are ≤ ~1.5 k rows; not worth doing.
+- PERF-06 (MID agents via Aggregate API) — one list call already yields both counts and keeps per-MID fields DIR-01/038 wants; two aggregate calls would be more requests (recorded in 023).
+- Sparkline down-sampling — ≤ 2 880 points once 024's 30 s floor exists.
+- Removing drizzle entirely — ADR-0007 keeps the drizzle→SQL pipeline.
+- Bun test harness for `scripts/*.ts` (TEST-10) — release is manual and macOS-bound; failures are immediate.
+- Testing the dead journal/replay machinery (TEST-08) — deleted by 029 instead.
+- Re-reading `poll_interval_secs` every tick — restart is documented (011/020); not worth the plumbing.
+- `resolver = "2"` on edition 2024 — no `rust-version` until 037; resolver 3 buys nothing here.
+- Splitting `drift.rs`/`servicenow.rs`/`process.rs` — cohesive single-topic modules.
+- "Upgrade happened" marker Signal — build drift already flags it; would need an ADR-0007 exception.
+- `scripts/delete-debug-app.ts` `sh.waku.dev`/`codes.waku.dev` — intentional legacy bundle IDs for cleaning pre-rename debug data.
