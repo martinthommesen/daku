@@ -12,7 +12,7 @@ use crate::theme::ThemePreference;
 pub struct DaemonSettings {
     pub theme: ThemePreference,
     pub language: AppLanguage,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
 
