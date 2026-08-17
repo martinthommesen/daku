@@ -3,33 +3,42 @@
 use daku_client::DaemonSupervisor;
 use daku_protocol::{EnvironmentHealth, Reachability};
 use gpui::{
-    App, Bounds, ClickEvent, Context, Entity, FontWeight, IntoElement, PathBuilder, Pixels, Point,
-    SharedString, Window, canvas, div, point, prelude::*, px,
+    App, AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, FontWeight,
+    IntoElement, PathBuilder, Pixels, Point, SharedString, Window, canvas, div, point, prelude::*,
+    px,
+};
+use gpui_component::{
+    ActiveTheme as _, TitleBar, h_flex,
+    sidebar::{
+        Sidebar, SidebarCollapsible, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+    },
 };
 
 use crate::dashboard_state::{
-    CompareRow, DashboardState, SidebarRow, SignalCard, fixture_events, freshness, signal_label,
+    CompareRow, DashboardState, SignalCard, fixture_events, freshness, signal_label,
     ui_fixture_enabled,
 };
-use crate::theme::Theme;
 use crate::{CloseWindow, ToggleFpsCounter};
 
-/// Sidebar width shared by the GPUI sidebar and the AppKit tint layer.
-pub const SIDEBAR_WIDTH: f32 = 220.0;
+const SIDEBAR_WIDTH: f32 = 220.0;
 
 pub struct Daku {
     state: DashboardState,
     _supervisor: Option<DaemonSupervisor>,
     show_fps: bool,
+    /// `Root` owns the window's root dispatch node, so the shell only receives
+    /// menu- and keystroke-dispatched actions while this handle is focused.
+    focus_handle: FocusHandle,
 }
 
 impl Daku {
     pub fn new(
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
         supervisor: Option<DaemonSupervisor>,
     ) -> Entity<Self> {
-        cx.new(|cx| {
+        let focus_handle = cx.focus_handle();
+        let entity = cx.new(|cx| {
             let mut state = DashboardState::new();
             if ui_fixture_enabled() {
                 state.set_connected(true);
@@ -42,8 +51,11 @@ impl Daku {
                 state,
                 _supervisor: supervisor,
                 show_fps: false,
+                focus_handle: focus_handle.clone(),
             }
-        })
+        });
+        window.focus(&focus_handle, cx);
+        entity
     }
 }
 
@@ -122,13 +134,15 @@ fn listen_dashboard(supervisor: &DaemonSupervisor, cx: &mut Context<Daku>) {
 
 impl Render for Daku {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::current(cx);
+        let sidebar = self.render_sidebar(cx);
+        let detail = self.render_detail(cx);
         div()
+            .track_focus(&self.focus_handle)
             .size_full()
-            .bg(theme.canvas)
+            .bg(cx.theme().background)
             .flex()
             .flex_col()
-            .text_color(theme.text)
+            .text_color(cx.theme().foreground)
             .on_action(cx.listener(|this, _: &ToggleFpsCounter, window, cx| {
                 this.show_fps = !this.show_fps;
                 window.refresh();
@@ -137,17 +151,17 @@ impl Render for Daku {
             .on_action(cx.listener(|_, _: &CloseWindow, window, _cx| {
                 crate::platform::hide_window(window);
             }))
+            .child(TitleBar::new().child(div().text_sm().child("daku")))
             .when(!self.state.connected(), |element| {
-                element.child(disconnected_banner(&theme))
+                element.child(disconnected_banner(cx))
             })
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_sidebar(&theme, cx))
-                    .child(self.render_detail(&theme)),
+                    .items_start()
+                    .child(sidebar)
+                    .child(detail),
             )
             .when(self.show_fps, |element| {
                 element.child(
@@ -155,7 +169,7 @@ impl Render for Daku {
                         .px(px(12.0))
                         .py(px(6.0))
                         .text_size(px(11.0))
-                        .text_color(theme.text_tertiary)
+                        .text_color(cx.theme().muted_foreground)
                         .child("FPS"),
                 )
             })
@@ -163,40 +177,39 @@ impl Render for Daku {
 }
 
 impl Daku {
-    fn render_sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(SIDEBAR_WIDTH))
-            .h_full()
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
-            .px(px(10.0))
-            .py(px(12.0))
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                div()
-                    .px(px(8.0))
-                    .text_size(px(14.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("daku · ServiceNow"),
-            )
-            .child(section_label("Platforms", theme))
-            .child(platform_row(theme))
-            .child(section_label("Environments", theme))
-            .children(self.environment_rows(theme, cx))
-    }
-
-    fn environment_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let selected_id = self.state.selected_id().map(str::to_owned);
-        self.state
+        let items: Vec<SidebarMenuItem> = self
+            .state
             .sidebar()
             .into_iter()
-            .map(|row| environment_row(row, selected_id.as_deref(), theme, cx))
-            .collect()
+            .map(|row| {
+                let selected = selected_id.as_deref() == Some(row.id.as_str());
+                let id = row.id.clone();
+                let color = if row.muted {
+                    cx.theme().muted_foreground
+                } else {
+                    health_color(row.health, cx)
+                };
+                SidebarMenuItem::new(row.label.clone())
+                    .active(selected)
+                    .suffix(move |_, _| div().size(px(8.0)).rounded_full().bg(color))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.state.select(&id);
+                        cx.notify();
+                    }))
+            })
+            .collect();
+
+        Sidebar::new("daku-sidebar")
+            .collapsible(SidebarCollapsible::None)
+            .w(px(SIDEBAR_WIDTH))
+            .header(SidebarHeader::new().child(div().text_sm().child("ServiceNow")))
+            .child(SidebarGroup::new("Environments").child(SidebarMenu::new().children(items)))
+            .into_any_element()
     }
 
-    fn render_detail(&self, theme: &Theme) -> impl IntoElement {
+    fn render_detail(&self, cx: &App) -> gpui::AnyElement {
         let selected = self.state.selected().cloned();
         let cards = selected
             .as_ref()
@@ -221,7 +234,7 @@ impl Daku {
                             .pt(px(18.0))
                             .pb(px(10.0))
                             .border_b_1()
-                            .border_color(theme.border)
+                            .border_color(cx.theme().border)
                             .child(
                                 div()
                                     .text_size(px(20.0))
@@ -235,8 +248,8 @@ impl Daku {
                                     .flex_row()
                                     .items_center()
                                     .gap(px(8.0))
-                                    .child(health_badge(environment.health, theme))
-                                    .child(reachability_badge(environment.reachability, theme)),
+                                    .child(health_badge(environment.health, cx))
+                                    .child(reachability_badge(environment.reachability, cx)),
                             )
                             .child(
                                 div()
@@ -246,7 +259,7 @@ impl Daku {
                                     .items_center()
                                     .gap(px(6.0))
                                     .text_size(px(12.0))
-                                    .text_color(theme.text_tertiary)
+                                    .text_color(cx.theme().muted_foreground)
                                     .child(
                                         environment
                                             .instance_url
@@ -259,9 +272,9 @@ impl Daku {
                                             element.child("\u{b7}").child(
                                                 div()
                                                     .text_color(if fresh.stale {
-                                                        theme.warning
+                                                        cx.theme().warning
                                                     } else {
-                                                        theme.text_tertiary
+                                                        cx.theme().muted_foreground
                                                     })
                                                     .child(fresh.label),
                                             )
@@ -276,14 +289,14 @@ impl Daku {
                             .flex_wrap()
                             .gap(px(10.0))
                             .p(px(22.0))
-                            .children(cards.into_iter().map(|card| self.signal_card(card, theme))),
+                            .children(cards.into_iter().map(|card| self.signal_card(card, cx))),
                     )
                     .when(strip.visible, |element| {
                         element.child(compare_strip(
                             strip.has_mismatch,
                             &selected_id,
                             &rows,
-                            theme,
+                            cx,
                         ))
                     })
             })
@@ -296,13 +309,14 @@ impl Daku {
                 element.child(
                     div()
                         .p(px(22.0))
-                        .text_color(theme.text_tertiary)
+                        .text_color(cx.theme().muted_foreground)
                         .child(message),
                 )
             })
+            .into_any_element()
     }
 
-    fn signal_card(&self, card: SignalCard, theme: &Theme) -> impl IntoElement {
+    fn signal_card(&self, card: SignalCard, cx: &App) -> gpui::AnyElement {
         let summary = self.state.card_summary(card.signal_id);
         let detail = self.state.card_detail(card.signal_id);
         let mismatch_lines = if card.signal_id == "drift" {
@@ -316,19 +330,18 @@ impl Daku {
             .w(px(220.0))
             .flex_grow(1.0)
             .p(px(12.0))
-            .rounded(px(8.0))
+            .rounded(cx.theme().radius)
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.raised)
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
+            .text_color(cx.theme().secondary_foreground)
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .items_center()
                     .gap(px(6.0))
                     .text_size(px(11.0))
-                    .text_color(theme.text_tertiary)
-                    .child(status_dot(&card.status, theme))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(status_dot(&card.status, cx))
                     .child(signal_label(card.signal_id)),
             )
             .child(div().mt(px(6.0)).text_size(px(15.0)).child(if waiting {
@@ -343,7 +356,7 @@ impl Daku {
                     div()
                         .mt(px(4.0))
                         .text_size(px(11.0))
-                        .text_color(theme.text_tertiary)
+                        .text_color(cx.theme().muted_foreground)
                         .child(detail),
                 )
             })
@@ -352,143 +365,80 @@ impl Daku {
                     div()
                         .mt(px(4.0))
                         .text_size(px(11.0))
-                        .text_color(theme.text_secondary)
+                        .text_color(cx.theme().muted_foreground)
                         .children(mismatch_lines.into_iter().map(|line| div().child(line))),
                 )
             })
             .when(card.sparkline.len() >= 2, |element| {
-                element.child(sparkline(&card.sparkline, theme.accent))
+                element.child(sparkline(&card.sparkline, cx.theme().accent))
             })
+            .into_any_element()
     }
 }
 
-fn environment_row(
-    row: SidebarRow,
-    selected_id: Option<&str>,
-    theme: &Theme,
-    cx: &mut Context<Daku>,
-) -> gpui::AnyElement {
-    let selected = selected_id == Some(row.id.as_str());
-    let id = row.id.clone();
-    div()
-        .id(SharedString::from(format!("env-{}", row.id)))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(8.0))
-        .px(px(8.0))
-        .py(px(7.0))
-        .rounded(px(6.0))
-        .cursor_pointer()
-        .when(selected, |element| {
-            element.bg(theme.sidebar_item_background)
-        })
-        .text_color(if selected {
-            theme.text
-        } else {
-            theme.text_secondary
-        })
-        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.state.select(&id);
-            cx.notify();
-        }))
-        .child(health_dot(row.health, row.muted, theme))
-        .child(row.label)
-        .into_any_element()
-}
-
-fn disconnected_banner(theme: &Theme) -> impl IntoElement {
+fn disconnected_banner(cx: &App) -> impl IntoElement {
     div()
         .w_full()
         .px(px(14.0))
         .py(px(8.0))
-        .bg(theme.danger_soft)
-        .text_color(theme.danger)
+        .bg(cx.theme().danger.opacity(0.15))
+        .text_color(cx.theme().danger)
         .text_size(px(12.0))
         .child("Disconnected")
 }
 
-fn section_label(label: &'static str, theme: &Theme) -> impl IntoElement {
-    div()
-        .px(px(8.0))
-        .text_size(px(10.0))
-        .text_color(theme.text_ghost)
-        .child(label.to_ascii_uppercase())
-}
-
-fn platform_row(theme: &Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(8.0))
-        .px(px(8.0))
-        .py(px(7.0))
-        .rounded(px(6.0))
-        .bg(theme.sidebar_item_background)
-        .child("ServiceNow")
-}
-
-fn health_dot(health: EnvironmentHealth, muted: bool, theme: &Theme) -> impl IntoElement {
-    div().size(px(8.0)).rounded_full().bg(if muted {
-        theme.text_ghost
-    } else {
-        health_color(health, theme)
-    })
-}
-
-fn status_dot(status: &str, theme: &Theme) -> impl IntoElement {
+fn status_dot(status: &str, cx: &App) -> impl IntoElement {
     let color = match status {
-        "healthy" => theme.success,
-        "degraded" => theme.warning,
-        "down" => theme.danger,
-        _ => theme.text_ghost,
+        "healthy" => cx.theme().success,
+        "degraded" => cx.theme().warning,
+        "down" => cx.theme().danger,
+        _ => cx.theme().muted_foreground,
     };
     div().size(px(8.0)).rounded_full().bg(color)
 }
 
-fn health_badge(health: EnvironmentHealth, theme: &Theme) -> impl IntoElement {
+fn health_badge(health: EnvironmentHealth, cx: &App) -> impl IntoElement {
     badge(
         match health {
             EnvironmentHealth::Healthy => "healthy",
             EnvironmentHealth::Degraded => "degraded",
             EnvironmentHealth::Down => "down",
         },
-        health_color(health, theme),
-        theme,
+        health_color(health, cx),
+        cx,
     )
 }
 
-fn reachability_badge(reachability: Reachability, theme: &Theme) -> impl IntoElement {
+fn reachability_badge(reachability: Reachability, cx: &App) -> impl IntoElement {
     let (label, color) = match reachability {
-        Reachability::Reachable => ("reachable", theme.success),
-        Reachability::Unreachable => ("unreachable", theme.danger),
-        Reachability::Asleep => ("asleep", theme.text_ghost),
+        Reachability::Reachable => ("reachable", cx.theme().success),
+        Reachability::Unreachable => ("unreachable", cx.theme().danger),
+        Reachability::Asleep => ("asleep", cx.theme().muted_foreground),
     };
-    badge(label, color, theme)
+    badge(label, color, cx)
 }
 
-fn badge(label: &'static str, color: gpui::Hsla, theme: &Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
+/// gpui-component's `Badge` is a count/dot *overlay*, not a label pill, so the
+/// pill stays local until plan 045 owns the badge design.
+fn badge(label: &'static str, color: gpui::Hsla, cx: &App) -> impl IntoElement {
+    h_flex()
         .items_center()
         .gap(px(6.0))
         .px(px(8.0))
         .py(px(3.0))
         .rounded(px(999.0))
-        .bg(theme.inset)
+        .bg(cx.theme().muted)
         .text_size(px(12.0))
-        .text_color(theme.text_secondary)
+        .text_color(cx.theme().muted_foreground)
         .child(div().size(px(8.0)).rounded_full().bg(color))
         .child(label)
 }
 
-fn health_color(health: EnvironmentHealth, theme: &Theme) -> gpui::Hsla {
+fn health_color(health: EnvironmentHealth, cx: &App) -> gpui::Hsla {
     match health {
-        EnvironmentHealth::Healthy => theme.success,
-        EnvironmentHealth::Degraded => theme.warning,
-        EnvironmentHealth::Down => theme.danger,
+        EnvironmentHealth::Healthy => cx.theme().success,
+        EnvironmentHealth::Degraded => cx.theme().warning,
+        EnvironmentHealth::Down => cx.theme().danger,
     }
 }
 
@@ -496,7 +446,7 @@ fn compare_strip(
     has_mismatch: bool,
     selected_id: &str,
     rows: &[CompareRow],
-    theme: &Theme,
+    cx: &App,
 ) -> impl IntoElement {
     div()
         .mx(px(22.0))
@@ -504,13 +454,13 @@ fn compare_strip(
         .p(px(14.0))
         .rounded(px(8.0))
         .border_1()
-        .border_color(theme.border_strong)
-        .bg(theme.inset)
+        .border_color(cx.theme().border)
+        .bg(cx.theme().muted)
         .child(
             div()
                 .mb(px(8.0))
                 .text_size(px(12.0))
-                .text_color(theme.text_tertiary)
+                .text_color(cx.theme().muted_foreground)
                 .child("vs clone source"),
         )
         .child(
@@ -519,7 +469,7 @@ fn compare_strip(
                 .flex_row()
                 .flex_wrap()
                 .gap(px(16.0))
-                .text_color(theme.text_secondary)
+                .text_color(cx.theme().muted_foreground)
                 .children(
                     rows.iter()
                         .filter(|row| row.id != selected_id)
@@ -530,7 +480,7 @@ fn compare_strip(
             element.child(
                 div()
                     .mt(px(8.0))
-                    .text_color(theme.warning)
+                    .text_color(cx.theme().warning)
                     .text_size(px(12.0))
                     .child("build / drift mismatch"),
             )

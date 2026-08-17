@@ -12,18 +12,16 @@ macro_rules! tr {
 }
 
 mod app;
-mod assets;
 pub mod daemon;
 mod dashboard_state;
 mod platform;
-mod theme;
 mod updater;
 
 pub use daku_client::{identity, persistence};
 
 use gpui::{
-    App, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, point, px, size,
+    App, AppContext as _, Application, Bounds, KeyBinding, Menu, MenuItem,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, px, size,
 };
 
 use crate::app::Daku;
@@ -68,11 +66,11 @@ pub fn run() {
     };
 
     gpui_platform::application()
-        .with_assets(crate::assets::Assets)
+        .with_assets(gpui_component_assets::Assets)
         .with_main_window_reopen()
         .run(move |cx: &mut App| {
             cx.set_app_identity(APP_ID, APP_NAME);
-            crate::theme::init(cx);
+            gpui_component::init(cx);
             crate::platform::init_reduce_motion(cx);
 
             let updater = crate::updater::Updater::init();
@@ -99,19 +97,10 @@ pub fn run() {
             let window = cx
                 .open_window(
                     WindowOptions {
-                        titlebar: Some(TitlebarOptions {
-                            title: Some(APP_NAME.into()),
-                            appears_transparent: cfg!(target_os = "macos"),
-                            traffic_light_position: cfg!(target_os = "macos")
-                                .then(|| point(px(16.0), px(17.0))),
-                        }),
+                        titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                         is_movable: true,
                         app_owns_titlebar_drag: cfg!(target_os = "macos"),
-                        window_background: if cfg!(target_os = "macos") {
-                            WindowBackgroundAppearance::Blurred
-                        } else {
-                            WindowBackgroundAppearance::Opaque
-                        },
+                        window_background: WindowBackgroundAppearance::Opaque,
                         app_id: Some(APP_ID.to_owned()),
                         window_bounds: Some(window_bounds),
                         display_id: None,
@@ -120,17 +109,20 @@ pub fn run() {
                     },
                     move |window, cx| {
                         crate::platform::configure_main_window_close_behavior(window, cx);
-                        Daku::new(window, cx, daemon)
+                        window
+                            .observe_window_appearance(|window, cx| {
+                                gpui_component::Theme::sync_system_appearance(Some(window), cx);
+                            })
+                            .detach();
+                        let view = Daku::new(window, cx, daemon);
+                        cx.new(|cx| gpui_component::Root::new(view, window, cx))
                     },
                 )
                 .expect("failed to open daku window");
 
             window
                 .update(cx, |_, window, cx| {
-                    crate::platform::configure_sidebar_material(
-                        window,
-                        crate::theme::Theme::current(cx).is_dark,
-                    );
+                    gpui_component::Theme::sync_system_appearance(Some(window), cx);
                     cx.activate(true);
                 })
                 .ok();

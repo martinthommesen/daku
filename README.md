@@ -27,11 +27,27 @@ cargo check --workspace
 bun install  # optional: Bun scripts / lint
 ```
 
-The first `cargo` build clones the pinned zed repository for GPUI (~0.5 GB,
-several minutes); later builds reuse it. `bun install` is only needed for the
-Bun scripts.
+The first `cargo` build clones the pinned zed repository for GPUI (~0.5 GB) and
+compiles GPUI + gpui-component — expect several minutes; later builds reuse it.
+`bun install` is only needed for the Bun scripts.
 
-GPUI is pinned by `rev` in `Cargo.toml` (both `gpui` and `gpui_platform`); bump both together and run `bun run check`. Do not run `cargo update` casually — it re-resolves every zed crate.
+The shell is built on [gpui-component](https://github.com/longbridge/gpui-component)
+(ADR-0008), which depends on `gpui = { git = zed }` with no `rev`. Cargo treats
+`git+zed?rev=X` and `git+zed` as different sources, so **`gpui`/`gpui_platform`
+carry no `rev`** — the zed commit is pinned in `Cargo.lock` only, while
+`gpui-component`/`gpui-component-assets` are pinned by `rev` in `Cargo.toml`.
+Bump both together:
+
+```sh
+cargo update -p gpui-component --precise <rev>
+cargo update -p gpui-component-assets --precise <rev>
+cargo update -p gpui --precise <zed sha from gpui-component's Cargo.lock at that rev>
+```
+
+Then run `bun run check` and launch the fixture. Do not run `cargo update`
+casually — it re-resolves every zed crate. Feature unification through
+gpui-component enables `profiler` on `gpui` and `runtime_shaders` on
+`gpui_platform`.
 
 Daemon Hello auth uses env **`DAKU_DAEMON_TOKEN`**. Operator data/config lives under **`~/.daku/`** (directory `0700`, SQLite `app.db` `0600`). Override the DB path with **`DAKU_DB_PATH`**.
 
