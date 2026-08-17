@@ -20,6 +20,10 @@ pub const SYS_PLUGINS_PATH: &str =
     "/api/now/table/sys_plugins?sysparm_fields=id,version,active&sysparm_limit=1000";
 pub const SYS_STORE_APP_PATH: &str = "/api/now/table/sys_store_app?sysparm_fields=scope,id,version,latest_version,active&sysparm_limit=1000";
 
+/// Plugin/store-app inventories change on the order of days; refetch this
+/// often. Builds are still compared every tick via the availability snapshot.
+pub const INVENTORY_REFRESH_SECS: i64 = 30 * 60;
+
 pub fn drift_state(build_matches: bool, mismatches: u64) -> &'static str {
     if build_matches && mismatches == 0 {
         "healthy"
@@ -34,12 +38,21 @@ struct EnvInventory {
     truncated: bool,
 }
 
+#[derive(Clone)]
+struct CachedInventory {
+    fetched_at: i64,
+    plugins: Vec<PluginRecord>,
+    truncated: bool,
+}
+
 pub struct DriftCollector {
     environments: Vec<EnvironmentConfig>,
     credentials: Arc<dyn CredentialStore>,
     client: Arc<ServiceNowClient>,
     store: StateStore,
     poll_interval: Duration,
+    /// Last successful plugin/store-app fetch per Environment id.
+    inventories: std::sync::Mutex<HashMap<String, CachedInventory>>,
 }
 
 impl DriftCollector {
@@ -56,6 +69,96 @@ impl DriftCollector {
             client: client.into(),
             store,
             poll_interval,
+            inventories: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn env_inventory(
+        &self,
+        environment: &EnvironmentConfig,
+        connection: &Connection,
+        observed_at: i64,
+        max_age_secs: i64,
+    ) -> anyhow::Result<EnvInventory> {
+        let cached = self
+            .inventories
+            .lock()
+            .expect("drift inventory cache")
+            .get(&environment.id)
+            .filter(|entry| observed_at.saturating_sub(entry.fetched_at) <= INVENTORY_REFRESH_SECS)
+            .cloned();
+        let (plugins, truncated) = match cached {
+            Some(entry) => (entry.plugins, entry.truncated),
+            None => {
+                let (plugins, plugins_truncated) = fetch_plugin_page(
+                    &self.client,
+                    environment,
+                    self.credentials.as_ref(),
+                    SYS_PLUGINS_PATH,
+                )?;
+                let (store_apps, store_truncated) = fetch_plugin_page(
+                    &self.client,
+                    environment,
+                    self.credentials.as_ref(),
+                    SYS_STORE_APP_PATH,
+                )?;
+                let mut combined = plugins;
+                combined.extend(store_apps);
+                let truncated = plugins_truncated || store_truncated;
+                self.inventories
+                    .lock()
+                    .expect("drift inventory cache")
+                    .insert(
+                        environment.id.clone(),
+                        CachedInventory {
+                            fetched_at: observed_at,
+                            plugins: combined.clone(),
+                            truncated,
+                        },
+                    );
+                (combined, truncated)
+            }
+        };
+        Ok(EnvInventory {
+            build: fetch_build(
+                &self.client,
+                environment,
+                self.credentials.as_ref(),
+                connection,
+                observed_at,
+                max_age_secs,
+            )?,
+            plugins,
+            truncated,
+        })
+    }
+
+    fn collect_other(
+        &self,
+        connection: &Connection,
+        environment: &EnvironmentConfig,
+        observed_at: i64,
+        max_age_secs: i64,
+        source: Option<&EnvInventory>,
+    ) -> anyhow::Result<()> {
+        let Some(source) = source else {
+            return persist_drift_down(
+                connection,
+                &environment.id,
+                "clone source unreachable",
+                observed_at,
+            )
+            .map_err(anyhow::Error::from);
+        };
+        match self.env_inventory(environment, connection, observed_at, max_age_secs) {
+            Ok(other) => {
+                persist_drift_compare(connection, &environment.id, source, &other, observed_at)
+                    .map_err(anyhow::Error::from)
+            }
+            Err(error) => {
+                persist_drift_down(connection, &environment.id, &error.to_string(), observed_at)
+                    .map_err(anyhow::Error::from)
+            }
         }
     }
 }
@@ -78,14 +181,7 @@ impl SignalCollector for DriftCollector {
             return persist_all_skipped(&connection, &self.environments, observed_at);
         }
         let max_age_secs = (self.poll_interval.as_secs() as i64).saturating_mul(2);
-        let source_inventory = fetch_env_inventory(
-            &self.client,
-            source,
-            self.credentials.as_ref(),
-            &connection,
-            observed_at,
-            max_age_secs,
-        );
+        let source_inventory = self.env_inventory(source, &connection, observed_at, max_age_secs);
         let mut first_error = None;
         let source_inventory = match source_inventory {
             Ok(inventory) => {
@@ -107,11 +203,9 @@ impl SignalCollector for DriftCollector {
             if environment.id == source.id {
                 continue;
             }
-            if let Err(error) = collect_other(
+            if let Err(error) = self.collect_other(
                 &connection,
-                &self.client,
                 environment,
-                self.credentials.as_ref(),
                 observed_at,
                 max_age_secs,
                 source_inventory.as_ref(),
@@ -124,71 +218,6 @@ impl SignalCollector for DriftCollector {
             None => Ok(()),
         }
     }
-}
-
-fn collect_other(
-    connection: &Connection,
-    client: &ServiceNowClient,
-    environment: &EnvironmentConfig,
-    credentials: &dyn CredentialStore,
-    observed_at: i64,
-    max_age_secs: i64,
-    source: Option<&EnvInventory>,
-) -> anyhow::Result<()> {
-    let Some(source) = source else {
-        return persist_drift_down(
-            connection,
-            &environment.id,
-            "clone source unreachable",
-            observed_at,
-        )
-        .map_err(anyhow::Error::from);
-    };
-    match fetch_env_inventory(
-        client,
-        environment,
-        credentials,
-        connection,
-        observed_at,
-        max_age_secs,
-    ) {
-        Ok(other) => {
-            persist_drift_compare(connection, &environment.id, source, &other, observed_at)
-                .map_err(anyhow::Error::from)
-        }
-        Err(error) => {
-            persist_drift_down(connection, &environment.id, &error.to_string(), observed_at)
-                .map_err(anyhow::Error::from)
-        }
-    }
-}
-
-fn fetch_env_inventory(
-    client: &ServiceNowClient,
-    environment: &EnvironmentConfig,
-    credentials: &dyn CredentialStore,
-    connection: &Connection,
-    observed_at: i64,
-    max_age_secs: i64,
-) -> anyhow::Result<EnvInventory> {
-    let (plugins, plugins_truncated) =
-        fetch_plugin_page(client, environment, credentials, SYS_PLUGINS_PATH)?;
-    let (store_apps, store_truncated) =
-        fetch_plugin_page(client, environment, credentials, SYS_STORE_APP_PATH)?;
-    let mut combined = plugins;
-    combined.extend(store_apps);
-    Ok(EnvInventory {
-        build: fetch_build(
-            client,
-            environment,
-            credentials,
-            connection,
-            observed_at,
-            max_age_secs,
-        )?,
-        plugins: combined,
-        truncated: plugins_truncated || store_truncated,
-    })
 }
 
 fn fetch_plugin_page(
@@ -788,6 +817,187 @@ mod tests {
             .unwrap()
             .expect("snapshot");
         assert_eq!(row.state, "healthy");
+        let _ = std::fs::remove_file(path);
+    }
+
+    struct CountingTransport {
+        inner: DriftTransport,
+        plugin_requests: Arc<std::sync::atomic::AtomicUsize>,
+        /// Statuses to return for the non-source plugin page, one per call.
+        test_plugin_statuses: std::sync::Mutex<Vec<u16>>,
+    }
+
+    impl CountingTransport {
+        fn new(
+            source_plugins: &'static str,
+            other_plugins: &'static str,
+            test_plugin_statuses: Vec<u16>,
+        ) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let plugin_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    inner: DriftTransport {
+                        source_plugins,
+                        other_plugins,
+                        store_apps: include_str!("../tests/fixtures/drift/store_apps_empty.json"),
+                        build: include_str!("../tests/fixtures/availability/ok.json"),
+                    },
+                    plugin_requests: Arc::clone(&plugin_requests),
+                    test_plugin_statuses: std::sync::Mutex::new(test_plugin_statuses),
+                },
+                plugin_requests,
+            )
+        }
+    }
+
+    impl HttpTransport for CountingTransport {
+        fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+            if request.url.contains("/api/now/table/sys_plugins")
+                || request.url.contains("/api/now/table/sys_store_app")
+            {
+                self.plugin_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if request.url.contains("/api/now/table/sys_plugins")
+                    && !request.url.contains("acme-prod")
+                {
+                    let status = {
+                        let mut statuses = self.test_plugin_statuses.lock().unwrap();
+                        if statuses.is_empty() {
+                            200
+                        } else {
+                            statuses.remove(0)
+                        }
+                    };
+                    if status != 200 {
+                        return Ok(HttpResponse {
+                            status,
+                            headers: vec![("content-type".into(), "application/json".into())],
+                            body: String::new(),
+                        });
+                    }
+                }
+            }
+            self.inner.execute(request)
+        }
+    }
+
+    fn counting_collector(
+        path: &std::path::Path,
+        source_plugins: &'static str,
+        other_plugins: &'static str,
+        test_plugin_statuses: Vec<u16>,
+    ) -> (DriftCollector, Arc<std::sync::atomic::AtomicUsize>) {
+        let _ = std::fs::remove_file(path);
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
+        credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
+        let (transport, plugin_requests) =
+            CountingTransport::new(source_plugins, other_plugins, test_plugin_statuses);
+        let collector = DriftCollector::new(
+            vec![
+                env("prod", "acme-prod", true),
+                env("test", "acme-test", false),
+            ],
+            credentials,
+            ServiceNowClient::new(transport, SystemClock),
+            StateStore::daemon(path.to_path_buf()),
+            Duration::from_secs(120),
+        );
+        (collector, plugin_requests)
+    }
+
+    fn mismatches(path: &std::path::Path, environment_id: &str) -> serde_json::Value {
+        let connection = StateStore::daemon(path.to_path_buf()).open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, environment_id, DRIFT_SIGNAL_ID)
+            .unwrap()
+            .expect("snapshot");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        serde_json::json!({ "state": row.state, "mismatches": payload["mismatches"] })
+    }
+
+    #[test]
+    fn drift_signal_reuses_inventory_within_refresh_window() {
+        let path =
+            std::env::temp_dir().join(format!("daku-drift-cache-{}.db", uuid::Uuid::new_v4()));
+        let (collector, plugin_requests) = counting_collector(
+            &path,
+            include_str!("../tests/fixtures/drift/plugins_a.json"),
+            include_str!("../tests/fixtures/drift/plugins_a_v2.json"),
+            vec![],
+        );
+        collector.collect().unwrap();
+        assert_eq!(
+            plugin_requests.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "cold cache: 2 pages x 2 environments"
+        );
+        assert_eq!(mismatches(&path, "test")["mismatches"], 1);
+
+        collector.collect().unwrap();
+        assert_eq!(
+            plugin_requests.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "second tick must reuse the cached inventories"
+        );
+        assert_eq!(mismatches(&path, "test")["mismatches"], 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn drift_signal_refetches_inventory_after_refresh_window() {
+        let path =
+            std::env::temp_dir().join(format!("daku-drift-stale-{}.db", uuid::Uuid::new_v4()));
+        let (collector, plugin_requests) = counting_collector(
+            &path,
+            include_str!("../tests/fixtures/drift/plugins_a.json"),
+            include_str!("../tests/fixtures/drift/plugins_a_v2.json"),
+            vec![],
+        );
+        collector.collect().unwrap();
+        assert_eq!(plugin_requests.load(std::sync::atomic::Ordering::SeqCst), 4);
+
+        collector
+            .inventories
+            .lock()
+            .unwrap()
+            .values_mut()
+            .for_each(|entry| entry.fetched_at -= INVENTORY_REFRESH_SECS + 1);
+
+        collector.collect().unwrap();
+        assert_eq!(
+            plugin_requests.load(std::sync::atomic::Ordering::SeqCst),
+            8,
+            "stale cache must refetch both environments"
+        );
+        assert_eq!(mismatches(&path, "test")["mismatches"], 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn drift_signal_failed_inventory_is_not_cached() {
+        let path =
+            std::env::temp_dir().join(format!("daku-drift-retry-{}.db", uuid::Uuid::new_v4()));
+        let (collector, plugin_requests) = counting_collector(
+            &path,
+            include_str!("../tests/fixtures/drift/plugins_a.json"),
+            include_str!("../tests/fixtures/drift/plugins_a.json"),
+            vec![500],
+        );
+        // Tick 1: prod fetches both pages (2), test's sys_plugins 500s and bails (1).
+        collector.collect().unwrap();
+        assert_eq!(plugin_requests.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(mismatches(&path, "test")["state"], "down");
+
+        // Tick 2: prod is cached (0), test retries both pages (2).
+        collector.collect().unwrap();
+        assert_eq!(
+            plugin_requests.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "a failed fetch must not be cached"
+        );
+        let snapshot = mismatches(&path, "test");
+        assert_eq!(snapshot["state"], "healthy");
+        assert_eq!(snapshot["mismatches"], 0);
         let _ = std::fs::remove_file(path);
     }
 }
