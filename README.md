@@ -23,6 +23,8 @@ bun install
 cargo check -p daku -p daku-core -p daku-daemon -p daku-protocol -p daku-client
 ```
 
+GPUI is pinned by `rev` in `Cargo.toml` (both `gpui` and `gpui_platform`); bump both together and run `bun run check`. Do not run `cargo update` casually — it re-resolves every zed crate.
+
 Daemon Hello auth uses env **`DAKU_DAEMON_TOKEN`**. Operator data/config lives under **`~/.daku/`** (directory `0700`, SQLite `app.db` `0600`). Override the DB path with **`DAKU_DB_PATH`**.
 
 **Attaching to a daemon you run yourself:** start `DAKU_DAEMON_TOKEN=<token> daku-daemon --bind 127.0.0.1:<port>` and launch the app with `DAKU_DAEMON_ADDRESS=127.0.0.1:<port> DAKU_DAEMON_TOKEN=<token>`. Both variables must be set together. Non-loopback binds need `--allow-non-loopback` and are outside the v1 support envelope — see [`docs/research/hosted-daemon.md`](docs/research/hosted-daemon.md).

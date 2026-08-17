@@ -23,16 +23,15 @@ resolver = "2"
 
 [dependencies]
 anyhow = "1.0"
-dirs = "6.0"
 # Prefer upstream Zed GPUI after browser/WKWebView strip (plan 001).
-gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+# Pinned to the commit Cargo.lock resolved; bump `rev` on both lines
+# together and re-run `bun run check`.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "db7c1d38c8e17e9d4f01c35179c847fcd5bfa09b" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "db7c1d38c8e17e9d4f01c35179c847fcd5bfa09b", features = [
     "font-kit",
 ] }
 libc = "0.2"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.18", features = ["v4", "serde"] }
 daku-client = { path = "crates/daku-client" }
 daku-protocol = { path = "crates/daku-protocol" }
 rust-i18n = "4"
@@ -81,6 +80,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSString",
     "NSURL",
 ] }
+# Not imported directly, but needed to enable `objc2-core-graphics` on
+# objc2-quartz-core (gates CALayer::setBackgroundColor, used in platform.rs).
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "objc2-core-graphics"] }
 raw-window-handle = "0.6"
 
