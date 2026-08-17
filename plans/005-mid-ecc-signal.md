@@ -2,41 +2,30 @@
 
 > **Executor instructions**: Follow this plan step by step. Run every verification command and confirm the expected result before moving to the next step. If anything in the "STOP conditions" section occurs, stop and report — do not improvise. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: confirm plan 003 collector pattern exists. Then `git diff --stat da67ae9..HEAD -- plans/005-mid-ecc-signal.md crates/daku-core`.
+> **Drift check (run first)**: `git diff --stat 567179a..HEAD -- crates/daku-core crates/daku-daemon`
+> Confirm 003 DONE (HTTP client + loop). Prefer 004 DONE for `parse_aggregate_count`; if 004 not merged, copy the same Aggregate parse tests into this crate module and STOP to note duplication for reconcile — do **not** invent a second helper API shape.
 
 ## Status
 
 - **Priority**: P2
 - **Effort**: M
 - **Risk**: MED
-- **Depends on**: plans/003-availability-signal.md
+- **Depends on**: plans/003-availability-signal.md (soft: 004 for `parse_aggregate_count`)
 - **Category**: direction
-- **Planned at**: commit `da67ae9`, 2026-08-17
+- **Planned at**: commit `567179a`, 2026-08-17
 - **Issue**: https://github.com/martinthommesen/daku/issues/21
 
 ## Why this matters
 
-Dead MID Servers and ECC backlog are a named v1 pain (spec Signal #3). One Signal covers both `ecc_agent` health and `ecc_queue` backlog so the Environment detail shows a single MID/ECC card. Empty MID lists on a baseline PDI must be **healthy** (research), not an alarm.
+Dead MID Servers and ECC backlog are v1 Signal #3. Empty MID lists on a baseline PDI are **healthy** (research).
 
 ## Current state
 
-- Plan 003/004 collector + fixture patterns.
-- Research — [servicenow-signals](https://github.com/martinthommesen/daku/blob/research/servicenow-signals/docs/research/servicenow-signals.md):
-
-  **MID (`ecc_agent`)** Table API fields: `status` (Up/Down/Paused/Upgrading), `validated`, `version`, `host_name`. Unhealthy if any row has `status≠Up` or `validated≠true` (treat boolean/`true` string consistently in parser).
-
-  Optional (v1 nice-to-have, do not block): `ecc_agent_issue` count — skip unless trivial.
-
-  **ECC queue** Aggregate API on `ecc_queue`:
-
-  - Backlog: `queue=output^state=ready` count (+ optional oldest age later)
-  - Errors: `state=error` count
-  - Constrain by date (default retention ~7 days) — e.g. `sys_created_on>javascript:gs.daysAgoStart(7)`
-
-  Roles: `mid_server` or admin. Baseline PDI: zero MIDs → OK.
-
-- Spec: point-in-time (no 24h ring required for this Signal).
-- CONTEXT.md: one **Signal** named observation — use `signal_id = "mid_ecc"`.
+- Research ([servicenow-signals](https://github.com/martinthommesen/daku/blob/research/servicenow-signals/docs/research/servicenow-signals.md)):
+  - **MID:** Table API `ecc_agent` fields `status`, `validated`, `version`, `host_name`. Unhealthy if `status≠Up` or `validated` is not true.
+  - **ECC:** Aggregate `ecc_queue`: `queue=output^state=ready` count; `state=error` count; date-bound (~7 days).
+- Point-in-time Signal (no samples required).
+- `signal_id = "mid_ecc"`. Soft ceiling: `ECC_READY_DEGRADED_AT = 100` (named constant).
 
 ## Commands you will need
 
@@ -45,44 +34,23 @@ Dead MID Servers and ECC backlog are a named v1 pain (spec Signal #3). One Signa
 | Tests | `cargo test -p daku-core mid_ecc` | all pass |
 | Check | `cargo check -p daku-core -p daku-daemon` | exit 0 |
 
-## Suggested executor toolkit
-
-- Mirror jobs/syslog collector module from 004 if present; else availability from 003.
-- Research note rows for MID Server status + ECC queue backlog.
-
 ## Scope
 
 **In scope**
 
-- Collector producing `signal_id = "mid_ecc"`:
-  - Fetch `ecc_agent` list (limit reasonable, e.g. 200) with fields above.
-  - Aggregate counts for ready backlog + error on `ecc_queue`.
-  - Payload JSON example shape (field names stable for UI later):
+- Collector registered on 003 loop; payload:
 
-    ```json
-    {
-      "agents_total": 0,
-      "agents_unhealthy": 0,
-      "ecc_output_ready": 0,
-      "ecc_error": 0
-    }
-    ```
+  ```json
+  { "agents_total": 0, "agents_unhealthy": 0, "ecc_output_ready": 0, "ecc_error": 0 }
+  ```
 
-  - State mapping (hard-coded):
-    - `healthy`: agents_unhealthy=0 AND ecc_error=0 AND ecc_output_ready below soft ceiling (default **100** — constant `ECC_READY_DEGRADED_AT`; document in code)
-    - `degraded`: any unhealthy agent, any ecc_error>0, or ready backlog ≥ ceiling
-    - probe/auth failure → unreachable handling from 003 (do not mark “no MIDs” as failure)
-  - Empty `ecc_agent` result → agents_total=0, healthy (unless probe failed).
-- Fixtures: `crates/daku-core/tests/fixtures/mid_ecc/` — agents all Up; one Down; empty agents; ecc ready high; ecc errors; 403.
-- Snapshot only (`signal_snapshots`); **do not** require `signal_samples` for this Signal.
-- Daemon one-shot/poll wiring consistent with other collectors.
+- State: `healthy` if unhealthy=0, ecc_error=0, ready < 100; else `degraded`. Probe failure → 003 unreachable path. Empty agents → healthy.
+- Fixtures under `tests/fixtures/mid_ecc/`.
+- Snapshot only (no `signal_samples`).
 
 **Out of scope**
 
-- Parsing `ecc_agent_status` CPU/mem (dashboard extras).
-- Discovery Admin Workspace roles beyond what Table API already allows.
-- GPUI (009).
-- Inventing hostnames in fixtures — use `"mid-host-a.example.com"` style fakes only if a hostname field is needed.
+- `ecc_agent_issue`, `ecc_agent_status` CPU/mem, Discovery workspace roles, private poll timers, GPUI.
 
 ## Git workflow
 
@@ -91,47 +59,40 @@ Dead MID Servers and ECC backlog are a named v1 pain (spec Signal #3). One Signa
 
 ## Steps
 
-### Step 1: Parse agent list + classify unhealthy
+### Step 1: Classify agents
 
 **Verify**: `cargo test -p daku-core classify_mid_agents` → empty=ok; Down=unhealthy; validated false=unhealthy.
 
-### Step 2: Parse ECC aggregate counts
+### Step 2: ECC counts via Aggregate helper
 
-**Verify**: `cargo test -p daku-core parse_ecc_queue_counts` → pass.
+**Verify**: `cargo test -p daku-core mid_ecc` (includes queue parse) → pass.
 
-### Step 3: Combine → snapshot
+### Step 3: Snapshot + register on loop
 
-**Verify**: `cargo test -p daku-core mid_ecc_signal` → state matrix covered.
-
-### Step 4: HTTP + daemon wire
-
-Injectable client; encoded queries copied from research comments.
-
-**Verify**: `cargo test -p daku-core mid_ecc` all pass; `cargo check` exit 0.
+**Verify**: `cargo test -p daku-core mid_ecc_signal` → state matrix; `rg -n 'interval|tokio::time' crates/daku-core/src/*mid*` → no private timer; `cargo check -p daku-core -p daku-daemon` → exit 0.
 
 ## Test plan
 
 | Case | Expected |
 |------|----------|
 | empty agents, zero queue | healthy |
-| one Down agent | degraded |
+| one Down | degraded |
 | ecc_error > 0 | degraded |
 | ready ≥ 100 | degraded |
-| 403 | unreachable / probe failure path |
 
 ## Done criteria
 
-- [ ] Fixture tests green, no network
-- [ ] `signal_id` is exactly `mid_ecc`
-- [ ] Empty MID list is healthy
-- [ ] `plans/README.md` row 005 → `done`
+- [ ] `cargo test -p daku-core mid_ecc` exit 0
+- [ ] `rg -n 'mid_ecc' crates/daku-core` → ≥1 hit
+- [ ] No private poll timer in MID module
+- [ ] `plans/README.md` row 005 Status = `DONE`
 
 ## STOP conditions
 
-- Table `ecc_agent` / `ecc_queue` 403 on Operator smoke with monitoring account that has `mid_server` — stop; do not scrape HTML dashboards as a workaround.
-- Field names for `validated`/`status` differ on live instance — stop and update fixtures only after confirming against research + one Operator query (now-sdk), do not guess alternate tables.
+- `ecc_agent` / `ecc_queue` 403 with `mid_server` account — STOP; no HTML scraping.
+- Field names differ on live instance — STOP; confirm via Operator query + research before changing.
 
 ## Maintenance notes
 
-- Plan 008: unhealthy MID → degraded.
-- Reviewers: ensure PDI-empty ≠ alarm; backlog ceiling is a named constant for later tuning.
+- Plan 008: unhealthy MID → Environment degraded.
+- Reviewers: PDI-empty ≠ alarm.

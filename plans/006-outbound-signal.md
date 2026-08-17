@@ -2,35 +2,27 @@
 
 > **Executor instructions**: Follow this plan step by step. Run every verification command and confirm the expected result before moving to the next step. If anything in the "STOP conditions" section occurs, stop and report — do not improvise. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: confirm plan 003 collector pattern exists. Then `git diff --stat da67ae9..HEAD -- plans/006-outbound-signal.md crates/daku-core`.
+> **Drift check (run first)**: `git diff --stat 567179a..HEAD -- crates/daku-core crates/daku-daemon`
+> Confirm 003 DONE. Reuse `parse_aggregate_count` from 004 (or 005 note); do not invent a parallel helper.
 
 ## Status
 
 - **Priority**: P2
 - **Effort**: M
 - **Risk**: MED
-- **Depends on**: plans/003-availability-signal.md
+- **Depends on**: plans/003-availability-signal.md (soft: 004)
 - **Category**: direction
-- **Planned at**: commit `da67ae9`, 2026-08-17
+- **Planned at**: commit `567179a`, 2026-08-17
 - **Issue**: https://github.com/martinthommesen/daku/issues/21
 
 ## Why this matters
 
-Silent integration failure is an explicit v1 pain (spec Signal #7). Research points at Aggregate counts on outbound HTTP logs plus email send-failures — enough for a glance without parsing Flow Designer deeply in v1.
+Silent integration failure is v1 Signal #7. v1 uses Aggregate counts on outbound HTTP logs only (single table, no optional email fork).
 
 ## Current state
 
-- Collector patterns from 003/004.
-- Research — [servicenow-signals](https://github.com/martinthommesen/daku/blob/research/servicenow-signals/docs/research/servicenow-signals.md) row “Integration / outbound errors”:
-
-  **Primary:** Aggregate on `sys_outbound_http_log` for recent non-success HTTP statuses, e.g. count where `http_status>=400` and `sys_created_on>javascript:gs.hoursAgoStart(1)` (table name from developer blog / research — do not invent another log table).
-
-  **Secondary (include if Aggregate works on fixtures + optional live smoke):** `sys_email` with `type=send-failed` (and state Error) in the same 1h window — count only.
-
-  **Deferred in this plan (do not implement unless free):** `sys_flow_context` state=ERROR — note in maintenance as follow-up; v1 card can ship with HTTP log + email only.
-
-- Point-in-time Signal (no required 24h ring; optional sample append is OK but not required).
-- CONTEXT.md: `signal_id = "outbound"`.
+- Research: Aggregate on `sys_outbound_http_log` for `http_status>=400` with `sys_created_on>javascript:gs.hoursAgoStart(1)`.
+- `signal_id = "outbound"`. Point-in-time. Register on 003 loop.
 
 ## Commands you will need
 
@@ -39,87 +31,53 @@ Silent integration failure is an explicit v1 pain (spec Signal #7). Research poi
 | Tests | `cargo test -p daku-core outbound` | all pass |
 | Check | `cargo check -p daku-core -p daku-daemon` | exit 0 |
 
-## Suggested executor toolkit
-
-- Same HTTP Aggregate helper as jobs/syslog (004) if already landed; otherwise implement a shared `aggregate_count(table, query)` helper here and leave a note for 004 to reuse (prefer not duplicating forever — if 004 not merged yet, put helper in `daku-core` shared module).
-
 ## Scope
 
 **In scope**
 
-- Collector `signal_id = "outbound"`:
-  - Payload:
-
-    ```json
-    {
-      "outbound_http_4xx_5xx_1h": 0,
-      "email_send_failed_1h": 0
-    }
-    ```
-
-  - State:
-    - `healthy` if both counts are 0
-    - `degraded` if either count > 0
-    - probe failure → unreachable path from 003
-  - If `sys_email` Aggregate returns 403 but HTTP log works: store email count as `null` in payload and still produce healthy/degraded from HTTP only; log once at warn. Do **not** fail the whole Signal solely because email ACL is missing.
-- Fixtures under `crates/daku-core/tests/fixtures/outbound/`.
-- Snapshot persistence + daemon wire.
-- Code comment: outbound DB logging properties exist (`glide.outbound_http.db.log` etc.) — Operator may see zeros if logging disabled; document in Operator smoke doc.
+- Collector payload: `{ "outbound_http_4xx_5xx_1h": N }`.
+- State: `healthy` if N=0; `degraded` if N>0; probe failure → 003 path.
+- Fixtures under `tests/fixtures/outbound/`.
+- Snapshot only.
 
 **Out of scope**
 
-- Scraping IntegrationHub UI.
-- Alerting / webhooks.
-- ECC errors (covered by 005).
-- Real hostnames or request URLs that look like customer systems in fixtures — use `https://api.example.com/...` only if a URL field appears in fixtures.
+- `sys_email`, `sys_flow_context`, IntegrationHub UI, ECC errors (005), private timers, GPUI, persisting raw log bodies.
 
 ## Git workflow
 
 - Branch: `plan/006-outbound-signal`
-- Commit example: `Add outbound integration failures Signal`
+- Commit example: `Add outbound HTTP failures Signal`
 
 ## Steps
 
-### Step 1: Fixture Aggregate parsers for outbound + email
+### Step 1: Parse + classify
 
-**Verify**: `cargo test -p daku-core parse_outbound_counts` → pass.
+**Verify**: `cargo test -p daku-core outbound_signal` → zero=healthy; N>0=degraded.
 
-### Step 2: Classifier + snapshot
+### Step 2: HTTP collector + register
 
-**Verify**: `cargo test -p daku-core outbound_signal` → zero=healthy; any>0=degraded.
-
-### Step 3: HTTP collectors + soft email ACL
-
-**Verify**: test where email call returns 403 → snapshot still written from HTTP counts.
-
-### Step 4: Daemon + Operator smoke doc
-
-No real instance hostnames in repo docs.
-
-**Verify**: `rg -n 'dev[0-9]+\\.service-now' docs README.md` → no matches; `cargo check` exit 0.
+**Verify**: `cargo test -p daku-core outbound` → pass; `cargo check -p daku-core -p daku-daemon` → exit 0; no private `interval` in outbound module.
 
 ## Test plan
 
 | Case | Expected |
 |------|----------|
-| both zero | healthy |
-| http failures > 0 | degraded |
-| email failures > 0 | degraded |
-| email 403, http ok | snapshot with email null/omitted; state from http |
+| count 0 | healthy |
+| count > 0 | degraded |
 
 ## Done criteria
 
-- [ ] Fixture tests green, no network
-- [ ] Encoded queries match research tables `sys_outbound_http_log` and `sys_email`
-- [ ] `plans/README.md` row 006 → `done`
+- [ ] `cargo test -p daku-core outbound` exit 0
+- [ ] `rg -n 'sys_outbound_http_log' crates/daku-core` → ≥1 hit
+- [ ] `plans/README.md` row 006 Status = `DONE`
 
 ## STOP conditions
 
-- `sys_outbound_http_log` does not exist / always 404 on Operator’s family — stop; do not invent alternate table names; cite research and ask for a research refresh.
-- Pressure to commit request bodies that contain live credentials from outbound logs — never persist raw log rows in daku DB; counts only.
+- Table missing/404 on Operator family — STOP; no alternate table names without research refresh.
+- Pressure to store outbound response bodies in SQLite — refuse (counts only).
 
 ## Maintenance notes
 
-- Follow-up: `sys_flow_context` ERROR counts.
-- Plan 008: any outbound degraded → Environment degraded.
-- Reviewers: counts only, no log body retention.
+- Deferred (not this plan): email send-failed, flow ERROR counts.
+- Plan 008: outbound degraded → Environment degraded.

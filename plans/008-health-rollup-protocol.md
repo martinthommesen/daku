@@ -2,95 +2,85 @@
 
 > **Executor instructions**: Follow this plan step by step. Run every verification command and confirm the expected result before moving to the next step. If anything in the "STOP conditions" section occurs, stop and report — do not improvise. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: confirm plans 001–003 landed enough that `daku-protocol` / `daku-daemon` / `daku-client` compile. Then `git diff --stat 315f38d..HEAD -- plans/008-health-rollup-protocol.md crates/daku-protocol crates/daku-core crates/daku-daemon`.
+> **Drift check (run first)**: `git diff --stat 567179a..HEAD -- crates/daku-protocol crates/daku-core crates/daku-daemon crates/daku-client`
+> Confirm 003 DONE (snapshots + loop). Missing 004–007 OK (stubs).
 
 ## Status
 
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: MED
-- **Depends on**: plans/003-availability-signal.md (stubs OK for Signals 004–007)
+- **Depends on**: plans/003-availability-signal.md (stubs OK for 004–007)
 - **Category**: direction
-- **Planned at**: commit `315f38d`, 2026-08-17
+- **Planned at**: commit `567179a`, 2026-08-17
 - **Issue**: https://github.com/martinthommesen/daku/issues/22
 
 ## Why this matters
 
-The GPUI shell (plan 009) must not query SQLite itself. Spec keeps the **daemon + versioned protocol + native client** split (ADR-0001/0003). This plan defines Environment health rollup rules and the wire events that push snapshots/health to the client so UI work is not blocked on every Signal collector being finished — missing Signals may be stubbed as `unknown` / omitted.
+GPUI (009) must not open SQLite. Spec keeps daemon + versioned protocol + native client (ADR-0001/0003). This plan defines Environment health (exactly three values) and wire events, including **trend samples** for jobs/syslog so 009 can render ~24h sparklines.
 
 ## Current state
 
-- After plan 001: crates `daku-protocol`, `daku-client`, `daku-daemon`, `daku-core` exist (renamed from waku); agent domain stripped; Hello handshake retained (research/waku-reuse: `ClientMessage::Hello` → `ServerMessage::Hello | Rejected`).
-- After plan 002–003: SQLite has `signal_snapshots` (+ samples); availability (and later others) write rows.
-- CONTEXT.md **Environment health**: rolled-up **healthy** / **degraded** / **down** from Signals; hard-coded defaults, not Operator alert rules.
-- Spec §5: unreachable → down; overdue job → degraded; asleep is a collector outcome distinct from health (surface in availability payload / reachability, do not silently map asleep to healthy).
-- Plans 004–007 define per-Signal state contributions (cite when present; if a Signal file is not implemented yet, rollup treats missing snapshot as `unknown` and **ignores** it for rollup — do not invent degraded).
+- Hello handshake retained; replace agent payloads.
+- CONTEXT.md **Environment health**: **healthy** | **degraded** | **down** only — no `unknown`.
+- Spec §6 **reachability** outcomes: **reachable** | **unreachable** | **asleep** — **separate fields** from health. Asleep must **not** be folded into health=`degraded`.
+- Spec §5: unreachable → health `down`; overdue job → health `degraded` (via Signal state).
+- `last_clone` is informational (never forces degraded).
 
 ## Commands you will need
 
 | Purpose | Command | Expected on success |
 |---------|---------|---------------------|
+| Rollup tests | `cargo test -p daku-core health_rollup` | all pass |
 | Protocol tests | `cargo test -p daku-protocol` | all pass |
-| Core rollup tests | `cargo test -p daku-core health_rollup` | all pass |
 | Check | `cargo check -p daku-protocol -p daku-core -p daku-daemon -p daku-client` | exit 0 |
-
-## Suggested executor toolkit
-
-- Inventory / waku-reuse notes on protocol envelope (keep Hub/handshake/replay; replace agent Commands/Events).
-- CONTEXT.md vocabulary for type names (`EnvironmentHealth`, `SignalSnapshot`, …).
+| Client decode | `cargo test -p daku-client protocol_dashboard` | all pass (or module name you choose — must exist) |
 
 ## Scope
 
 **In scope**
 
-### 1. Rollup pure function (daku-core)
+### 1. Reachability vs health (required types)
 
 ```text
-rollup(reachability, signal_states[]) -> EnvironmentHealth
+Reachability = reachable | unreachable | asleep
+EnvironmentHealth = healthy | degraded | down   // exactly these three
 ```
 
-Hard-coded rules (document in `crates/daku-core/src/health.rs` or similar):
+Rollup rules (pure function + table tests):
 
-| Condition | Environment health |
-|-----------|-------------------|
-| reachability = unreachable | `down` |
-| reachability = asleep | `degraded` (Environment not usable; distinct from Signal failures) **or** a dedicated UI flag — prefer health=`degraded` + availability payload still says asleep |
-| any Signal state = `down` (if used) or availability implies unreachable already handled | `down` |
-| any present Signal state = `degraded` | `degraded` |
-| all present Signals `healthy` (and reachable) | `healthy` |
-| no Signal snapshots yet | `unknown` (or `healthy` with `stale: true` — prefer explicit `unknown` in protocol so UI can show “—” / muted dot) |
+| Inputs | health | reachability |
+|--------|--------|--------------|
+| probe unreachable | `down` | `unreachable` |
+| probe asleep | rollup(**Signal** states only; if none, `healthy`) — **do not** set health from asleep itself | `asleep` |
+| reachable + any Signal `degraded` | `degraded` | `reachable` |
+| reachable + all present Signals `healthy` | `healthy` | `reachable` |
+| reachable + no snapshots yet | `healthy` | `reachable` |
 
-`last_clone` informational degraded-never (plan 007): if snapshot state is always healthy, it never forces rollup alone.
+Missing Signals are omitted (not degraded). `last_clone` never votes degraded.
 
-### 2. Protocol types (daku-protocol)
+### 2. Protocol (minimum — no optional commands)
 
-Replace agent payloads with daku events/commands (names illustrative — match existing enum style in the crate):
+**Server → client**
 
-- **Server → client events** (minimum):
-  - `EnvironmentsUpdated { environments: Vec<EnvironmentSummary> }` — id, label, platform_id, health, last_observed_at
-  - `SignalSnapshotsUpdated { environment_id, snapshots: Vec<SignalSnapshotDto> }` — signal_id, state, observed_at, payload_json (string or serde_json::Value)
-  - Keep Hello / Rejected / ping machinery from waku envelope
-- **Client → server commands** (minimum):
-  - `SubscribeDashboard` or implicit subscribe after Hello
-  - `SelectEnvironment { id }` (optional if UI filters locally)
-  - `RefreshNow` (optional — triggers one poll cycle)
+- `EnvironmentsUpdated { environments: Vec<EnvironmentSummary> }`  
+  `EnvironmentSummary { id, label, platform_id, health, reachability, last_observed_at }`
+- `SignalSnapshotsUpdated { environment_id, snapshots: Vec<SignalSnapshotDto> }`  
+  `SignalSnapshotDto { signal_id, state, observed_at, payload_json }`
+- `SignalSamplesUpdated { environment_id, signal_id, points: Vec<{ observed_at, value_real }> }`  
+  Emitted for `jobs` and `syslog` only (≤24h window). Empty `points` allowed.
 
-Bump `protocol_version` if the forked constant still says waku’s number — choose a daku starting version (e.g. `1`) and reject mismatches.
+**Client → server:** Hello only for v1 dashboard subscribe (implicit after Hello). **Do not** add `RefreshNow` or `SelectEnvironment` in v1.
 
-### 3. Daemon push path
+Bump/reset `PROTOCOL_VERSION` for daku domain (e.g. start at `1`).
 
-On snapshot write or poll cycle end: recompute rollup per Environment; broadcast events to connected clients. Unit-test with an in-memory hub if waku left test helpers; otherwise test rollup + serialization round-trip only and a thin daemon integration test.
+### 3. Daemon push
 
-### 4. Stubs
-
-If Signals 004–007 are missing, daemon may emit only availability (+ empty others). Rollup must still compile and tests must cover stubbed sets.
+After each collector tick: recompute rollup; broadcast the three event types as needed.
 
 **Out of scope**
 
-- GPUI layout (009).
-- Sparkle (010).
-- Alerting, non-loopback exposure, multi-user auth.
-- Changing poll cadence semantics beyond exposing `RefreshNow`.
+- Fourth health value; RefreshNow/SelectEnvironment; GPUI layout; Sparkle; SQLite from UI.
 
 ## Git workflow
 
@@ -99,55 +89,50 @@ If Signals 004–007 are missing, daemon may emit only availability (+ empty oth
 
 ## Steps
 
-### Step 1: Rollup unit tests first
+### Step 1: Rollup unit tests
 
-Table-driven cases: unreachable→down; asleep→degraded; one degraded Signal→degraded; all healthy→healthy; empty→unknown.
+Include explicit case: **asleep + no degraded Signals → health healthy (or last signal rollup), reachability asleep** — not health degraded.
 
-**Verify**: `cargo test -p daku-core health_rollup` → pass.
+**Verify**: `cargo test -p daku-core health_rollup` → pass; `rg -n 'asleep' crates/daku-core` → tests assert health ≠ degraded solely due to asleep.
 
-### Step 2: Protocol DTOs + serde round-trip
+### Step 2: Protocol DTOs + round-trip
 
-Add types; remove leftover agent message variants if any remain after 001.
+**Verify**: `cargo test -p daku-protocol` → pass; `rg -n 'EnvironmentHealth|Reachability|SignalSamplesUpdated' crates/daku-protocol` → ≥1 hit each; `rg -n 'RefreshNow|SelectEnvironment' crates/daku-protocol` → no matches.
 
-**Verify**: `cargo test -p daku-protocol` → pass; `rg -n 'Agent|SessionTool|waku' crates/daku-protocol/src` → no agent domain leftovers (allow historical comments sparingly).
+### Step 3: Daemon broadcast after tick
 
-### Step 3: Daemon broadcast hook
+**Verify**: integration or hub test receives `EnvironmentsUpdated` after fixture tick; `cargo check -p daku-daemon` exit 0.
 
-After availability (or full) poll, emit `EnvironmentsUpdated` + `SignalSnapshotsUpdated`.
+### Step 4: Client decode
 
-**Verify**: integration or hub test with fake client receives both after a fixture poll; `cargo check -p daku-daemon` exit 0.
-
-### Step 4: Client decode smoke
-
-`daku-client` can deserialize the new events (compile-time + one decode test).
-
-**Verify**: `cargo test -p daku-client` → pass (or `cargo check -p daku-client` if tests thin).
+**Verify**: `cargo test -p daku-client protocol_dashboard` → pass (deserialize EnvironmentsUpdated + SignalSamplesUpdated).
 
 ## Test plan
 
 | Case | Expected |
 |------|----------|
-| unreachable | health down |
-| jobs degraded only | health degraded |
-| only last_clone healthy | health healthy |
-| no snapshots | health unknown |
-| serde Hello + EnvironmentsUpdated | round-trip |
+| unreachable | health down, reachability unreachable |
+| asleep, signals healthy | health healthy, reachability asleep |
+| jobs degraded | health degraded, reachability reachable |
+| samples event | points length matches DB window in fixture |
 
 ## Done criteria
 
-- [ ] Rollup rules implemented and tested
-- [ ] Protocol events named for Environments/Signals (not agents)
-- [ ] Daemon can push updates after a poll
-- [ ] `plans/README.md` row 008 → `done`
+- [ ] `cargo test -p daku-core health_rollup` exit 0
+- [ ] `cargo test -p daku-protocol` exit 0
+- [ ] `cargo check -p daku-protocol -p daku-core -p daku-daemon -p daku-client` exit 0
+- [ ] `rg -n 'enum EnvironmentHealth|EnvironmentHealth::' crates/daku-core crates/daku-protocol` → only healthy/degraded/down variants (no `Unknown`)
+- [ ] `rg -n 'asleep' crates/daku-core` → rollup test proves asleep ↛ degraded
+- [ ] `rg -n 'SignalSamplesUpdated' crates/daku-protocol` → ≥1 hit
+- [ ] `plans/README.md` row 008 Status = `DONE`
 
 ## STOP conditions
 
-- Plan 001 left protocol uncompilable — stop; do not redesign the envelope; fix compile or return to 001.
-- Temptation to let GPUI open SQLite directly — refuse; keep daemon as source of truth.
-- Changing Hello auth to remove local shared secret entirely — out of scope; keep loopback + env-based daemon auth from 002.
+- Plan 001 protocol uncompilable — STOP.
+- Urge to open SQLite from the UI process — refuse.
+- Urge to map asleep → health degraded — refuse (spec §6).
 
 ## Maintenance notes
 
-- Plan 009 consumes these events only.
-- When 004–007 land, ensure each collector calls the same “snapshots changed” hook.
-- Reviewers: asleep vs unreachable vs degraded Signal must remain distinguishable in payloads even if rollup collapses some to degraded/down.
+- Plan 009: health dots use `health`; header badge uses `reachability`; sparklines use `SignalSamplesUpdated`.
+- Reviewers: three health values only; asleep distinct.

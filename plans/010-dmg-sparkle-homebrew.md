@@ -2,159 +2,127 @@
 
 > **Executor instructions**: Follow this plan step by step. Run every verification command and confirm the expected result before moving to the next step. If anything in the "STOP conditions" section occurs, stop and report — do not improvise. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: confirm plan 009 GPUI app launches via the repo’s documented dev script. Then `git diff --stat d912bbb..HEAD -- plans/010-dmg-sparkle-homebrew.md scripts/ src/updater.rs resources/`.
+> **Drift check (run first)**: `git diff --stat 567179a..HEAD -- scripts resources src/updater.rs docs/packaging.md README.md`
+> Confirm 009 DONE (`cargo check -p daku`). On mismatch, STOP.
 
 ## Status
 
 - **Priority**: P3
 - **Effort**: L
-- **Risk**: HIGH (signing/notary depends on Operator Apple account)
+- **Risk**: HIGH
 - **Depends on**: plans/009-gpui-shell-variant-c.md
 - **Category**: direction
-- **Planned at**: commit `d912bbb`, 2026-08-17
+- **Planned at**: commit `567179a`, 2026-08-17
 - **Issue**: https://github.com/martinthommesen/daku/issues/23
 
 ## Why this matters
 
-ADR-0006: v1 ships as a notarised macOS `.app` / DMG with Sparkle auto-updates; Homebrew cask is the alternate channel with Sparkle disabled so channels do not fight. Without packaging, the Operator cannot hand a colleague a build (intentional GPL distribution). This plan adapts waku’s `scripts/bundle.sh` / release / appcast path to **daku** branding — it does not invent a new updater stack.
+ADR-0006: notarised `.app` / DMG + Sparkle primary; Homebrew cask alternate with Sparkle disabled. Adapts waku packaging scripts — no new updater stack.
 
 ## Current state
 
-- ADR-0006 + spec §9.
-- After plan 001: waku scripts may already be renamed (`scripts/bundle.sh`, optional `release.ts`, `appcast.ts`, `src/updater.rs`, Sparkle bits under `resources/`). Inventory: [waku-fork-inventory](https://github.com/martinthommesen/daku/blob/research/waku-fork-inventory/docs/research/waku-fork-inventory.md) lists these as packaging (not day-1).
-- macOS-only (ADR-0001); Linux `bundle-linux.sh` stays out of scope / deleted if still present.
-- Licence GPL-3.0-only; public GitHub is the source of truth for corresponding source.
-- **Secrets never in git**: Developer ID certs, notary credentials, Sparkle Ed25519 private key, Apple ID app-specific passwords — Operator machine / CI secrets store only. Plans and issues name **variable names**, never values.
+- After 001, expect some of: `scripts/bundle.sh`, `scripts/release.ts`, `scripts/appcast.ts`, `src/updater.rs`, `resources/*`. Inventory listed these as packaging (not day-1).
+- macOS-only; GPL-3.0-only; secrets never in git.
 
 ## Commands you will need
 
 | Purpose | Command | Expected on success |
 |---------|---------|---------------------|
-| Unsigned local bundle (if script supports) | document exact `bun run` / `./scripts/bundle.sh` flags found in-repo | `.app` produced under `dist/` or documented path |
-| Check updater compile | `cargo check -p daku` with Sparkle feature flags as in-repo | exit 0 |
-| Appcast dry-run | script that builds appcast XML from a **local** DMG path | XML written; no upload required for done |
+| Inventory scripts | `test -f scripts/bundle.sh` | exit 0 (if missing, restore from pin — see Step 1) |
+| Unsigned bundle | `./scripts/bundle.sh --unsigned` **or** the flag printed by `./scripts/bundle.sh --help` that skips codesign — record the exact invocation in `docs/packaging.md` in the same commit | `test -d dist/Daku.app \|\| test -d "dist/daku.app"` (pick one name in Step 2 and match here) |
+| Check updater | `cargo check -p daku` | exit 0 |
+| Cask style | `brew style homebrew/daku.rb` if file + brew exist; else `ruby -c homebrew/daku.rb` | exit 0 |
+| No private keys | `rg -n 'BEGIN .*PRIVATE' scripts resources docs` | no matches |
 
-Exact script names after rename may be `scripts/bundle.sh` targeting `Daku.app` — discover from README and update this plan’s verify lines if they differ (do not invent parallel scripts).
-
-## Suggested executor toolkit
-
-- ADR-0006.
-- If Apple Developer ID / notary profile is missing: generate a **wizard** checklist (`.claude/skills/wizard`) for the Operator — see Appendix A; do not block the *script* work on secrets being present, but STOP before claiming a notarised release is done.
-- Public hygiene: no serial numbers, Team IDs that are personal, or key material in commits. Team ID placeholders like `YOUR_TEAM_ID` in docs are OK.
+If `bundle.sh` has no `--unsigned`, use: `SKIP_CODESIGN=1 ./scripts/bundle.sh` and document that; if neither works, STOP and add a single `--unsigned` flag rather than inventing a second script.
 
 ## Scope
 
 **In scope**
 
-1. **Rebrand bundle identity**
-   - `Info.plist` / icns / bundle id → `com.…daku` (choose a stable id; document it in README). Replace remaining “Waku” user-visible strings in the packaged app.
-   - Output `Daku.app` (or `daku.app` — pick one and stick to it).
-
-2. **`scripts/bundle.sh` (or successor)**
-   - Build release GPUI binary + embed/ship `daku-daemon` next to the app as waku did (discover layout from existing script).
-   - Codesign with Developer ID Application when identity is available.
-   - Produce DMG.
-
-3. **Sparkle (primary channel)**
-   - Keep/adapt `src/updater.rs` feed URL to a daku-owned HTTPS appcast location (GitHub Releases + static appcast is fine).
-   - Adapt `scripts/appcast.ts` / `release.ts` for daku artifact names.
-   - Document that the Sparkle **private** key lives only on the Operator release machine / CI secret store.
-
-4. **Homebrew cask alternate**
-   - Add a cask formula **draft** under `dist/homebrew/` or document a tap PR template (file in-repo is OK) that installs the notarised DMG/app from GitHub Releases.
-   - **Sparkle off or no-op** in cask builds: compile flag / plist / updater early-return when `DAKU_CHANNEL=homebrew` or `#ifdef` / env detected at build time — document the exact switch you implement.
-   - Upgrades for cask users: `brew upgrade --cask daku` (name TBD).
-
-5. **README packaging section**
-   - How to build unsigned for local smoke.
-   - How to cut a signed+notarised release (points at Appendix A wizard for credentials).
-   - How cask differs from Sparkle.
+1. Rebrand plist/icns/scripts → `Daku.app`, bundle id `app.daku`.
+2. `scripts/bundle.sh` produces app + DMG; embed `daku-daemon` as upstream did.
+3. Sparkle via existing `src/updater.rs` + appcast scripts; public appcast URL on GitHub Releases.
+4. Build switch `DAKU_CHANNEL=homebrew` (or Cargo feature `channel-homebrew`) makes updater a no-op — unit/stub test required.
+5. `homebrew/daku.rb` cask draft + `docs/packaging.md`.
+6. Appendix A human checklist for Developer ID / notary / Sparkle private key (no values in repo).
 
 **Out of scope**
 
-- Linux/Windows packages.
-- Mac App Store.
-- Committing any `.p12`, private keys, notary API JSON keys, or app-specific passwords.
-- Changing GPL to a proprietary licence.
+- Linux/Windows; Mac App Store; committing key material; replacing Sparkle without ADR.
 
 ## Git workflow
 
 - Branch: `plan/010-dmg-sparkle-homebrew`
-- Commit example: `Add daku DMG/Sparkle packaging and Homebrew cask notes`
+- Commit example: `Add daku DMG/Sparkle packaging and Homebrew cask draft`
 
 ## Steps
 
-### Step 1: Discover inherited packaging scripts
+### Step 1: Ensure packaging scripts exist
 
-List what plan 001 actually left in `scripts/` and `resources/`. Update README with the real command names.
+```sh
+test -f scripts/bundle.sh || echo MISSING_BUNDLE
+test -f src/updater.rs || echo MISSING_UPDATER
+```
 
-**Verify**: `ls scripts/bundle.sh scripts/release.ts scripts/appcast.ts src/updater.rs 2>/dev/null; ls resources 2>/dev/null | head` — note which exist; STOP only if **none** of bundle/updater remain and 001 deleted packaging without replacement — then restore from pinned waku SHA paths cited in inventory (copy those files only).
+If `MISSING_*`, restore those files only from waku pin `4c483bc282faf4ce9296390887f09b44abb34f27`, then rebrand.
 
-### Step 2: Rebrand bundle + unsigned build
+**Verify**: `test -f scripts/bundle.sh && test -f src/updater.rs`
 
-Rename Waku → Daku in plist/scripts; produce an unsigned `.app` for local open (Gatekeeper may warn — OK for this step).
+### Step 2: Rebrand + unsigned bundle
 
-**Verify**: unsigned app launches; window title / About shows daku; `rg -n 'Waku' resources Info.plist scripts/bundle.sh` → no user-facing Waku left (comments OK).
+Lock app dir name to **`Daku.app`**. Document exact unsigned command in `docs/packaging.md`.
 
-### Step 3: Sparkle channel wiring
+**Verify**: run that documented command → `test -d dist/Daku.app`; `rg -n 'Waku' resources/Info.plist scripts/bundle.sh` → no matches (comments exempt if unavoidable — prefer zero).
 
-Point appcast URL at the public repo’s documented releases path; ensure updater compiles; add build flag to disable updater for cask.
+### Step 3: Sparkle + homebrew no-op
 
-**Verify**: `cargo check -p daku` exit 0; unit or stub test that “homebrew/cask build → updater no-op” holds.
+**Verify**: `cargo test -p daku updater_channel` → homebrew/cask build does not schedule checks; `cargo check -p daku` → exit 0.
 
-### Step 4: Homebrew cask draft
+### Step 4: Cask draft
 
-Write cask template + README install instructions. Artifact URL uses GitHub Releases placeholders, not a private CDN.
+**Verify**: `test -f homebrew/daku.rb`; `ruby -c homebrew/daku.rb` → exit 0 (or `brew style` if available).
 
-**Verify**: `brew style` on the cask file if `brew` available; otherwise YAML/Ruby syntax review only.
+### Step 5: Docs + secret scan
 
-### Step 5: Operator release doc + wizard
-
-Add `docs/packaging.md` (or README section) describing the release checklist. Appendix A below can be turned into an interactive wizard script if useful — content must match.
-
-**Verify**: docs contain **no** credential values; `gitleaks` clean on the commit; `rg -ni 'BEGIN (RSA |OPENSSH )?PRIVATE' docs scripts` → no matches.
+**Verify**: `test -f docs/packaging.md`; `rg -n 'BEGIN .*PRIVATE' scripts resources docs` → no matches; `rg -n 'dev[0-9]+\\.service-now' docs` → no matches.
 
 ## Test plan
 
 | Case | Expected |
 |------|----------|
-| unsigned bundle | `.app` runs on Operator Mac |
-| cask build flag | updater does not schedule checks |
-| appcast script dry-run | writes XML for a local DMG |
-| signed+notarised | **only** when Appendix A credentials exist — otherwise document BLOCKED and still complete script/doc work |
+| unsigned bundle command | `dist/Daku.app` exists |
+| updater_channel homebrew | no-op |
+| notarised upload | only if Appendix A creds exist — else leave Status note BLOCKED for notarisation but scripts DONE |
 
 ## Done criteria
 
-- [ ] Unsigned `Daku` app bundle path documented and buildable
-- [ ] Sparkle path adapted; cask builds disable Sparkle
-- [ ] Homebrew cask draft + install docs
-- [ ] No secrets in repo
-- [ ] `plans/README.md` row 010 → `done` (note BLOCKED-notarisation if Operator lacks Apple ID — scripts/docs can still be done)
+- [ ] `test -d dist/Daku.app` after documented unsigned command (CI may skip dist artifact — then require the command to be documented and dry-runnable with `--help` exit 0 **and** a `scripts/bundle.sh` that contains `Daku.app`)
+- [ ] `cargo test -p daku updater_channel` exit 0
+- [ ] `test -f homebrew/daku.rb && test -f docs/packaging.md`
+- [ ] `rg -n 'BEGIN .*PRIVATE' scripts resources docs` → no matches
+- [ ] `plans/README.md` row 010 Status = `DONE` (or `BLOCKED` with reason `notarisation credentials missing` **only if** unsigned+cask+docs already meet the bullets above)
 
 ## STOP conditions
 
-- No Apple Developer ID / notary profile on the machine **and** the task asks to publish a notarised DMG — stop; finish unsigned + docs; run Appendix A wizard for the human; do not fake notarisation.
-- Sparkle private key missing — stop before uploading a signed appcast that clients cannot verify; unsigned local DMG is still OK.
-- Pressure to commit key material “just for CI” — refuse.
-- Replacing Sparkle with a different updater without an ADR — stop.
+- Asked to publish notarised DMG without Developer ID / notary profile — finish unsigned+docs; run Appendix A; do not fake notary.
+- Sparkle private key missing before publishing appcast — STOP upload; unsigned local OK.
+- Replace Sparkle without ADR — STOP.
 
 ## Maintenance notes
 
-- GitHub Actions notarisation later may use OIDC/API key secrets — configure in repo settings, never in plans.
-- Reviewers: confirm cask and Sparkle cannot both auto-update the same install.
-- Corresponding source for each release tag must be the public git tag (GPL).
+- CI secrets for notary later — repo settings only.
+- Reviewers: cask and Sparkle must not both auto-update one install.
 
 ---
 
 ## Appendix A — Operator wizard checklist (human-only)
 
-Do **not** paste secret values into issues, chat, or the repo. Mark each step done locally.
+No secret values in issues/chat/repo.
 
-1. Enrol / confirm **Apple Developer Program** membership for the signing identity you will use.
-2. Create **Developer ID Application** certificate in Xcode or developer.apple.com; install in login keychain.
-3. Create an **app-specific password** or **App Store Connect API key** for notarytool; store in Keychain or CI secrets — never in git.
-4. Run `xcrun notarytool store-credentials` (or current Apple-recommended equivalent) to save a local notary profile name; record only the **profile name** in your private notes.
-5. Generate Sparkle Ed25519 keypair with Sparkle’s `generate_keys` tool; store **private** key in release secrets; commit only the **public** key where the waku/daku scripts already expect it (if the fork commits a public key file).
-6. Decide public **appcast URL** and GitHub Releases naming (`Daku-x.y.z.dmg`).
-7. Cut a test notarised build once; verify Gatekeeper opens cleanly on a second Mac.
-8. Publish Homebrew cask pointing at that Release; confirm Sparkle is disabled in that build.
+1. Apple Developer Program membership.
+2. Developer ID Application certificate in login keychain.
+3. Notary credentials via `notarytool store-credentials` — store profile **name** only in private notes.
+4. Sparkle Ed25519 keypair; private key in release secrets; public key only in repo if scripts already expect it.
+5. Appcast URL + GitHub Release asset name `Daku-x.y.z.dmg`.
+6. Test notarised open on a second Mac; publish cask with Sparkle disabled.

@@ -2,7 +2,8 @@
 
 > **Executor instructions**: Follow this plan step by step. Run every verification command and confirm the expected result before moving to the next step. If anything in the "STOP conditions" section occurs, stop and report — do not improvise. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: confirm plan 003 done (availability fixtures green). Then `git diff --stat da67ae9..HEAD -- plans/004-jobs-syslog-trends.md crates/daku-core`.
+> **Drift check (run first)**: `git diff --stat 567179a..HEAD -- crates/daku-core crates/daku-daemon`
+> Confirm plan 003 DONE (`CollectorLoop` + `ServiceNowClient` exist). On mismatch, STOP.
 
 ## Status
 
@@ -11,76 +12,56 @@
 - **Risk**: MED
 - **Depends on**: plans/003-availability-signal.md
 - **Category**: direction
-- **Planned at**: commit `da67ae9`, 2026-08-17
+- **Planned at**: commit `567179a`, 2026-08-17
 - **Issue**: https://github.com/martinthommesen/daku/issues/21
 
 ## Why this matters
 
-Stuck scheduled jobs and climbing syslog errors are two of the Operator’s core pains (spec §5). Spec requires **~24h trends** for both — the only Signals that need a sample ring in v1. Landing them together reuses the Aggregate/Table client pattern from plan 003 and proves `signal_samples` + prune before MID/outbound/drift work.
+Stuck jobs and syslog errors are core Operator pains (spec §5). Spec requires **~24h trends** for both — the only Signals that need `signal_samples`. This plan registers collectors on the **existing** 003 poll loop (no second timer).
 
 ## Current state
 
-- Collector layout from plan 003: injectable HTTP client, `signal_snapshots`, fixture classifiers, no network in `cargo test`.
-- Plan 002 created `signal_samples` (environment_id, signal_id, observed_at, value_real, value_json) for this plan.
-- Research (do **not** invent endpoints) — [servicenow-signals](https://github.com/martinthommesen/daku/blob/research/servicenow-signals/docs/research/servicenow-signals.md):
+- 003: `ServiceNowClient` (OAuth/basic, 429), `CollectorLoop` (~120s), `signal_snapshots`.
+- 002: `signal_samples` table ready.
+- Research ([servicenow-signals](https://github.com/martinthommesen/daku/blob/research/servicenow-signals/docs/research/servicenow-signals.md)):
 
-  **Jobs (`sys_trigger`)** via Aggregate or Table API:
-
+  **Jobs** — Aggregate/Table on `sys_trigger`:
   - Overdue Ready: `state=0^next_action<javascript:gs.minutesAgoStart(15)`
   - Error: `state=3`
-  - Optional stuck Running: `state=1^claimed_by!=NULL^sys_updated_on<…` (document threshold; default 30 minutes if used)
+  Prefer Aggregate `sysparm_count=true`.
 
-  Prefer Aggregate `sysparm_count=true` per query over pulling rows.
+  **Syslog** — Aggregate on `syslog`:
+  - `sysparm_count=true&sysparm_query=level=2^sys_created_on>javascript:gs.hoursAgoStart(1)`
+  - `level=2` = Error is research-**[unverified]** — constant `SYSLOG_ERROR_LEVEL=2`; STOP if Operator smoke shows Error rows with another value.
+  - Always date-bound (rotated table).
 
-  **Syslog** via Aggregate API:
-
-  - `GET /api/now/stats/syslog?sysparm_count=true&sysparm_query=level=2^sys_created_on>javascript:gs.hoursAgoStart(1)`
-  - Research notes level `2` = Error is **[unverified]** — fixtures + classifier must treat the numeric level as a config constant (`syslog_error_level`, default `2`); STOP if live PDI returns empty/wrong when Operator confirms Error rows exist with another value.
-  - Always date-bound (`syslog` is rotated).
-
-- Spec: poll ~2 min; store latest snapshot + ~24h ring; hard-coded health (e.g. overdue job → degraded).
-- CONTEXT.md: Signal names on an Environment; vocabulary **Signal**, **Environment**, **Environment health**.
+- Hard-coded: overdue>0 → Signal `degraded`; syslog count>0 → `degraded`; probe failure → unreachable handling from 003 (do not invent Signal `down` for count>0).
 
 ## Commands you will need
 
 | Purpose | Command | Expected on success |
 |---------|---------|---------------------|
-| Tests | `cargo test -p daku-core jobs` and `cargo test -p daku-core syslog` | all pass |
+| Jobs tests | `cargo test -p daku-core jobs_signal` | all pass |
+| Syslog tests | `cargo test -p daku-core syslog_signal` | all pass |
+| Prune tests | `cargo test -p daku-core prune_signal_samples` | all pass |
+| Aggregate helper | `cargo test -p daku-core aggregate_count` | all pass |
 | Check | `cargo check -p daku-core -p daku-daemon` | exit 0 |
-| Sample prune | covered by unit test on tempfile DB | samples older than 24h removed |
-
-## Suggested executor toolkit
-
-- Copy module layout from availability collector (plan 003).
-- Research note + spec §5–7; ADR-0007 for local store.
 
 ## Scope
 
 **In scope**
 
-- Collectors under `crates/daku-core` (or existing collector dir from 003):
-  - `signal_id = "jobs"` — payload JSON with counts: `overdue_ready`, `error`, optional `stuck_running`; map state:
-    - `healthy` if overdue=0 and error=0 (and stuck=0 if collected)
-    - `degraded` if overdue>0 or stuck>0
-    - `down` only if the Environment is unreachable / probe failed (auth/transport) — reuse 003 outcome types; do not invent a third “jobs down” meaning
-  - `signal_id = "syslog"` — payload with `error_count_1h` (and optional top `source` groups if Aggregate `group_by` is easy; otherwise count-only is enough for v1)
-    - `healthy` if count == 0
-    - `degraded` if count > 0 (hard-coded; no Operator thresholds in v1)
-    - probe failure → same unreachable handling as 003
-- After each successful poll: upsert `signal_snapshots` **and** append `signal_samples` with `value_real` = primary count (jobs: overdue+error; syslog: error_count_1h).
-- Prune `signal_samples` for these signal_ids where `observed_at` < now−24h (run after insert or on a timer).
-- Fixtures under `crates/daku-core/tests/fixtures/jobs/` and `.../syslog/`:
-  - Aggregate-style JSON bodies matching Table/Aggregate API `result` shape (fake counts only).
-  - At least: zero counts, non-zero overdue, non-zero syslog errors, 403/auth failure body.
-- Daemon: extend one-shot / poll loop to include jobs + syslog (or `probe-jobs` / `probe-syslog` subcommands mirroring availability).
-- Constants module documenting encoded queries and `syslog_error_level = 2` with a comment pointing at the research unverified note.
+- Shared pure helper `parse_aggregate_count(body: &[u8]) -> Result<u64>` (and optional query builder) in `daku-core` — **this plan owns it**; 005–006 reuse it.
+- Collectors `signal_id = "jobs"` and `"syslog"` registered on 003’s loop.
+- Jobs payload: `{ "overdue_ready": N, "error": N }` only (no stuck-running in v1).
+- Syslog payload: `{ "error_count_1h": N }`.
+- Each successful poll: upsert snapshot **and** append `signal_samples` (`value_real` = overdue+error for jobs; error_count_1h for syslog).
+- Prune samples with `observed_at` older than 24h (all signal_ids or these two — prefer **all** for one function).
+- Fixtures under `tests/fixtures/jobs/` and `tests/fixtures/syslog/`.
 
 **Out of scope**
 
-- MID/ECC, outbound, drift/clone (005–007).
-- GPUI charts (009) — DB samples are enough; UI reads them later.
-- Live CI against a PDI.
-- Semaphores / `stats.do` (explicitly skipped in research v1 set).
+- Second poll timer; stuck-running jobs; `group_by=source` (defer); GPUI sparklines (009 reads samples via protocol from 008); live CI.
 
 ## Git workflow
 
@@ -89,67 +70,52 @@ Stuck scheduled jobs and climbing syslog errors are two of the Operator’s core
 
 ## Steps
 
-### Step 1: Fixture parsers for Aggregate counts
+### Step 1: `parse_aggregate_count`
 
-Pure functions parse Aggregate API JSON → counts. Do not call the network.
+**Verify**: `cargo test -p daku-core aggregate_count` → pass.
 
-**Verify**: `cargo test -p daku-core parse_aggregate_count` → pass.
+### Step 2: Jobs collector + snapshot/sample
 
-### Step 2: Jobs classifier + snapshot/sample write
+**Verify**: `cargo test -p daku-core jobs_signal` → zero→healthy; overdue>0→degraded; sample row written.
 
-Given overdue/error/(optional stuck) counts → Signal state + persist snapshot + one sample row.
-
-**Verify**: `cargo test -p daku-core jobs_signal` → healthy/degraded cases + DB rows on tempfile.
-
-### Step 3: Syslog classifier + snapshot/sample write
-
-Same pattern with `error_count_1h`.
+### Step 3: Syslog collector + snapshot/sample
 
 **Verify**: `cargo test -p daku-core syslog_signal` → pass.
 
-### Step 4: HTTP collectors (injectable)
+### Step 4: Prune
 
-Build encoded queries exactly as in research (inline in code comments with research link). Inject client; production uses same HTTP stack as availability.
+**Verify**: `cargo test -p daku-core prune_signal_samples` → row at now−25h removed; now kept.
 
-**Verify**: mock client tests write snapshots; `cargo test` does not open sockets.
+### Step 5: Register on CollectorLoop
 
-### Step 5: 24h prune
-
-Implement `prune_signal_samples(db, older_than)` and call it after samples insert (or daemon tick).
-
-**Verify**: unit test inserts sample at now−25h and now; prune → only recent remains.
-
-### Step 6: Wire daemon entrypoints
-
-Document Operator-local smoke in `docs/examples/` without real hostnames (example.com only).
-
-**Verify**: `rg -n 'dev[0-9]+\\.service-now' docs README.md` → no matches; `cargo check` exit 0.
+**Verify**: `rg -n 'register.*jobs|JobsCollector|signal_id.*jobs' crates/daku-core crates/daku-daemon` → ≥1 hit; `cargo check -p daku-core -p daku-daemon` → exit 0; `rg -n 'tokio::time::interval|poll_interval' crates/daku-core/src/jobs.rs crates/daku-core/src/syslog.rs 2>/dev/null` → no matches (no private timers).
 
 ## Test plan
 
 | Case | Expected |
 |------|----------|
-| jobs all zero | healthy snapshot; sample value 0 |
+| jobs zeros | healthy, sample 0 |
 | overdue > 0 | degraded |
-| syslog errors > 0 | degraded |
-| prune | drops >24h samples only for jobs/syslog (or all — document choice; prefer all signal_ids for simplicity) |
+| syslog > 0 | degraded |
+| prune | drops >24h |
 | no network in default tests | enforced |
 
 ## Done criteria
 
-- [ ] `cargo test -p daku-core` jobs + syslog + prune tests pass with no network
-- [ ] `signal_samples` populated and pruned
-- [ ] Encoded queries match research note (no invented tables)
-- [ ] `plans/README.md` row 004 → `done`
+- [ ] Listed `cargo test` filters exit 0
+- [ ] `cargo check -p daku-core -p daku-daemon` exit 0
+- [ ] `rg -n 'signal_samples' crates/daku-core` → write + prune paths exist
+- [ ] No private interval in jobs/syslog modules (Step 5 rg)
+- [ ] `plans/README.md` row 004 Status = `DONE`
 
 ## STOP conditions
 
-- Aggregate API response shape on fixtures cannot be made to match without guessing undocumented fields — stop and cite research; keep count parsing minimal (`result.stats` / documented Aggregate envelope — read research + one live Operator smoke before changing).
-- Live PDI shows Error syslog rows but `level=2` returns 0 — stop; do not silently switch levels without updating research/comment and fixtures.
-- Pressure to store secrets or real hostnames in fixtures.
+- Aggregate envelope cannot be parsed without guessing undocumented fields — STOP; cite research.
+- Live PDI: Error rows exist but `level=2` counts 0 — STOP; do not silently change level.
+- Plan 003 loop missing — STOP; do not add a new timer.
 
 ## Maintenance notes
 
-- Plan 008 rollup: overdue → degraded is defined here; keep thresholds in one constants file.
-- Plan 009 may chart `signal_samples` for jobs/syslog only.
-- Reviewers: confirm date bounds on every `syslog` query (rotation hazard).
+- Plan 008/009: expose sample series for jobs/syslog sparklines.
+- Plan 008 rollup: jobs/syslog `degraded` → Environment `degraded`.
+- Reviewers: date bounds on every syslog query.

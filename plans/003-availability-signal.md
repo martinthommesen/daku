@@ -2,7 +2,8 @@
 
 > **Executor instructions**: Follow this plan step by step. Run every verification command and confirm the expected result before moving to the next step. If anything in the "STOP conditions" section occurs, stop and report — do not improvise. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: confirm plans 001–002 done (`cargo check -p daku-daemon`; migrations test green). Then `git diff --stat b670982..HEAD -- plans/003-availability-signal.md`.
+> **Drift check (run first)**: `git diff --stat 567179a..HEAD -- crates/daku-core crates/daku-daemon docs/examples README.md`
+> Confirm 002 DONE (`signal_snapshots` migration exists). On mismatch, STOP.
 
 ## Status
 
@@ -11,130 +12,120 @@
 - **Risk**: MED
 - **Depends on**: plans/002-daemon-sqlite-skeleton.md
 - **Category**: direction
-- **Planned at**: commit `b670982`, 2026-08-17
+- **Planned at**: commit `567179a`, 2026-08-17
 - **Issue**: https://github.com/martinthommesen/daku/issues/20
 
 ## Why this matters
 
-Availability is Signal #1 in the accepted spec: up/latency + build via Table API probe on `sys_properties` `name=glide.war`. Shipping this first proves the collector loop, credential read path, reachable/unreachable/asleep semantics (ADR-0004), and snapshot persistence — before investing in GPUI or the other six Signals.
+Availability is Signal #1: up/latency + build via Table API on `sys_properties` `name=glide.war`. This plan also owns the **shared collector infrastructure** every later Signal reuses: config load, Keychain credentials, OAuth client-credentials, HTTP client with **429 / `Retry-After`**, and the **single ~2 minute poll loop**.
 
 ## Current state
 
-- Daemon + SQLite skeleton from plan 002 (`signal_snapshots` table).
-- Research (do not invent endpoints):  
+- Daemon + SQLite: `signal_snapshots` / `signal_samples`; config SoT = `~/.daku/environments.json`.
+- Probe (do not invent):  
   `GET /api/now/table/sys_properties?sysparm_query=name=glide.war&sysparm_fields=value&sysparm_limit=1`  
-  — see [servicenow-signals research](https://github.com/martinthommesen/daku/blob/research/servicenow-signals/docs/research/servicenow-signals.md) and spec §5.
-- Auth: OAuth client credentials preferred for real Environments; **basic allowed for PDI stand-ins** (ADR-0004). Secrets from macOS Keychain (daku-owned service); never commit them.
-- Collector outcomes: **reachable** / **unreachable** / **asleep** (PDI hibernate HTML) vs Signal state healthy/degraded/down.
-- Poll cadence target ~2 minutes (spec) — implementation may use a shorter interval in dev via config.
-- CONTEXT.md: this Signal is named observations on an **Environment**.
+  — [servicenow-signals](https://github.com/martinthommesen/daku/blob/research/servicenow-signals/docs/research/servicenow-signals.md), spec §5–6.
+- Auth (ADR-0004 / spec §6): **OAuth 2.0 client credentials** for real Environments; **basic** only for PDI stand-ins. Secrets in macOS Keychain (service `daku`, account = environment `id`).
+- Outcomes: **reachable** / **unreachable** / **asleep** — distinct from Environment health and from Signal state (003 stores reachability in availability payload; plan 008 must not map asleep → degraded).
+- Poll cadence: **one shared loop**, default **120s**, all Environments, all registered collectors (004–007 only register; they do not start their own timers).
 
 ## Commands you will need
 
 | Purpose | Command | Expected on success |
 |---------|---------|---------------------|
-| Unit/fixture tests | `cargo test -p daku-core availability` | all pass |
+| Classifier tests | `cargo test -p daku-core classify_availability` | all pass |
+| HTTP/oauth/429 tests | `cargo test -p daku-core servicenow_http` | all pass |
+| Persist tests | `cargo test -p daku-core persist_availability_snapshot` | all pass |
 | Check | `cargo check -p daku-core -p daku-daemon` | exit 0 |
-| Local smoke (Operator only) | documented curl/probe using **local** creds | 200 JSON with `result[0].value` — **not run in CI** |
-
-## Suggested executor toolkit
-
-- `.claude/skills/now-sdk/SKILL.md` for Operator-local `npx @servicenow/sdk query` smoke (optional).
-- ADR-0004; signals research note; spec §5–6.
+| Poll loop test | `cargo test -p daku-core collector_loop` | all pass |
 
 ## Scope
 
 **In scope**
 
-- Module `daku-core` (or `daku-core/src/collector/`) implementing:
-  - Config load from `~/.daku/environments.json` (example shape from plan 002).
-  - Credential resolve stub interface + Keychain backend on macOS (service name e.g. `daku`, account = environment id) — **no secret values in tests**.
-  - HTTP client probe for availability:
-    - Measure RTT.
-    - Parse JSON `result[0].value` as build string when `Content-Type` is JSON and status 2xx.
-    - If body looks like hibernate HTML / non-JSON 200 → outcome `asleep`.
-    - Transport/TLS/auth failures → `unreachable`.
-  - Map to Signal state: reachable+ok → `healthy`; unreachable → treat Environment probe as `down` for this Signal; asleep → distinct state stored in payload (UI later).
-  - Persist one row to `signal_snapshots` with `signal_id = "availability"`.
-- Daemon timer or one-shot CLI subcommand `daku-daemon probe-availability` for easy testing.
-- **Fixtures**: checked-in HTTP response bodies under `crates/daku-core/tests/fixtures/availability/` (`ok.json`, `hibernating.html`, `401.json`) — no real build strings required; fake `glide-australia-fake.zip` is fine.
-- Unit tests that run the parser/classifier against fixtures (no network).
+1. **Config load** from `~/.daku/environments.json` (example from 002).
+2. **Credential resolve** trait + macOS Keychain backend (service `daku`, account = env id). Tests use a fake backend — never real secrets.
+3. **OAuth client-credentials** (required for `auth_method: oauth_client_credentials`):
+   - Token URL: `{instance_url}/oauth_token.do` (standard ServiceNow; if Operator smoke proves a different path, STOP and report — do not invent).
+   - Body: `grant_type=client_credentials` + client id/secret from Keychain (store two Keychain accounts or one JSON blob — document the choice in code comments; tests use fake backend).
+   - Cache access token in memory until `expires_in`; on 401 once, refresh and retry once.
+   - Basic auth path for `auth_method: basic` only.
+4. **Shared HTTP client** used by all Signals:
+   - Timeouts; injectability for fixtures.
+   - On **429**: honor `Retry-After` (seconds or HTTP-date); retry ≤2 times; then fail probe as unreachable/transient error recorded in payload — unit-test with stub headers (no network).
+5. **Availability classifier** + probe → `signal_id = "availability"` snapshot (RTT, build string, reachability).
+6. **`CollectorLoop`**: interval default 120s (config key `poll_interval_secs`); runs all registered `SignalCollector`s; 004–007 add registrations only.
+7. Fixtures under `crates/daku-core/tests/fixtures/availability/` (`ok.json`, `hibernating.html`, `401.json`).
+8. One-shot CLI: `daku-daemon probe-availability` (or equivalent) for smoke.
+9. Operator smoke doc without real hostnames.
 
 **Out of scope**
 
-- Other Signals (004–007).
-- GPUI display (009) — console/log or DB row is enough.
-- CI calling a real PDI.
-- Recording real hostnames in fixtures or source.
+- Other Signal collectors’ business logic (004–007).
+- GPUI (009); CI against live PDI; inventing hostnames.
 
 ## Git workflow
 
 - Branch: `plan/003-availability-signal`
-- Commit example: `Add availability Signal probe with fixtures`
+- Commit example: `Add availability Signal, OAuth HTTP client, and collector loop`
 
 ## Steps
 
 ### Step 1: Fixture classifier
 
-Implement pure functions:
+`classify_availability_response(status, content_type, body, rtt_ms) -> AvailabilityObservation` (reachability + build + Signal state).
 
-- `classify_availability_response(status, content_type, body, rtt_ms) -> AvailabilityObservation`
-
-Cover fixtures: ok JSON → healthy + build value; hibernate HTML → asleep; 401/403 → unreachable; empty/connection error path unit-tested via `Result`.
-
-**Verify**: `cargo test -p daku-core classify_availability` → pass.
+**Verify**: `cargo test -p daku-core classify_availability` → pass (ok→reachable/healthy; hibernate HTML→asleep; 401→unreachable).
 
 ### Step 2: Persist snapshot
 
-Given an Environment id + observation, upsert/insert `signal_snapshots`.
+**Verify**: `cargo test -p daku-core persist_availability_snapshot` → one row `signal_id=availability` on tempfile DB.
 
-**Verify**: `cargo test -p daku-core persist_availability_snapshot` using tempfile DB from plan 002 helpers.
+### Step 3: Shared HTTP + 429 + OAuth (fake clock/backend)
 
-### Step 3: HTTP probe (injectable client)
+Implement `ServiceNowClient` with injectable transport. Tests: 429 with `Retry-After: 1` retries; OAuth token cache + single refresh on 401; basic auth header path.
 
-Trait or param for HTTP GET so tests inject fixtures; production uses `reqwest` (or existing HTTP stack from waku if present) with timeout.
+**Verify**: `cargo test -p daku-core servicenow_http` → pass; **no** sockets in these tests.
 
-**Verify**: test with mock/fixture client → snapshot written; **no** network in `cargo test`.
+### Step 4: Availability collector + CollectorLoop
 
-### Step 4: Wire daemon one-shot + optional interval
+Register availability; loop interval from config (default 120). Test loop invokes collector twice with fake instant advance **or** with interval=0 / manual `tick()` — prefer explicit `tick()` API for tests.
 
-- CLI: probe all configured Environments once and exit (or log results).
-- Config key for interval defaulting toward 120s (spec).
+**Verify**: `cargo test -p daku-core collector_loop` → pass.
 
-**Verify**: `cargo run -p daku-daemon -- probe-availability` with `DAKU_DB_PATH` + example env file using **example.com** URLs expects unreachable (network to example) **or** skip network by pointing at a local wiremock — prefer fixture-injected integration test over flaky DNS.
+### Step 5: Daemon one-shot + docs
 
-### Step 5: Operator-local smoke doc
-
-In `README.md` or `docs/examples/availability-smoke.md`: steps to put PDI URL in `~/.daku/environments.json`, store basic auth in Keychain, run probe once. **Do not** write the Operator’s hostname into the repo.
-
-**Verify**: doc exists; `rg -n 'dev[0-9]+\\.service-now' docs README.md` → no matches.
+**Verify**: `rg -n 'dev[0-9]+\\.service-now' docs README.md` → no matches; `cargo check -p daku-core -p daku-daemon` → exit 0.
 
 ## Test plan
 
 | Case | Expected |
 |------|----------|
-| ok.json fixture | healthy, payload contains build string |
-| hibernating.html | asleep |
+| ok.json | reachable, healthy, build present |
+| hibernating.html | asleep (not conflated with unreachable) |
 | 401 | unreachable |
-| DB persist | one snapshot row for `availability` |
-| No network in default `cargo test` | enforced |
+| 429 + Retry-After | retries then ok/fail per stub |
+| OAuth cache | second call skips token endpoint |
+| collector tick | snapshot written without network |
 
 ## Done criteria
 
-- [ ] Fixture tests green with no network
-- [ ] Snapshots land in SQLite via override path
-- [ ] Daemon exposes a one-shot probe entrypoint
-- [ ] Operator smoke documented without real hostnames
-- [ ] `plans/README.md` row 003 → `done`
+- [ ] `cargo test -p daku-core classify_availability servicenow_http persist_availability_snapshot collector_loop` exit 0
+- [ ] `cargo check -p daku-core -p daku-daemon` exit 0
+- [ ] `rg -n 'Retry-After|retry_after' crates/daku-core` → ≥1 hit
+- [ ] `rg -n 'client_credentials|oauth_token' crates/daku-core` → ≥1 hit
+- [ ] `rg -n 'poll_interval|CollectorLoop|collector_loop' crates/daku-core` → ≥1 hit
+- [ ] `plans/README.md` row 003 Status = `DONE`
 
 ## STOP conditions
 
-- Plan 002 schema missing `signal_snapshots`.
-- Pressure to commit real credentials or hostnames.
-- Table API path differs on the Operator’s instance and fixtures cannot be updated without inventing undocumented APIs — stop and cite research note before changing the endpoint.
+- Plan 002 missing `signal_snapshots`.
+- Token URL differs on Operator instance — STOP; do not invent alternate OAuth paths.
+- Table API path for `glide.war` differs and cannot be confirmed from research — STOP.
+- Request to put Credentials in git or SQLite — refuse.
 
 ## Maintenance notes
 
-- Plans 004–007 copy this collector module layout.
-- Plan 008 reads `signal_snapshots` for Environment health rollup.
-- Reviewers: ensure asleep ≠ unreachable ≠ down conflation stays explicit in the type.
+- **004–007 must not spawn their own timers** — implement `SignalCollector` and register on the loop from 003.
+- Plan 008: read availability payload reachability separately from Environment health; **never** map asleep → health degraded.
+- Reviewers: asleep ≠ unreachable; 429 tests present; OAuth not “basic-only”.
