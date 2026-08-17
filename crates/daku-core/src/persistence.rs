@@ -21,6 +21,9 @@ const MIGRATIONS_TABLE: &str = "CREATE TABLE IF NOT EXISTS migrations (
 
 const DAKU_DB_PATH_ENV: &str = "DAKU_DB_PATH";
 
+/// Snapshot state for a Signal that deliberately did not probe this tick.
+pub const SKIPPED_STATE: &str = "skipped";
+
 fn unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

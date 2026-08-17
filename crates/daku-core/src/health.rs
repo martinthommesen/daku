@@ -17,12 +17,16 @@ use crate::syslog::SYSLOG_SIGNAL_ID;
 pub const SERVICENOW_PLATFORM_ID: &str = "servicenow";
 
 pub fn health_rollup(reachability: Reachability, signals: &[(&str, &str)]) -> EnvironmentHealth {
-    if reachability == Reachability::Unreachable {
-        return EnvironmentHealth::Down;
+    match reachability {
+        // Reachability is reported separately; a sleeping Environment cannot
+        // be observed, so its Signals must not vote.
+        Reachability::Unreachable => return EnvironmentHealth::Down,
+        Reachability::Asleep => return EnvironmentHealth::Healthy,
+        Reachability::Reachable => {}
     }
     let mut health = EnvironmentHealth::Healthy;
     for &(signal_id, state) in signals {
-        if signal_id == LAST_CLONE_SIGNAL_ID || state == "skipped" {
+        if signal_id == LAST_CLONE_SIGNAL_ID || state == persistence::SKIPPED_STATE {
             continue;
         }
         if state == "down" || state == "degraded" {
@@ -196,10 +200,17 @@ mod tests {
     }
 
     #[test]
-    fn health_rollup_asleep_with_degraded_signal_is_degraded() {
+    fn health_rollup_asleep_ignores_signal_votes() {
         assert_eq!(
             health_rollup(Reachability::Asleep, &[("jobs", "degraded")]),
-            EnvironmentHealth::Degraded
+            EnvironmentHealth::Healthy
+        );
+        assert_eq!(
+            health_rollup(
+                Reachability::Asleep,
+                &[("jobs", "down"), ("syslog", "down")]
+            ),
+            EnvironmentHealth::Healthy
         );
     }
 
@@ -209,13 +220,6 @@ mod tests {
             health_rollup(Reachability::Reachable, &[("jobs", "down")]),
             EnvironmentHealth::Degraded
         );
-    }
-
-    #[test]
-    fn health_rollup_asleep_signal_down_is_degraded_not_down() {
-        let health = health_rollup(Reachability::Asleep, &[("jobs", "down")]);
-        assert_eq!(health, EnvironmentHealth::Degraded);
-        assert_ne!(health, EnvironmentHealth::Down);
     }
 
     #[test]
