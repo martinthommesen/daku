@@ -15,7 +15,7 @@ Map: [#17](https://github.com/martinthommesen/daku/issues/17) (closed). Index lo
 | 004–007 (original) | was `da67ae9` | `315f38d` |
 | 008–009 (original) | was `315f38d` | `d912bbb` |
 | 010 (original) | was `d912bbb` | `567179a` |
-| **001–010 (this revision)** | **`567179a`** | *(this commit)* |
+| **001–010 (this revision)** | **`567179a`** (drift base) | **`ce612f5`** |
 
 Drift checks use `567179a..HEAD` against each plan’s **Scope** paths (not only the plan markdown).
 
