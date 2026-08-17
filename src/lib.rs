@@ -2,15 +2,9 @@
 
 rust_i18n::i18n!("locales", fallback = "en");
 
-const _LOCALE_SOURCES: [&str; 3] = [
-    include_str!("../locales/app.yml"),
-    include_str!("../locales/zh-CN.yml"),
-    include_str!("../locales/ja.yml"),
-];
-
 macro_rules! tr {
     ($key:expr) => {
-        crate::i18n::translate($key)
+        rust_i18n::t!($key).into_owned()
     };
     ($key:expr, $($args:tt)*) => {
         rust_i18n::t!($key, $($args)*).into_owned()
@@ -25,7 +19,7 @@ mod platform;
 mod theme;
 mod updater;
 
-pub use daku_client::{i18n, identity, persistence};
+pub use daku_client::{identity, persistence};
 
 use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions,

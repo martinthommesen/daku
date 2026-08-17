@@ -1412,8 +1412,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
- "objc2-foundation 0.3.2",
- "rust-i18n",
  "serde",
  "serde_json",
  "uuid",

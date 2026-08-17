@@ -1,4 +1,4 @@
-//! Process-neutral theme preference persisted in the desktop settings file.
+//! Theme preference the desktop shell resolves against the system appearance.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,16 +9,4 @@ pub enum ThemePreference {
     System,
     Light,
     Dark,
-}
-
-impl ThemePreference {
-    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
-
-    pub fn label(self) -> String {
-        match self {
-            Self::System => crate::i18n::translate("settings.theme_system"),
-            Self::Light => crate::i18n::translate("settings.theme_light"),
-            Self::Dark => crate::i18n::translate("settings.theme_dark"),
-        }
-    }
 }
