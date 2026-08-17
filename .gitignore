@@ -1,0 +1,19 @@
+# Local / tooling
+.DS_Store
+.playwright-mcp/
+
+# Secrets & local Operator config (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+
+# Build artifacts (when the app exists)
+target/
+node_modules/
+.waku-cache/
+dist/
+*.db
+*.db-wal
+*.db-shm

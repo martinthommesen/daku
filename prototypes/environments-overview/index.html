@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PROTOTYPE — daku environments overview</title>
+  <!--
+    PROTOTYPE / THROWAY — answers: how should the main screen look?
+    Three variants via ?variant=A|B|C — waku colour tokens, fake data.
+    Real target is GPUI (ADR-0001); this is layout fidelity only.
+    Plan: A columns · B matrix · C sidebar+detail — structurally different.
+  -->
+  <style>
+    :root, [data-theme="dark"] {
+      --canvas: #1A1A1A;
+      --sidebar: #181818;
+      --surface: #1A1A1A;
+      --raised: #232323;
+      --inset: #151515;
+      --border: rgba(230, 233, 240, 0.07);
+      --border-strong: rgba(230, 233, 240, 0.14);
+      --text: #E2E2E2;
+      --text-secondary: #A3A3A3;
+      --text-tertiary: #7D7D7D;
+      --text-ghost: #575757;
+      --accent: #E2795B;
+      --gauge: #3B82F6;
+      --success: #62C987;
+      --warning: #E0B36A;
+      --danger: #E2726A;
+      --inverse: #E7E9EC;
+      --on-inverse: #17181C;
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+    }
+    [data-theme="light"] {
+      --canvas: #F6F5F6;
+      --sidebar: #F3F3F3;
+      --surface: #F6F5F6;
+      --raised: #ECECEC;
+      --inset: #E6E6E6;
+      --border: rgba(28, 31, 40, 0.08);
+      --border-strong: rgba(28, 31, 40, 0.15);
+      --text: #242424;
+      --text-secondary: #666666;
+      --text-tertiary: #858585;
+      --text-ghost: #A4A4A4;
+      --accent: #C85F44;
+      --gauge: #2563EB;
+      --success: #2F8F52;
+      --warning: #A66B20;
+      --danger: #C64A42;
+      --inverse: #202227;
+      --on-inverse: #F8F8F9;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: var(--font);
+      background: var(--canvas);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+    .proto-banner {
+      position: sticky; top: 0; z-index: 40;
+      background: var(--inset);
+      border-bottom: 1px solid var(--border-strong);
+      padding: 6px 12px;
+      display: flex; gap: 12px; align-items: center; justify-content: space-between;
+      color: var(--text-secondary); font-size: 12px;
+    }
+    .proto-banner strong { color: var(--accent); font-weight: 600; }
+    .proto-banner .actions { display: flex; gap: 8px; }
+    .chip {
+      border: 1px solid var(--border-strong);
+      background: var(--raised);
+      border-radius: 6px;
+      padding: 3px 8px;
+      color: var(--text-secondary);
+    }
+    .chip:hover { color: var(--text); border-color: var(--text-ghost); }
+
+    /* health dots */
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot.healthy { background: var(--success); }
+    .dot.degraded { background: var(--warning); }
+    .dot.down { background: var(--danger); }
+    .dot.asleep { background: var(--text-ghost); }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+      color: var(--text-secondary);
+    }
+
+    /* ===== Variant A: columns ===== */
+    .a-shell { display: flex; flex-direction: column; height: calc(100% - 36px); }
+    .a-header {
+      padding: 16px 20px 8px;
+      display: flex; justify-content: space-between; align-items: baseline;
+    }
+    .a-header h1 { margin: 0; font-size: 18px; font-weight: 560; letter-spacing: -0.02em; }
+    .a-header span { color: var(--text-tertiary); font-size: 12px; }
+    .a-cols {
+      flex: 1; display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px;
+      background: var(--border); margin: 8px 12px 80px; border-radius: 10px; overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .a-col { background: var(--surface); padding: 14px 14px 18px; min-height: 0; overflow: auto; }
+    .a-col.selected { background: var(--raised); outline: 1px solid var(--accent); outline-offset: -1px; }
+    .a-col-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .a-col-head h2 { margin: 0; font-size: 14px; font-weight: 560; }
+    .a-meta { color: var(--text-tertiary); font-size: 11px; margin-bottom: 14px; }
+    .a-signal {
+      display: grid; grid-template-columns: 1fr auto; gap: 4px 10px;
+      padding: 8px 0; border-top: 1px solid var(--border);
+    }
+    .a-signal .name { color: var(--text); }
+    .a-signal .val { color: var(--text-secondary); font-variant-numeric: tabular-nums; text-align: right; }
+    .a-signal .hint { grid-column: 1 / -1; color: var(--text-ghost); font-size: 11px; }
+    .a-detail {
+      margin: 0 12px 80px; padding: 12px 14px; background: var(--inset);
+      border: 1px solid var(--border); border-radius: 8px; color: var(--text-secondary);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+      white-space: pre-wrap;
+    }
+
+    /* ===== Variant B: matrix ===== */
+    .b-shell { padding: 16px 20px 90px; }
+    .b-shell h1 { margin: 0 0 4px; font-size: 18px; font-weight: 560; }
+    .b-sub { color: var(--text-tertiary); margin-bottom: 16px; }
+    .b-table {
+      width: 100%; border-collapse: separate; border-spacing: 0;
+      border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+    }
+    .b-table th, .b-table td {
+      border-bottom: 1px solid var(--border); border-right: 1px solid var(--border);
+      padding: 10px 12px; text-align: left; vertical-align: middle;
+    }
+    .b-table th:last-child, .b-table td:last-child { border-right: none; }
+    .b-table tr:last-child td { border-bottom: none; }
+    .b-table thead th { background: var(--inset); color: var(--text-secondary); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .b-table tbody th { background: var(--surface); color: var(--text-secondary); font-weight: 500; width: 22%; }
+    .b-cell { cursor: pointer; }
+    .b-cell:hover { background: var(--raised); }
+    .b-cell.active { box-shadow: inset 0 0 0 1px var(--accent); }
+    .b-cell-inner { display: flex; flex-direction: column; gap: 2px; }
+    .b-cell-inner .val { font-variant-numeric: tabular-nums; }
+    .b-drift {
+      margin-top: 16px; padding: 12px 14px; background: var(--raised);
+      border: 1px solid var(--border-strong); border-radius: 8px;
+    }
+    .b-drift h3 { margin: 0 0 6px; font-size: 13px; font-weight: 560; }
+    .b-drift ul { margin: 0; padding-left: 18px; color: var(--text-secondary); }
+    .b-state {
+      margin-top: 12px; padding: 10px 12px; background: var(--inset);
+      border-radius: 8px; font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+      color: var(--text-secondary); white-space: pre-wrap;
+    }
+
+    /* ===== Variant C: sidebar + detail ===== */
+    .c-shell { display: grid; grid-template-columns: 220px 1fr; height: calc(100% - 36px); }
+    .c-side {
+      background: var(--sidebar); border-right: 1px solid var(--border-strong);
+      padding: 12px 10px; display: flex; flex-direction: column; gap: 12px;
+    }
+    .c-brand { font-size: 14px; font-weight: 600; letter-spacing: -0.02em; padding: 4px 8px; }
+    .c-brand span { color: var(--accent); }
+    .c-section { color: var(--text-ghost); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; padding: 0 8px; margin-bottom: 4px; }
+    .c-item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 7px 8px; border-radius: 6px; color: var(--text-secondary); width: 100%; text-align: left;
+    }
+    .c-item:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+    [data-theme="light"] .c-item:hover { background: rgba(0,0,0,0.04); }
+    .c-item.active { background: rgba(255,255,255,0.06); color: var(--text); }
+    [data-theme="light"] .c-item.active { background: rgba(0,0,0,0.06); }
+    .c-main { display: flex; flex-direction: column; min-width: 0; overflow: auto; padding-bottom: 80px; }
+    .c-top {
+      padding: 18px 22px 10px; display: flex; justify-content: space-between; align-items: flex-start;
+      border-bottom: 1px solid var(--border);
+    }
+    .c-top h1 { margin: 0; font-size: 20px; font-weight: 560; letter-spacing: -0.02em; }
+    .c-top .sub { color: var(--text-tertiary); margin-top: 4px; }
+    .c-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 10px; padding: 16px 22px;
+    }
+    .c-card {
+      background: var(--raised); border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px; cursor: pointer; text-align: left; width: 100%;
+    }
+    .c-card:hover { border-color: var(--border-strong); }
+    .c-card.active { border-color: var(--accent); }
+    .c-card .label { color: var(--text-tertiary); font-size: 11px; margin-bottom: 6px; }
+    .c-card .value { font-size: 15px; font-variant-numeric: tabular-nums; }
+    .c-card .note { color: var(--text-ghost); font-size: 11px; margin-top: 6px; }
+    .c-compare {
+      margin: 0 22px 16px; padding: 12px 14px; border: 1px dashed var(--border-strong);
+      border-radius: 8px; background: var(--inset);
+    }
+    .c-compare h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-tertiary); font-weight: 500; }
+    .c-compare .row { display: flex; gap: 16px; flex-wrap: wrap; color: var(--text-secondary); }
+    .c-state {
+      margin: 0 22px 20px; padding: 10px 12px; background: var(--inset);
+      border-radius: 8px; font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+      color: var(--text-secondary); white-space: pre-wrap;
+    }
+
+    /* floating switcher — deliberately not part of the design */
+    .switcher {
+      position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+      z-index: 50; display: flex; align-items: center; gap: 10px;
+      background: #111; color: #f5f5f5; border: 1px solid #333;
+      border-radius: 999px; padding: 8px 12px; box-shadow: 0 8px 28px rgba(0,0,0,0.45);
+      font-size: 12px; font-family: var(--font);
+    }
+    [data-theme="light"] .switcher { background: #1a1a1a; }
+    .switcher button {
+      width: 28px; height: 28px; border-radius: 50%;
+      background: #2a2a2a; color: #fff; font-size: 14px;
+    }
+    .switcher button:hover { background: #3a3a3a; }
+    .switcher .label { min-width: 200px; text-align: center; font-weight: 500; }
+    .switcher .label small { display: block; color: #999; font-weight: 400; margin-top: 1px; }
+  </style>
+</head>
+<body>
+  <div class="proto-banner">
+    <div><strong>PROTOTYPE</strong> — environments overview · fake data · not GPUI (layout only)</div>
+    <div class="actions">
+      <button class="chip" id="themeToggle" type="button">Theme: dark</button>
+      <button class="chip" type="button" onclick="location.reload()">Reset</button>
+    </div>
+  </div>
+  <div id="app"></div>
+  <div class="switcher" id="switcher" aria-label="Prototype variant switcher">
+    <button type="button" id="prev" aria-label="Previous variant">←</button>
+    <div class="label" id="switcherLabel"></div>
+    <button type="button" id="next" aria-label="Next variant">→</button>
+  </div>
+
+  <script>
+    // —— fake domain state (mirrors CONTEXT + #9) ——
+    const SIGNALS = [
+      { id: "availability", name: "Availability", kind: "point" },
+      { id: "jobs", name: "Scheduled jobs", kind: "trend" },
+      { id: "mid", name: "MID / ECC", kind: "point" },
+      { id: "syslog", name: "Syslog errors", kind: "trend" },
+      { id: "drift", name: "Version / plugins", kind: "point" },
+      { id: "clone", name: "Last clone", kind: "point" },
+      { id: "outbound", name: "Outbound / integrations", kind: "point" },
+    ];
+
+    const ENVIRONMENTS = [
+      {
+        id: "prod", label: "prod", url: "https://prod.example.service-now.com",
+        health: "degraded",
+        signals: {
+          availability: { state: "healthy", value: "142 ms · Australia patch3" },
+          jobs: { state: "degraded", value: "2 overdue · 1 error", hint: "24h: rising" },
+          mid: { state: "healthy", value: "3/3 up · queue 12" },
+          syslog: { state: "degraded", value: "38 errors / h", hint: "24h trend ↑" },
+          drift: { state: "healthy", value: "source of truth" },
+          clone: { state: "healthy", value: "source" },
+          outbound: { state: "degraded", value: "4 HTTP fail · 1 email" },
+        },
+      },
+      {
+        id: "test", label: "test", url: "https://test.example.service-now.com",
+        health: "healthy",
+        signals: {
+          availability: { state: "healthy", value: "168 ms · Australia patch3" },
+          jobs: { state: "healthy", value: "0 overdue" },
+          mid: { state: "healthy", value: "2/2 up · queue 3" },
+          syslog: { state: "healthy", value: "4 errors / h" },
+          drift: { state: "degraded", value: "3 plugins behind prod" },
+          clone: { state: "healthy", value: "12 days ago" },
+          outbound: { state: "healthy", value: "0 failures" },
+        },
+      },
+      {
+        id: "dev", label: "dev", url: "https://dev.example.service-now.com",
+        health: "down",
+        signals: {
+          availability: { state: "down", value: "unreachable (VPN?)" },
+          jobs: { state: "down", value: "—" },
+          mid: { state: "down", value: "—" },
+          syslog: { state: "down", value: "—" },
+          drift: { state: "down", value: "—" },
+          clone: { state: "degraded", value: "41 days ago" },
+          outbound: { state: "down", value: "—" },
+        },
+      },
+    ];
+
+    const VARIANTS = {
+      A: { key: "A", name: "Environment columns" },
+      B: { key: "B", name: "Signal × Environment matrix" },
+      C: { key: "C", name: "Sidebar + Environment detail" },
+    };
+    const ORDER = ["A", "B", "C"];
+
+    const ui = {
+      selectedEnv: "prod",
+      selectedSignal: "jobs",
+      selectedCell: { env: "prod", signal: "jobs" },
+    };
+
+    function params() {
+      return new URLSearchParams(location.search);
+    }
+    function currentVariant() {
+      const v = (params().get("variant") || "A").toUpperCase();
+      return ORDER.includes(v) ? v : "A";
+    }
+    function setVariant(v) {
+      const p = params();
+      p.set("variant", v);
+      history.replaceState(null, "", "?" + p.toString());
+      render();
+    }
+    function cycle(dir) {
+      const i = ORDER.indexOf(currentVariant());
+      setVariant(ORDER[(i + dir + ORDER.length) % ORDER.length]);
+    }
+    function theme() {
+      return document.documentElement.getAttribute("data-theme") || "dark";
+    }
+    function setTheme(t) {
+      document.documentElement.setAttribute("data-theme", t);
+      localStorage.setItem("daku-proto-theme", t);
+      document.getElementById("themeToggle").textContent = "Theme: " + t;
+    }
+
+    function healthLabel(h) {
+      return `<span class="badge"><span class="dot ${h}"></span>${h}</span>`;
+    }
+
+    function stateDump(extra) {
+      return JSON.stringify({ variant: currentVariant(), theme: theme(), ui, ...extra }, null, 2);
+    }
+
+    // —— Variant A ——
+    function renderA() {
+      const cols = ENVIRONMENTS.map((env) => {
+        const selected = ui.selectedEnv === env.id ? " selected" : "";
+        const signals = SIGNALS.map((s) => {
+          const sig = env.signals[s.id];
+          return `<div class="a-signal">
+            <div class="name">${healthLabel(sig.state)} ${s.name}</div>
+            <div class="val">${sig.value}</div>
+            ${sig.hint ? `<div class="hint">${sig.hint}</div>` : ""}
+          </div>`;
+        }).join("");
+        return `<button type="button" class="a-col${selected}" data-env="${env.id}">
+          <div class="a-col-head"><h2>${env.label}</h2>${healthLabel(env.health)}</div>
+          <div class="a-meta">${env.url.replace("https://", "")}</div>
+          ${signals}
+        </button>`;
+      }).join("");
+
+      const env = ENVIRONMENTS.find((e) => e.id === ui.selectedEnv);
+      return `<div class="a-shell">
+        <div class="a-header">
+          <h1>ServiceNow</h1>
+          <span>glance · ~2 min · columns per Environment</span>
+        </div>
+        <div class="a-cols">${cols}</div>
+        <div class="a-detail">${stateDump({ focus: env })}</div>
+      </div>`;
+    }
+
+    // —— Variant B ——
+    function renderB() {
+      const head = `<tr><th>Signal</th>${ENVIRONMENTS.map((e) =>
+        `<th>${e.label} ${healthLabel(e.health)}</th>`).join("")}</tr>`;
+      const rows = SIGNALS.map((s) => {
+        const cells = ENVIRONMENTS.map((e) => {
+          const sig = e.signals[s.id];
+          const active = ui.selectedCell.env === e.id && ui.selectedCell.signal === s.id ? " active" : "";
+          return `<td class="b-cell${active}" data-env="${e.id}" data-signal="${s.id}">
+            <div class="b-cell-inner">
+              ${healthLabel(sig.state)}
+              <span class="val">${sig.value}</span>
+            </div>
+          </td>`;
+        }).join("");
+        return `<tr><th>${s.name}</th>${cells}</tr>`;
+      }).join("");
+
+      const driftBits = [
+        "test: 3 plugins behind prod",
+        "dev: unreachable — last clone 41d (stale vs prod)",
+        "prod build Australia patch3 · test matches · dev unknown",
+      ];
+
+      return `<div class="b-shell">
+        <h1>ServiceNow — matrix</h1>
+        <div class="b-sub">Every Signal × every Environment at once · best for drift scanning</div>
+        <table class="b-table"><thead>${head}</thead><tbody>${rows}</tbody></table>
+        <div class="b-drift">
+          <h3>Cross-Environment drift</h3>
+          <ul>${driftBits.map((d) => `<li>${d}</li>`).join("")}</ul>
+        </div>
+        <div class="b-state">${stateDump({})}</div>
+      </div>`;
+    }
+
+    // —— Variant C ——
+    function renderC() {
+      const env = ENVIRONMENTS.find((e) => e.id === ui.selectedEnv);
+      const items = ENVIRONMENTS.map((e) =>
+        `<button type="button" class="c-item${ui.selectedEnv === e.id ? " active" : ""}" data-env="${e.id}">
+          <span class="dot ${e.health}"></span>${e.label}
+        </button>`).join("");
+
+      const cards = SIGNALS.map((s) => {
+        const sig = env.signals[s.id];
+        const active = ui.selectedSignal === s.id ? " active" : "";
+        return `<button type="button" class="c-card${active}" data-signal="${s.id}">
+          <div class="label">${healthLabel(sig.state)} ${s.name}</div>
+          <div class="value">${sig.value}</div>
+          ${sig.hint ? `<div class="note">${sig.hint}</div>` : ""}
+        </button>`;
+      }).join("");
+
+      const others = ENVIRONMENTS.filter((e) => e.id !== env.id)
+        .map((e) => {
+          const d = e.signals.drift.value;
+          const c = e.signals.clone.value;
+          return `<span><strong>${e.label}</strong>: drift ${d} · clone ${c}</span>`;
+        }).join("");
+
+      return `<div class="c-shell">
+        <aside class="c-side">
+          <div class="c-brand">daku <span>·</span> ServiceNow</div>
+          <div>
+            <div class="c-section">Platforms</div>
+            <button type="button" class="c-item active"><span class="dot healthy"></span>ServiceNow</button>
+          </div>
+          <div>
+            <div class="c-section">Environments</div>
+            ${items}
+          </div>
+        </aside>
+        <main class="c-main">
+          <div class="c-top">
+            <div>
+              <h1>${env.label}</h1>
+              <div class="sub">${env.url} · ${healthLabel(env.health)} · polled ~2 min ago</div>
+            </div>
+          </div>
+          <div class="c-grid">${cards}</div>
+          <div class="c-compare">
+            <h3>vs other Environments</h3>
+            <div class="row">${others}</div>
+          </div>
+          <div class="c-state">${stateDump({ focusSignal: ui.selectedSignal })}</div>
+        </main>
+      </div>`;
+    }
+
+    function render() {
+      const v = currentVariant();
+      const app = document.getElementById("app");
+      app.innerHTML = v === "A" ? renderA() : v === "B" ? renderB() : renderC();
+      const meta = VARIANTS[v];
+      document.getElementById("switcherLabel").innerHTML =
+        `${meta.key} — ${meta.name}<small>?variant=${meta.key}</small>`;
+
+      // bind clicks
+      app.querySelectorAll("[data-env]").forEach((el) => {
+        el.addEventListener("click", () => {
+          ui.selectedEnv = el.getAttribute("data-env");
+          if (el.hasAttribute("data-signal")) {
+            ui.selectedCell = { env: ui.selectedEnv, signal: el.getAttribute("data-signal") };
+            ui.selectedSignal = ui.selectedCell.signal;
+          }
+          render();
+        });
+      });
+      app.querySelectorAll("[data-signal]:not([data-env])").forEach((el) => {
+        el.addEventListener("click", () => {
+          ui.selectedSignal = el.getAttribute("data-signal");
+          render();
+        });
+      });
+    }
+
+    document.getElementById("prev").onclick = () => cycle(-1);
+    document.getElementById("next").onclick = () => cycle(1);
+    document.getElementById("themeToggle").onclick = () =>
+      setTheme(theme() === "dark" ? "light" : "dark");
+
+    window.addEventListener("keydown", (e) => {
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      if (e.key === "ArrowLeft") cycle(-1);
+      if (e.key === "ArrowRight") cycle(1);
+    });
+
+    setTheme(localStorage.getItem("daku-proto-theme") || "dark");
+    render();
+  </script>
+</body>
+</html>
