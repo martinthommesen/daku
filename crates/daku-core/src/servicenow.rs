@@ -418,6 +418,7 @@ mod tests {
             instance_url: "https://acme-dev.example.service-now.com".into(),
             auth_method: AuthMethod::Basic,
             sort_order: 0,
+            clone_source: false,
         }
     }
 
@@ -428,6 +429,7 @@ mod tests {
             instance_url: "https://acme-prod.example.service-now.com".into(),
             auth_method: AuthMethod::OauthClientCredentials,
             sort_order: 0,
+            clone_source: false,
         }
     }
 

@@ -2,17 +2,19 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use daku_protocol::settings::DaemonSettings;
 
 use crate::availability::AvailabilityCollector;
 use crate::config::{
-    CredentialStore, EnvironmentConfig, KeychainCredentialStore, load_environments,
+    load_environments, CredentialStore, EnvironmentConfig, KeychainCredentialStore,
 };
+use crate::drift::DriftCollector;
 use crate::jobs::JobsCollector;
+use crate::last_clone::LastCloneCollector;
 use crate::mid_ecc::MidEccCollector;
 use crate::outbound::OutboundCollector;
 use crate::persistence::StateStore;
@@ -121,6 +123,19 @@ pub fn build_default_loop(
         store.clone(),
     ));
     loop_.register(OutboundCollector::new(
+        environments.clone(),
+        credentials.clone(),
+        client.clone(),
+        store.clone(),
+    ));
+    loop_.register(DriftCollector::new(
+        environments.clone(),
+        credentials.clone(),
+        client.clone(),
+        store.clone(),
+        interval,
+    ));
+    loop_.register(LastCloneCollector::new(
         environments,
         credentials,
         client,
@@ -186,7 +201,7 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::availability::{AVAILABILITY_SIGNAL_ID, AvailabilityCollector};
+    use crate::availability::{AvailabilityCollector, AVAILABILITY_SIGNAL_ID};
     use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore};
     use crate::persistence::{self, StateStore};
     use crate::servicenow::{
@@ -223,6 +238,7 @@ mod tests {
                 instance_url: "https://acme-prod.example.service-now.com".into(),
                 auth_method: AuthMethod::Basic,
                 sort_order: 0,
+                clone_source: false,
             }],
             credentials,
             ServiceNowClient::new(FixtureTransport, SystemClock),

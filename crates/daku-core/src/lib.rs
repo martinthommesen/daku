@@ -3,8 +3,10 @@
 pub mod availability;
 pub mod collector;
 pub mod config;
+pub mod drift;
 pub mod hollow_backend;
 pub mod jobs;
+pub mod last_clone;
 pub mod mid_ecc;
 pub mod outbound;
 pub mod persistence;

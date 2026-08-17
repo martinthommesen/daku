@@ -26,6 +26,8 @@ pub struct EnvironmentConfig {
     pub instance_url: String,
     pub auth_method: AuthMethod,
     pub sort_order: i64,
+    #[serde(default)]
+    pub clone_source: bool,
 }
 
 pub fn default_environments_path() -> PathBuf {
@@ -111,6 +113,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments.example.json");
         let environments = load_environments(&path).unwrap();
         assert_eq!(environments[0].id, "prod");
+        assert!(environments[0].clone_source);
         assert_eq!(
             environments[0].auth_method,
             AuthMethod::OauthClientCredentials

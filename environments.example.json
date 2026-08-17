@@ -4,7 +4,8 @@
     "label": "Production",
     "instance_url": "https://acme-prod.example.service-now.com",
     "auth_method": "oauth_client_credentials",
-    "sort_order": 0
+    "sort_order": 0,
+    "clone_source": true
   },
   {
     "id": "test",

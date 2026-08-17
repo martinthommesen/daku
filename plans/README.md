@@ -29,7 +29,7 @@ Drift checks use `567179a..HEAD` against each plan’s **Scope** paths (not only
 | [004](004-jobs-syslog-trends.md) | Scheduled jobs + syslog Signals with ~24h trends | P1 | DONE | 003 |
 | [005](005-mid-ecc-signal.md) | MID/ECC Signal | P2 | DONE | 003 (soft: 004) |
 | [006](006-outbound-signal.md) | Outbound/integration failures Signal | P2 | DONE | 003 (soft: 004) |
-| [007](007-drift-last-clone.md) | Version/plugin drift + last-clone Signals | P2 | TODO | 003 |
+| [007](007-drift-last-clone.md) | Version/plugin drift + last-clone Signals | P2 | DONE | 003 |
 | [008](008-health-rollup-protocol.md) | Environment health rollup + protocol events (+ samples) | P1 | TODO | **003** (stubs OK) |
 | [009](009-gpui-shell-variant-c.md) | GPUI shell — sidebar + detail + job/syslog sparklines | P1 | TODO | 008 |
 | [010](010-dmg-sparkle-homebrew.md) | Notarised DMG + Sparkle; Homebrew cask alternate | P3 | TODO | 009 |

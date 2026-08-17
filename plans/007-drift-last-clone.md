@@ -93,10 +93,10 @@ Add `"clone_source": true` on the prod-like example entry in the existing exampl
 
 ## Done criteria
 
-- [ ] Diff/drift/clone `cargo test` filters exit 0
-- [ ] `rg -n '"drift"|"last_clone"|last_clone' crates/daku-core` → both signal ids present
-- [ ] `clone_source` present in example JSON (`rg` above)
-- [ ] `plans/README.md` row 007 Status = `DONE`
+- [x] Diff/drift/clone `cargo test` filters exit 0
+- [x] `rg -n '"drift"|"last_clone"|last_clone' crates/daku-core` → both signal ids present
+- [x] `clone_source` present in example JSON (`rg` above)
+- [x] `plans/README.md` row 007 Status = `DONE`
 
 ## STOP conditions
 
