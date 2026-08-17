@@ -100,7 +100,14 @@ impl DaemonClient {
         for message in self.inner.dashboard_cache.lock().values() {
             let _ = events.send(message.clone());
         }
-        self.inner.dashboard.lock().push(events);
+        let mut dashboard = self.inner.dashboard.lock();
+        // The reader thread flips `disconnected` and then clears this list
+        // exactly once; a sender registered after that would never be dropped
+        // and `recv()` would block forever instead of letting the caller move
+        // to the next client. Checking under the lock closes both orderings.
+        if !self.inner.disconnected.load(Ordering::Acquire) {
+            dashboard.push(events);
+        }
         receiver
     }
 
@@ -287,6 +294,25 @@ fn read_server_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscribe_dashboard_after_disconnect_closes_immediately() {
+        // A sender registered after the reader thread's cleanup would never be
+        // dropped and the desktop would block on `recv()` forever.
+        let (outgoing, _rx) = unbounded();
+        let client = DaemonClient {
+            inner: Arc::new(ClientInner {
+                outgoing,
+                pending: Mutex::new(HashMap::new()),
+                dashboard: Mutex::new(Vec::new()),
+                dashboard_cache: Mutex::new(BTreeMap::new()),
+                disconnected: AtomicBool::new(true),
+            }),
+        };
+        let receiver = client.subscribe_dashboard();
+        assert!(receiver.recv().is_err());
+        assert!(client.inner.dashboard.lock().is_empty());
+    }
 
     #[test]
     fn daemon_endpoint_accepts_addresses_and_secure_urls() {
