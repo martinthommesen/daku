@@ -16,6 +16,9 @@ This tree is a **partial fork** of [egoist/waku](https://github.com/egoist/waku)
 | Bun | current (schema / `scripts/dev.ts`) |
 | Xcode / clang | macOS builds |
 
+Release builds keep line-table debuginfo in a separate `.dSYM`
+(`split-debuginfo = "packed"`); the shipped binaries are stripped.
+
 ## Build
 
 ```sh

@@ -43,6 +43,9 @@ Appcast signing needs the Sparkle private key in the login keychain or
 `SPARKLE_PRIVATE_KEY` (CI / release secrets only). Put the matching public
 key in `resources/Info.plist` as `SUPublicEDKey` — public half only.
 
+Keep `dist/Daku-x.y.z-dSYM.zip` with the release (crash symbolication); it is
+not a Sparkle asset.
+
 Homebrew / cask builds must not also auto-update via Sparkle. Compile that
 artifact with `DAKU_CHANNEL=homebrew` (passes `--features channel-homebrew`,
 skips embedding Sparkle, writes `dist/Daku-x.y.z-homebrew.dmg`). Runtime

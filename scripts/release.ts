@@ -150,6 +150,25 @@ const zipPath = resolve(projectRoot, "dist", zipName);
 await mkdir(dirname(zipPath), { recursive: true });
 await $`ditto -c -k --keepParent ${appBundle} ${zipPath}`;
 
+// Symbols for crash symbolication; the shipped binaries stay stripped.
+const symbolsDirectory = resolve(projectRoot, "dist", `${appName}-${version}-dSYM`);
+await rm(symbolsDirectory, { force: true, recursive: true });
+await mkdir(symbolsDirectory, { recursive: true });
+for (const binary of [packageName, `${packageName}-daemon`]) {
+  const symbols = join(projectRoot, "target", "release", `${binary}.dSYM`);
+  try {
+    await access(symbols);
+  } catch {
+    throw new Error(
+      `Missing ${symbols} — build the release profile before packaging.`,
+    );
+  }
+  await $`ditto ${symbols} ${join(symbolsDirectory, `${binary}.dSYM`)}`;
+}
+const symbolsZip = `${symbolsDirectory}.zip`;
+await $`ditto -c -k --keepParent ${symbolsDirectory} ${symbolsZip}`;
+await rm(symbolsDirectory, { force: true, recursive: true });
+
 const updatesDirectory = join(projectRoot, "dist", "updates");
 await rm(updatesDirectory, { force: true, recursive: true });
 await mkdir(updatesDirectory, { recursive: true });
@@ -173,6 +192,7 @@ try {
 console.log(`\nApp ready: ${appBundle}`);
 console.log(`DMG ready: ${outputPath}`);
 console.log(`ZIP ready: ${zipPath}`);
+console.log(`Symbols ready: ${symbolsZip}`);
 console.log(
   "Upload the DMG, the ZIP (Sparkle enclosure) and appcast.xml to a GitHub Release when notarised.",
 );
