@@ -14,6 +14,9 @@ use crate::dashboard_state::{
 use crate::theme::Theme;
 use crate::{CloseWindow, ToggleFpsCounter};
 
+/// Sidebar width shared by the GPUI sidebar and the AppKit tint layer.
+pub const SIDEBAR_WIDTH: f32 = 220.0;
+
 pub struct Daku {
     state: DashboardState,
     _supervisor: Option<DaemonSupervisor>,
@@ -22,14 +25,10 @@ pub struct Daku {
 
 impl Daku {
     pub fn new(
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut App,
         supervisor: Option<DaemonSupervisor>,
     ) -> Entity<Self> {
-        window.on_window_should_close(cx, |window, _cx| {
-            crate::platform::hide_window(window);
-            false
-        });
         cx.new(|cx| {
             let mut state = DashboardState::new();
             if ui_fixture_enabled() {
@@ -166,7 +165,7 @@ impl Render for Daku {
 impl Daku {
     fn render_sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .w(px(220.0))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex()
             .flex_col()

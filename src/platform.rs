@@ -66,74 +66,6 @@ fn parse_boolean_setting(value: &str) -> Option<bool> {
     }
 }
 
-/// Notifications return in Signal UI plans; the current shell has no task banners.
-pub fn show_task_notification(_tag: &str, _title: &str, _body: &str, _: &gpui::App) {}
-
-#[cfg(target_os = "macos")]
-pub fn load_app_icon_for_bundle_id(bundle_id: &str) -> Option<std::sync::Arc<gpui::Image>> {
-    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSWorkspace};
-    use objc2_foundation::{NSDictionary, NSSize, NSString};
-
-    let bundle_id = NSString::from_str(bundle_id);
-    let workspace = NSWorkspace::sharedWorkspace();
-    let application_url = workspace.URLForApplicationWithBundleIdentifier(&bundle_id)?;
-    let application_path = application_url.path()?;
-    let image = workspace.iconForFile(&application_path);
-    image.setSize(NSSize::new(32.0, 32.0));
-    let tiff_data = image.TIFFRepresentation()?;
-    let bitmap_rep = NSBitmapImageRep::imageRepWithData(&tiff_data)?;
-    let properties = NSDictionary::new();
-    let png_data = unsafe {
-        bitmap_rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
-    }?;
-    let bytes = unsafe { png_data.as_bytes_unchecked() };
-    (!bytes.is_empty()).then(|| {
-        std::sync::Arc::new(gpui::Image::from_bytes(
-            gpui::ImageFormat::Png,
-            bytes.to_vec(),
-        ))
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn load_app_icon_for_bundle_id(_: &str) -> Option<std::sync::Arc<gpui::Image>> {
-    None
-}
-
-/// Select `path` in the platform file manager. GPUI dispatches Linux portal
-/// and subprocess work away from the UI thread.
-pub fn reveal_in_file_manager(path: &std::path::Path, cx: &gpui::App) {
-    cx.reveal_path(path);
-}
-
-/// Open `path` with its default application — a document in its editor.
-pub fn open_with_default_app(path: &std::path::Path, cx: &gpui::App) {
-    cx.open_with_system(path);
-}
-
-/// Decode the embedded desktop icon once. X11 consumes the RGBA pixels from
-/// `WindowOptions`; Wayland associates the window through `app_id` and its
-/// installed desktop entry.
-#[cfg(target_os = "linux")]
-pub fn linux_app_icon() -> Option<std::sync::Arc<image::RgbaImage>> {
-    static ICON: std::sync::LazyLock<Option<std::sync::Arc<image::RgbaImage>>> =
-        std::sync::LazyLock::new(|| {
-            image::load_from_memory(include_bytes!("../website/public/app-icon.png"))
-                .ok()
-                .map(|image| std::sync::Arc::new(image.into_rgba8()))
-        });
-    ICON.clone()
-}
-
-/// A compact shortcut label for the platform's primary GUI modifier.
-pub const fn primary_shortcut<'a>(macos: &'a str, other: &'a str) -> &'a str {
-    if cfg!(target_os = "macos") {
-        macos
-    } else {
-        other
-    }
-}
-
 /// Keep daku's single main window alive when the user closes it. This preserves
 /// the current session and lets a Dock activation reveal the same GPUI window.
 #[cfg(target_os = "macos")]
@@ -182,26 +114,6 @@ pub fn hide_window(window: &mut Window) {
 thread_local! {
     static SIDEBAR_TINT_VIEW: std::cell::RefCell<Option<objc2::rc::Retained<objc2_app_kit::NSView>>> =
         const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(target_os = "macos")]
-const SIDEBAR_WIDTH: f64 = 252.0;
-
-pub fn start_window_move(window: &Window) {
-    window.start_window_move();
-}
-
-/// Perform the platform's titlebar double-click action. GPUI delegates this
-/// to the user's system preference on macOS, while Linux client decorations
-/// must toggle maximize explicitly.
-pub fn titlebar_double_click(window: &Window) {
-    #[cfg(target_os = "macos")]
-    window.titlebar_double_click();
-
-    #[cfg(not(target_os = "macos"))]
-    if window.window_controls().maximize && window.is_resizable() {
-        window.zoom_window();
-    }
 }
 
 /// Match Cursor's macOS glass window stack without asking GPUI's transparent
@@ -271,7 +183,7 @@ pub fn configure_sidebar_material(window: &Window, dark: bool) {
             });
             if needs_new_view {
                 let mut frame = content_view.bounds();
-                frame.size.width = SIDEBAR_WIDTH;
+                frame.size.width = f64::from(crate::app::SIDEBAR_WIDTH);
                 let tint_view = NSView::initWithFrame(NSView::alloc(main_thread), frame);
                 tint_view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
                 tint_view.setWantsLayer(true);
@@ -293,86 +205,6 @@ pub fn configure_sidebar_material(window: &Window, dark: bool) {
 #[cfg(not(target_os = "macos"))]
 pub fn configure_sidebar_material(_: &Window, _: bool) {}
 
-#[cfg(target_os = "macos")]
-pub fn set_sidebar_material_width(window: &Window, width: f32) {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSView;
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let Ok(handle) = HasWindowHandle::window_handle(window) else {
-        return;
-    };
-    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-        return;
-    };
-    let Some(_main_thread) = MainThreadMarker::new() else {
-        return;
-    };
-
-    unsafe {
-        let view = handle.ns_view.cast::<NSView>().as_ref();
-        let Some(native_window) = view.window() else {
-            return;
-        };
-        SIDEBAR_TINT_VIEW.with_borrow(|slot| {
-            let Some(tint_view) = slot.as_ref().filter(|tint_view| {
-                tint_view
-                    .window()
-                    .as_deref()
-                    .is_some_and(|window| std::ptr::eq(window, native_window.as_ref()))
-            }) else {
-                return;
-            };
-            let mut frame = tint_view.frame();
-            frame.size.width = width.into();
-            tint_view.setFrame(frame);
-        });
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn set_sidebar_material_width(_: &Window, _: f32) {}
-
-/// Follow macOS when `dark` is `None`, otherwise force the native titlebar,
-/// traffic lights, menus, and vibrancy to the selected appearance.
-#[cfg(target_os = "macos")]
-pub fn set_window_appearance(window: &Window, dark: Option<bool>) {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::{
-        NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
-        NSView,
-    };
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let Ok(handle) = HasWindowHandle::window_handle(window) else {
-        return;
-    };
-    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-        return;
-    };
-    let Some(_main_thread) = MainThreadMarker::new() else {
-        return;
-    };
-
-    unsafe {
-        let view = handle.ns_view.cast::<NSView>().as_ref();
-        let Some(native_window) = view.window() else {
-            return;
-        };
-        let appearance = dark.and_then(|dark| {
-            NSAppearance::appearanceNamed(if dark {
-                NSAppearanceNameDarkAqua
-            } else {
-                NSAppearanceNameAqua
-            })
-        });
-        native_window.setAppearance(appearance.as_deref());
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn set_window_appearance(_: &Window, _: Option<bool>) {}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::parse_boolean_setting;
@@ -382,12 +214,5 @@ mod tests {
         assert_eq!(parse_boolean_setting(" true\n"), Some(true));
         assert_eq!(parse_boolean_setting("OFF"), Some(false));
         assert_eq!(parse_boolean_setting("default"), None);
-    }
-
-    #[test]
-    fn embedded_linux_icon_decodes_at_desktop_size() {
-        let icon = super::linux_app_icon().expect("embedded PNG should decode");
-
-        assert_eq!(icon.dimensions(), (256, 256));
     }
 }
