@@ -27,6 +27,9 @@ Feed URL (in `resources/Info.plist`):
 
 `https://github.com/martinthommesen/daku/releases/latest/download/appcast.xml`
 
+`CFBundleVersion` is set to the Cargo version at bundle time; bump `version`
+in `Cargo.toml` for every release or Sparkle will not offer the update.
+
 After a notarised build:
 
 ```sh
@@ -34,7 +37,8 @@ bun run release --signing-identity "Developer ID Application: …"
 bun scripts/appcast.ts dist/updates
 ```
 
-Attach `dist/Daku-x.y.z.dmg` and `dist/appcast.xml` to the GitHub Release.
+Attach `dist/Daku-x.y.z.dmg`, `dist/Daku-x.y.z.zip` (the Sparkle enclosure
+referenced by the appcast) and `dist/appcast.xml` to the GitHub Release.
 Appcast signing needs the Sparkle private key in the login keychain or
 `SPARKLE_PRIVATE_KEY` (CI / release secrets only). Put the matching public
 key in `resources/Info.plist` as `SUPublicEDKey` — public half only.
@@ -60,7 +64,8 @@ No secret values in issues, chat, or the repo.
 4. Sparkle Ed25519 keypair (`generate_keys` from the Sparkle `bin/`
    cache). Private key in release secrets / keychain; public key only in
    `Info.plist`.
-5. Appcast URL + GitHub Release asset name `Daku-x.y.z.dmg`.
+5. Appcast URL + GitHub Release asset names `Daku-x.y.z.dmg` and
+   `Daku-x.y.z.zip`.
 6. Test a notarised open on a second Mac; publish the cask with Sparkle
    disabled.
 

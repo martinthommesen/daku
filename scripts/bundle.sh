@@ -155,10 +155,17 @@ ensure_sparkle() {
     rm -rf "$sparkle_staging"
     return 1
   fi
-  echo "$sparkle_sha256  $sparkle_archive" | shasum -a 256 -c - >/dev/null
-  tar -xJf "$sparkle_archive" -C "$sparkle_staging" ./Sparkle.framework ./bin
+  if ! echo "$sparkle_sha256  $sparkle_archive" | shasum -a 256 -c - >/dev/null; then
+    echo "error: Sparkle $sparkle_version archive checksum mismatch" >&2
+    rm -rf "$sparkle_staging"
+    return 1
+  fi
+  if ! tar -xJf "$sparkle_archive" -C "$sparkle_staging" ./Sparkle.framework ./bin; then
+    rm -rf "$sparkle_staging"
+    return 1
+  fi
   rm "$sparkle_archive"
-  mv "$sparkle_staging" "$sparkle_cache_entry"
+  mv "$sparkle_staging" "$sparkle_cache_entry" || return 1
   sparkle_ok=1
 }
 
@@ -188,6 +195,9 @@ plutil -replace CFBundleExecutable -string "$app_name" "$contents/Info.plist"
 plutil -replace CFBundleIdentifier -string "$bundle_identifier" "$contents/Info.plist"
 plutil -replace CFBundleName -string "$app_name" "$contents/Info.plist"
 plutil -replace CFBundleShortVersionString -string "$version" "$contents/Info.plist"
+# Sparkle compares CFBundleVersion (sparkle:version). Keep it equal to the
+# semver so each release is strictly newer than the last.
+plutil -replace CFBundleVersion -string "$version" "$contents/Info.plist"
 
 sparkle_framework=""
 if [ "$profile" = "release" ] && [ "$sparkle_ok" = "1" ]; then

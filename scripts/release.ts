@@ -2,7 +2,7 @@
 
 import { $ } from "bun";
 import { access, mkdir, rm } from "node:fs/promises";
-import { dirname, extname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { defaultDownloadUrlPrefix, generateAppcast } from "./appcast";
 
@@ -16,15 +16,14 @@ const help = `Build a production Daku.app / DMG and (optionally) notarize it.
 Usage:
   bun run release [options]
 
-Does not upload. Attach dist/Daku-<version>.dmg and dist/appcast.xml to a
-GitHub Release. Notarisation needs a Developer ID + notary profile — see
+Does not upload. Attach dist/Daku-<version>.dmg, dist/Daku-<version>.zip
+(the Sparkle enclosure) and dist/appcast.xml to a GitHub Release. Notarisation needs a Developer ID + notary profile — see
 docs/packaging.md Appendix A. Missing credentials: use --unsigned or --adhoc.
 
 Options:
   --unsigned                    skip codesign (writes dist/Daku.app)
   --adhoc                       ad-hoc sign, no notarization
   --skip-notarize               signed DMG without notary
-  --output <path>               DMG output path (default: dist/Daku-<version>.dmg)
   --signing-identity <name>     Developer ID Application identity
                                 (or DAKU_CODESIGN_IDENTITY)
   --notary-profile <name>       notarytool keychain profile name only
@@ -39,7 +38,6 @@ const { values } = parseArgs({
     adhoc: { type: "boolean" },
     help: { type: "boolean", short: "h" },
     "notary-profile": { type: "string" },
-    output: { type: "string", short: "o" },
     "signing-identity": { type: "string" },
     "skip-build": { type: "boolean" },
     "skip-notarize": { type: "boolean" },
@@ -97,12 +95,11 @@ if (!cargoPackage) {
 }
 
 const version = cargoPackage.version;
-const dmgName = `${appName}-${version}.dmg`;
+const homebrewChannel = process.env.DAKU_CHANNEL === "homebrew";
+// Must match scripts/bundle.sh, which owns the DMG name.
+const dmgName = `${appName}-${version}${homebrewChannel ? "-homebrew" : ""}.dmg`;
 const zipName = `${appName}-${version}.zip`;
-const outputPath = resolve(projectRoot, values.output ?? join("dist", dmgName));
-if (extname(outputPath).toLowerCase() !== ".dmg") {
-  throw new Error(`Output path must end in .dmg: ${outputPath}`);
-}
+const outputPath = resolve(projectRoot, "dist", dmgName);
 
 const bundleScript = join(projectRoot, "scripts/bundle.sh");
 const skipCodesign = unsigned || (!configuredSigningIdentity && !adhoc);
@@ -120,6 +117,7 @@ if (skipCodesign) {
 
 const appBundle = join(projectRoot, "dist", `${appName}.app`);
 await access(appBundle);
+await access(outputPath);
 
 if (!unsigned && !adhoc && !skipNotarize && configuredSigningIdentity) {
   console.log("\n==> Submitting the DMG for Apple notarization");
@@ -175,4 +173,6 @@ try {
 console.log(`\nApp ready: ${appBundle}`);
 console.log(`DMG ready: ${outputPath}`);
 console.log(`ZIP ready: ${zipPath}`);
-console.log("Upload the DMG + appcast.xml to a GitHub Release when notarised.");
+console.log(
+  "Upload the DMG, the ZIP (Sparkle enclosure) and appcast.xml to a GitHub Release when notarised.",
+);
