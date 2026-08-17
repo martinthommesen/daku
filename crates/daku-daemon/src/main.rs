@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
     if arguments.probe_availability {
         return run_probe_availability();
     }
-    let auth = std::env::var(DAEMON_TOKEN_ENV).context("DAKU_DAEMON_TOKEN is missing")?;
+    let auth = require_token(std::env::var(DAEMON_TOKEN_ENV))?;
     // The bearer capability belongs only to this server process. Remove it
     // before any provider or workspace subprocess can inherit the daemon's
     // environment.
@@ -154,6 +154,14 @@ impl Arguments {
     }
 }
 
+fn require_token(value: Result<String, std::env::VarError>) -> anyhow::Result<String> {
+    let bearer = value.context("DAKU_DAEMON_TOKEN is missing")?;
+    if bearer.trim().is_empty() {
+        bail!("DAKU_DAEMON_TOKEN is empty; refusing to start an unauthenticated daemon");
+    }
+    Ok(bearer)
+}
+
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
     let result = unsafe { libc::kill(pid as i32, 0) };
@@ -199,6 +207,14 @@ mod tests {
     fn parses_explicit_non_loopback_opt_in() {
         let arguments = Arguments::parse(["--allow-non-loopback".into()]).unwrap();
         assert!(arguments.allow_non_loopback);
+    }
+
+    #[test]
+    fn empty_daemon_token_is_refused() {
+        assert!(require_token(Ok(String::new())).is_err());
+        assert!(require_token(Ok("   ".into())).is_err());
+        assert!(require_token(Err(std::env::VarError::NotPresent)).is_err());
+        assert_eq!(require_token(Ok("secret".into())).unwrap(), "secret");
     }
 
     #[test]

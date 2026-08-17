@@ -12,6 +12,12 @@ use crate::config::{AuthMethod, CredentialStore, EnvironmentConfig};
 
 const MAX_429_RETRIES: u8 = 2;
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
+/// Upper bound on a single 429 back-off. Anything longer would stall the
+/// shared collector thread for every Environment; the collector will retry
+/// naturally on its next tick.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Longest we will trust an OAuth grant regardless of what the server says.
+const MAX_TOKEN_TTL_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
@@ -178,8 +184,12 @@ impl ServiceNowClient {
         }
         let grant: AccessGrant =
             serde_json::from_str(&response.body).context("oauth token JSON")?;
-        let expires_in = grant.expires_in.unwrap_or(1800);
-        let valid_until = self.clock.now() + Duration::from_secs(expires_in);
+        let expires_in = grant.expires_in.unwrap_or(1800).min(MAX_TOKEN_TTL_SECS);
+        let valid_until = self
+            .clock
+            .now()
+            .checked_add(Duration::from_secs(expires_in))
+            .unwrap_or_else(|| self.clock.now());
         self.tokens.lock().expect("token cache").insert(
             environment.id.clone(),
             CachedToken {
@@ -282,10 +292,11 @@ fn retry_after_delay(response: &HttpResponse, now: SystemTime) -> Duration {
     let Some(value) = response.header("Retry-After") else {
         return DEFAULT_RETRY_AFTER;
     };
-    if let Ok(seconds) = value.trim().parse::<u64>() {
-        return Duration::from_secs(seconds);
-    }
-    http_date_delay(value, now).unwrap_or(DEFAULT_RETRY_AFTER)
+    let delay = match value.trim().parse::<u64>() {
+        Ok(seconds) => Duration::from_secs(seconds),
+        Err(_) => http_date_delay(value, now).unwrap_or(DEFAULT_RETRY_AFTER),
+    };
+    delay.min(MAX_RETRY_AFTER)
 }
 
 fn http_date_delay(value: &str, now: SystemTime) -> Option<Duration> {
@@ -657,6 +668,103 @@ mod tests {
         assert_eq!(
             auths,
             [Some("Bearer tok-1".into()), Some("Bearer tok-2".into())]
+        );
+    }
+
+    #[test]
+    fn servicenow_http_caps_huge_retry_after_seconds() {
+        let transport = ScriptedTransport::new(vec![
+            HttpResponse {
+                status: 429,
+                headers: vec![("Retry-After".into(), "86400".into())],
+                body: String::new(),
+            },
+            ok_table(),
+        ]);
+        let clock = Arc::new(RecordingClock::default());
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("dev", r#"{"username":"reader","password":"secret"}"#);
+        let client = ServiceNowClient::new(transport, clock.clone());
+        assert_eq!(
+            client
+                .request(
+                    &basic_env(),
+                    &credentials,
+                    "GET",
+                    "/api/now/table/sys_properties",
+                    None
+                )
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(*clock.sleeps.lock().expect("sleeps"), [MAX_RETRY_AFTER]);
+    }
+
+    #[test]
+    fn servicenow_http_caps_far_future_retry_after_date() {
+        let transport = ScriptedTransport::new(vec![
+            HttpResponse {
+                status: 429,
+                headers: vec![("Retry-After".into(), "Fri, 11 Nov 2033 22:13:20 GMT".into())],
+                body: String::new(),
+            },
+            ok_table(),
+        ]);
+        let clock = Arc::new(RecordingClock::default());
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("dev", r#"{"username":"reader","password":"secret"}"#);
+        let client = ServiceNowClient::new(transport, clock.clone());
+        assert_eq!(
+            client
+                .request(
+                    &basic_env(),
+                    &credentials,
+                    "GET",
+                    "/api/now/table/sys_properties",
+                    None
+                )
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(*clock.sleeps.lock().expect("sleeps"), [MAX_RETRY_AFTER]);
+    }
+
+    #[test]
+    fn servicenow_http_oauth_huge_expires_in_does_not_panic() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: r#"{"access_token":"t","expires_in":18446744073709551615}"#.into(),
+            },
+            ok_table(),
+            ok_table(),
+        ]));
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("prod", r#"{"client_id":"id","client_secret":"secret"}"#);
+        let client = ServiceNowClient::new(
+            SharedTransport(transport.clone()),
+            RecordingClock::default(),
+        );
+        let path = "/api/now/table/sys_properties";
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .request(&oauth_env(), &credentials, "GET", path, None)
+                    .unwrap()
+                    .status,
+                200
+            );
+        }
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .filter(|request| request.url.contains("oauth_token.do"))
+                .count(),
+            1
         );
     }
 

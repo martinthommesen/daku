@@ -1,8 +1,9 @@
 # daku-daemon
 
 Standalone process that hosts `daku-core::serve`. Loopback-only by default;
-clients authenticate with `DAKU_DAEMON_TOKEN`. Prints one JSON readiness record
-to stdout (address, protocol version, pid).
+clients authenticate with `DAKU_DAEMON_TOKEN`. An empty token is refused at
+startup. Prints one JSON readiness record to stdout (address, protocol
+version, pid).
 
 ```text
 DAKU_DAEMON_TOKEN=<secret> daku-daemon --bind 127.0.0.1:0 [--parent-pid PID] [--allow-origin ORIGIN]...
