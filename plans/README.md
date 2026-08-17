@@ -148,6 +148,6 @@ Decided in a grill session; ADR-0008 + ADR-0005 amendment. **Tracking issue:** [
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
-| [044](044-gpui-component-shell-and-pin.md) | Shell on gpui-component: Root, TitleBar, Sidebar, tokens; zed sha pinned in Cargo.lock only ([#68](https://github.com/martinthommesen/daku/issues/68)) | P1 | M | — | TODO |
+| [044](044-gpui-component-shell-and-pin.md) | Shell on gpui-component: Root, TitleBar, Sidebar, tokens; zed sha pinned in Cargo.lock only ([#68](https://github.com/martinthommesen/daku/issues/68)) | P1 | M | — | DONE |
 | [045](045-environment-detail-restyle.md) | Environment detail restyle: header, pills, Signal cards, compare strip ([#69](https://github.com/martinthommesen/daku/issues/69)) | P1 | M | 044 | TODO |
 | [046](046-drill-in-and-deep-links.md) | Card selection → Drill-in region + Open-in-ServiceNow links ([#70](https://github.com/martinthommesen/daku/issues/70)) | P2 | M | 045 | TODO |
