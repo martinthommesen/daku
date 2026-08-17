@@ -1,5 +1,7 @@
-//! Last-clone Signal: informational completed timestamp from the clone-source Environment.
+//! Last-clone Signal: informational clone age per clone **target**, read once
+//! from the clone-source Environment (the `clone_instance` record lives there).
 
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 
@@ -12,37 +14,99 @@ use crate::persistence::{self, StateStore};
 use crate::servicenow::ServiceNowClient;
 
 pub const LAST_CLONE_SIGNAL_ID: &str = "last_clone";
-pub const CLONE_INSTANCE_PATH: &str = "/api/now/table/clone_instance?sysparm_query=state=Completed^ORDERBYDESCcompleted&sysparm_fields=state,completed,target&sysparm_limit=1";
+pub const CLONE_INSTANCE_PATH: &str = "/api/now/table/clone_instance?sysparm_query=state=Completed^ORDERBYDESCcompleted&sysparm_fields=state,completed,target&sysparm_limit=10";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastCloneObservation {
-    pub supported: bool,
-    pub completed: Option<String>,
+pub struct CloneRow {
+    pub target: String,
+    pub completed: String,
 }
 
-pub fn parse_last_clone(status: u16, body: &str) -> LastCloneObservation {
+/// Newest Completed clone per target, in response order (already newest-first).
+/// `None` = the source cannot answer (non-200 or unreadable body) — nothing is
+/// then known about any target. `Some(vec![])` = no clone has ever completed.
+pub fn parse_last_clones(status: u16, body: &str) -> Option<Vec<CloneRow>> {
     if status != 200 {
-        return LastCloneObservation {
-            supported: false,
-            completed: None,
-        };
+        return None;
     }
-    let completed = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("result")
-                .and_then(|result| result.as_array())
-                .and_then(|rows| rows.first())
-                .and_then(|row| row.get("completed"))
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let rows = value.get("result")?.as_array()?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut newest = Vec::new();
+    for row in rows {
+        let field = |name: &str| {
+            row.get(name)
                 .and_then(|value| value.as_str())
+                .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        });
-    LastCloneObservation {
-        supported: completed.is_some(),
-        completed,
+        };
+        let (Some(target), Some(completed)) = (field("target"), field("completed")) else {
+            continue;
+        };
+        if seen.insert(target.to_ascii_lowercase()) {
+            newest.push(CloneRow {
+                target: target.to_owned(),
+                completed: completed.to_owned(),
+            });
+        }
     }
+    Some(newest)
+}
+
+/// `clone_instance.target` is an instance name; tolerate a full hostname on
+/// either side (see `docs/research/servicenow-signals.md`, item 10).
+pub fn target_matches(target: &str, environment: &EnvironmentConfig) -> bool {
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+    let host = instance_host(&environment.instance_url);
+    [host, first_label(host), environment.id.as_str()]
+        .iter()
+        .any(|candidate| {
+            candidate.eq_ignore_ascii_case(target)
+                || candidate.eq_ignore_ascii_case(first_label(target))
+        })
+}
+
+fn instance_host(instance_url: &str) -> &str {
+    instance_url
+        .rsplit("://")
+        .next()
+        .unwrap_or(instance_url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+}
+
+fn first_label(host: &str) -> &str {
+    host.split('.').next().unwrap_or(host)
+}
+
+/// Whole days between the clone and `observed_at`, comparing **date parts
+/// only** — the two clocks are different machines and hours of skew are
+/// irrelevant at day granularity. `None` when `completed` is not
+/// `YYYY-MM-DD HH:MM:SS`.
+fn age_days(completed: &str, observed_at: i64) -> Option<i64> {
+    let mut parts = completed.split(' ').next()?.split('-');
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let month = parts.next()?.parse::<i64>().ok()?;
+    let day = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some((observed_at.div_euclid(86_400) - days_from_civil(year, month, day)).max(0))
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 pub struct LastCloneCollector {
@@ -79,48 +143,91 @@ impl SignalCollector for LastCloneCollector {
         };
         let connection = self.store.open()?;
         let observed_at = unix_now();
-        match self.client.request(
+        let response = match self.client.request(
             source,
             self.credentials.as_ref(),
             "GET",
             CLONE_INSTANCE_PATH,
             None,
         ) {
-            Ok(response) if response.status == 200 || response.status == 403 => persist_last_clone(
-                &connection,
-                &source.id,
-                &parse_last_clone(response.status, &response.body),
-                observed_at,
-            )
-            .map_err(anyhow::Error::from),
-            Ok(response) => persist_last_clone_unreachable(
-                &connection,
-                &source.id,
-                &format!("HTTP {}", response.status),
-                observed_at,
-            )
-            .map_err(anyhow::Error::from),
-            Err(error) => persist_last_clone_unreachable(
-                &connection,
-                &source.id,
-                &error.to_string(),
-                observed_at,
-            )
-            .map_err(anyhow::Error::from),
+            Ok(response) if response.status == 200 || response.status == 403 => response,
+            Ok(response) => {
+                return persist_last_clone_unreachable(
+                    &connection,
+                    &source.id,
+                    &format!("HTTP {}", response.status),
+                    observed_at,
+                )
+                .map_err(anyhow::Error::from);
+            }
+            Err(error) => {
+                return persist_last_clone_unreachable(
+                    &connection,
+                    &source.id,
+                    &error.to_string(),
+                    observed_at,
+                )
+                .map_err(anyhow::Error::from);
+            }
+        };
+        let rows = parse_last_clones(response.status, &response.body);
+        persist_clone_source(&connection, &source.id, rows.is_some(), observed_at)?;
+        // 403: the source cannot list clones, so nothing is known about the
+        // targets — leave their snapshots alone rather than claiming "never".
+        let Some(rows) = rows else {
+            return Ok(());
+        };
+        for environment in self
+            .environments
+            .iter()
+            .filter(|environment| environment.id != source.id)
+        {
+            let row = rows
+                .iter()
+                .find(|row| target_matches(&row.target, environment));
+            persist_clone_target(&connection, &environment.id, row, &source.id, observed_at)?;
         }
+        Ok(())
     }
 }
 
-fn persist_last_clone(
+fn persist_clone_source(
     connection: &Connection,
     environment_id: &str,
-    observation: &LastCloneObservation,
+    supported: bool,
     observed_at: i64,
 ) -> io::Result<()> {
-    let payload = serde_json::json!({
-        "supported": observation.supported,
-        "completed": observation.completed,
-    });
+    let payload = serde_json::json!({ "role": "source", "supported": supported });
+    persistence::persist_signal_snapshot(
+        connection,
+        environment_id,
+        LAST_CLONE_SIGNAL_ID,
+        observed_at,
+        SignalState::Healthy,
+        &payload.to_string(),
+    )
+}
+
+fn persist_clone_target(
+    connection: &Connection,
+    environment_id: &str,
+    row: Option<&CloneRow>,
+    source_id: &str,
+    observed_at: i64,
+) -> io::Result<()> {
+    let payload = match row {
+        Some(row) => {
+            let mut payload = serde_json::json!({
+                "completed": row.completed,
+                "source_id": source_id,
+            });
+            if let Some(age) = age_days(&row.completed, observed_at) {
+                payload["age_days"] = age.into();
+            }
+            payload
+        }
+        None => serde_json::json!({ "supported": true, "completed": null }),
+    };
     persistence::persist_signal_snapshot(
         connection,
         environment_id,
@@ -164,30 +271,79 @@ mod tests {
 
     #[test]
     fn last_clone_signal_completed_timestamp() {
-        let observation = parse_last_clone(
+        let rows = parse_last_clones(
             200,
             include_str!("../tests/fixtures/last_clone/completed.json"),
-        );
-        assert!(observation.supported);
+        )
+        .expect("supported");
         assert_eq!(
-            observation.completed.as_deref(),
-            Some("2026-01-15 12:00:00")
+            rows,
+            vec![CloneRow {
+                target: "acme-test".into(),
+                completed: "2026-01-15 12:00:00".into(),
+            }]
         );
     }
 
     #[test]
     fn last_clone_signal_403_is_unsupported() {
-        let observation = parse_last_clone(403, r#"{"error":{"message":"Operation not allowed"}}"#);
-        assert!(!observation.supported);
-        assert_eq!(observation.completed, None);
+        assert_eq!(
+            parse_last_clones(403, r#"{"error":{"message":"Operation not allowed"}}"#),
+            None
+        );
     }
 
     #[test]
-    fn last_clone_signal_empty_is_unsupported() {
-        let observation =
-            parse_last_clone(200, include_str!("../tests/fixtures/last_clone/empty.json"));
-        assert!(!observation.supported);
-        assert_eq!(observation.completed, None);
+    fn last_clone_signal_empty_is_supported_with_no_rows() {
+        let rows = parse_last_clones(200, include_str!("../tests/fixtures/last_clone/empty.json"))
+            .expect("supported");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn parse_last_clones_groups_newest_per_target() {
+        let rows = parse_last_clones(
+            200,
+            include_str!("../tests/fixtures/last_clone/two_targets.json"),
+        )
+        .expect("supported");
+        assert_eq!(
+            rows,
+            vec![
+                CloneRow {
+                    target: "acme-test".into(),
+                    completed: "2026-01-15 12:00:00".into(),
+                },
+                CloneRow {
+                    target: "acme-dev".into(),
+                    completed: "2026-01-02 03:00:00".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn target_matches_host_label_and_id() {
+        let environment = env("test", "acme-test", false);
+        assert!(target_matches("acme-test", &environment));
+        assert!(target_matches("ACME-TEST", &environment));
+        assert!(target_matches(
+            "acme-test.example.service-now.com",
+            &environment
+        ));
+        assert!(target_matches("test", &environment));
+        assert!(!target_matches("acme-dev", &environment));
+        assert!(!target_matches("", &environment));
+    }
+
+    #[test]
+    fn age_days_counts_whole_days_from_the_date_part() {
+        let observed_at = days_from_civil(2026, 1, 27) * 86_400 + 3_600;
+        assert_eq!(age_days("2026-01-15 12:00:00", observed_at), Some(12));
+        assert_eq!(age_days("2026-01-27 23:00:00", observed_at), Some(0));
+        // A source clock ahead of the daemon must not render a negative age.
+        assert_eq!(age_days("2026-02-01 00:00:00", observed_at), Some(0));
+        assert_eq!(age_days("not a date", observed_at), None);
     }
 
     struct LastCloneTransport {
@@ -208,8 +364,8 @@ mod tests {
                 request.url
             );
             assert!(
-                request.url.contains("sysparm_limit=1"),
-                "last_clone is a single-row fetch: {}",
+                request.url.contains("sysparm_limit=10"),
+                "last_clone reads the newest rows across targets: {}",
                 request.url
             );
             assert!(
@@ -240,12 +396,14 @@ mod tests {
         let db = TempDb::new("last-clone");
         let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
-        credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
-        credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
+        for id in ["prod", "test", "dev"] {
+            credentials.insert(id, r#"{"username":"reader","password":"secret"}"#);
+        }
         let collector = LastCloneCollector::new(
             vec![
                 env("prod", "acme-prod", true),
                 env("test", "acme-test", false),
+                env("dev", "acme-dev", false),
             ],
             credentials,
             ServiceNowClient::new(LastCloneTransport { status, body }, SystemClock),
@@ -256,40 +414,59 @@ mod tests {
         (db, reopened)
     }
 
+    fn payload(store: &StateStore, environment_id: &str) -> serde_json::Value {
+        let connection = store.open().unwrap();
+        let row =
+            persistence::load_signal_snapshot(&connection, environment_id, LAST_CLONE_SIGNAL_ID)
+                .unwrap()
+                .expect("snapshot");
+        assert_eq!(row.state, "healthy");
+        serde_json::from_str(&row.payload_json).unwrap()
+    }
+
     #[test]
     fn last_clone_signal_completed_writes_healthy_snapshot() {
         let (_db, store) = collect_last_clone(
             200,
             include_str!("../tests/fixtures/last_clone/completed.json"),
         );
-        let connection = store.open().unwrap();
-        let row = persistence::load_signal_snapshot(&connection, "prod", LAST_CLONE_SIGNAL_ID)
-            .unwrap()
-            .expect("snapshot");
-        assert_eq!(row.state, "healthy");
-        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
-        assert_eq!(payload["supported"], true);
-        assert_eq!(payload["completed"], "2026-01-15 12:00:00");
-        assert!(
-            persistence::load_signal_snapshot(&connection, "test", LAST_CLONE_SIGNAL_ID)
-                .unwrap()
-                .is_none()
+        let test = payload(&store, "test");
+        assert_eq!(test["completed"], "2026-01-15 12:00:00");
+        assert_eq!(test["source_id"], "prod");
+        assert!(test["age_days"].as_i64().expect("age_days") >= 0);
+        let prod = payload(&store, "prod");
+        assert_eq!(prod["role"], "source");
+        assert_eq!(prod["supported"], true);
+        // No clone to dev in this fixture.
+        let dev = payload(&store, "dev");
+        assert_eq!(dev["supported"], true);
+        assert!(dev["completed"].is_null());
+    }
+
+    #[test]
+    fn last_clone_signal_two_targets_each_get_a_row() {
+        let (_db, store) = collect_last_clone(
+            200,
+            include_str!("../tests/fixtures/last_clone/two_targets.json"),
         );
+        assert_eq!(payload(&store, "test")["completed"], "2026-01-15 12:00:00");
+        assert_eq!(payload(&store, "dev")["completed"], "2026-01-02 03:00:00");
     }
 
     #[test]
     fn last_clone_signal_403_writes_healthy_unsupported() {
         let (_db, store) =
             collect_last_clone(403, r#"{"error":{"message":"Operation not allowed"}}"#);
+        let prod = payload(&store, "prod");
+        assert_eq!(prod["supported"], false);
+        assert!(prod.get("reachability").is_none());
+        // Nothing is known about the targets, so they keep no snapshot.
         let connection = store.open().unwrap();
-        let row = persistence::load_signal_snapshot(&connection, "prod", LAST_CLONE_SIGNAL_ID)
-            .unwrap()
-            .expect("snapshot");
-        assert_eq!(row.state, "healthy");
-        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
-        assert_eq!(payload["supported"], false);
-        assert!(payload["completed"].is_null());
-        assert!(payload.get("reachability").is_none());
+        assert!(
+            persistence::load_signal_snapshot(&connection, "test", LAST_CLONE_SIGNAL_ID)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

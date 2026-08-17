@@ -39,6 +39,27 @@ Legend for **PDI**: yes = works out of the box; partial = works with caveats; no
 | 15 | Health Log Analytics | Store app under ITOM AIOps; **separate licence** ("available as a separate license from ITOM AIOps"); needs Support-provisioned MetricBase/Occultus/Elasticsearch endpoints. Tables `sn_occ_*`; alerts flow into Event Management (`em_alert`) — Table API there. Its own REST endpoint is log *ingestion* on the MID (`/api/mid/hla/raw`), not a read API. Not a platform-health source; it is an ITOM product for customer logs. | `evt_mgmt_admin` (configure), `evt_mgmt_operator` | no (paid store app; PDIs cannot use MetricBase) | [Health Log Analytics](https://www.servicenow.com/docs/r/zurich/it-operations-management/health-log-analytics/hla-landing-page.html), [Install HLA](https://www.servicenow.com/docs/r/it-operations-management/health-log-analytics/install-health-log-analytics.html), [HLA components](https://www.servicenow.com/docs/r/it-operations-management/health-log-analytics/hla-components.html) |
 | 16 | Instance Observer | **Off-instance** cloud app under the paid **Impact** packages; near-real-time node/semaphore/transaction telemetry, alerting, multi-instance. Roles `io_standard`, `io_readonly` installed with the Impact plugin. No public customer REST API documented **[none found]**. Replaces Application Insights (deprecated in Zurich). | `io_standard` / `io_readonly` + Impact subscription | no | [Overview of Instance Observer](https://www.servicenow.com/docs/r/zurich/impact/io-overview.html), [Roles installed with Instance Observer](https://www.servicenow.com/docs/r/zurich/impact/impact-observer-roles.html) |
 
+
+### Item 10 follow-up: the shape of `clone_instance.target` **[unverified]**
+
+Daku persists last-clone **per clone target**, so the `target` field has to map
+onto an Environment. No live clone-source instance was available to probe, so
+this is recorded as an assumption: `target` (and `source`) are **instance
+names** — the first DNS label of the instance host, i.e. the `<name>` in
+`https://<name>.service-now.com` — not `sys_id` references, so
+`sysparm_fields=state,completed,target` returns a directly matchable string
+without `sysparm_display_value`. To verify on a real source Environment:
+`GET /api/now/table/clone_instance?sysparm_query=state=Completed^ORDERBYDESCcompleted&sysparm_fields=state,completed,target,source,sys_id&sysparm_limit=5`,
+then repeat with `sysparm_display_value=all` and compare raw vs display.
+
+The matcher (`crates/daku-core/src/last_clone.rs::target_matches`) therefore
+tolerates both shapes: it compares `target` case-insensitively against the
+Environment's configured host, that host's first DNS label, and the
+Environment's daku id, matching on either the full string or its first label.
+If a real deployment reports `target` as a `sys_id`, no Environment matches and
+every target renders "no clone found" — the fix is a second lookup or an
+explicit per-Environment clone-target name in `environments.json`.
+
 Now Support (support.servicenow.com) holds clone requests, upgrade scheduling, Impact's Platform Health Scan Engine (findings with ACT/RECOMMEND/SUGGEST/REVIEW enforcement levels, Impact subscription) and Instance Observer; it has no documented customer REST API and PDIs have no Now Support account, so it is out of scope for v1 **[absence of API: no doc found]**.
 
 ## Recommended v1 signal set (≤6)

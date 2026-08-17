@@ -484,11 +484,24 @@ fn summarize_payload(signal_id: &str, payload_json: &str) -> String {
                 String::new()
             }
         }
-        "last_clone" => value
-            .get("completed")
-            .and_then(|item| item.as_str())
-            .unwrap_or("")
-            .to_owned(),
+        "last_clone" => {
+            if value.get("role").and_then(|item| item.as_str()) == Some("source") {
+                "clone source".into()
+            } else if let Some(days) = value.get("age_days").and_then(|item| item.as_i64()) {
+                match days {
+                    0 => "today".into(),
+                    1 => "1 day ago".into(),
+                    days => format!("{days} days ago"),
+                }
+            } else if value
+                .get("completed")
+                .is_some_and(serde_json::Value::is_null)
+            {
+                "no clone found".into()
+            } else {
+                String::new()
+            }
+        }
         _ => String::new(),
     }
 }
@@ -582,7 +595,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 snap(
                     "last_clone",
                     "healthy",
-                    r#"{"supported":true,"completed":"2026-08-05 09:00:00"}"#,
+                    r#"{"completed":"2026-08-05 09:00:00","age_days":12,"source_id":"prod"}"#,
                 ),
             ],
         },
@@ -732,6 +745,22 @@ mod tests {
     }
 
     #[test]
+    fn last_clone_summary_shows_age() {
+        assert_eq!(
+            summarize_payload("last_clone", r#"{"role":"source","supported":true}"#),
+            "clone source"
+        );
+        assert_eq!(
+            summarize_payload("last_clone", r#"{"completed":"x","age_days":0}"#),
+            "today"
+        );
+        assert_eq!(
+            summarize_payload("last_clone", r#"{"supported":true,"completed":null}"#),
+            "no clone found"
+        );
+    }
+
+    #[test]
     fn summarize_payload_is_empty_for_skipped() {
         assert_eq!(summarize_payload("jobs", r#"{"skipped":"asleep"}"#), "");
         assert_eq!(
@@ -838,7 +867,7 @@ mod tests {
         let rows = loaded().compare_rows();
         let test = rows.iter().find(|row| row.id == "test").unwrap();
         assert_eq!(test.drift, "3 plugins differ");
-        assert_eq!(test.last_clone, "2026-08-05 09:00:00");
+        assert_eq!(test.last_clone, "12 days ago");
         let prod = rows.iter().find(|row| row.id == "prod").unwrap();
         assert_eq!(prod.drift, "source of truth");
         assert_eq!(prod.last_clone, "");
@@ -1028,7 +1057,7 @@ mod tests {
         assert_eq!(state.card_summary("drift"), "source of truth");
         state.select("test");
         assert_eq!(state.card_summary("drift"), "3 plugins differ");
-        assert_eq!(state.card_summary("last_clone"), "2026-08-05 09:00:00");
+        assert_eq!(state.card_summary("last_clone"), "12 days ago");
         state.apply(&ServerMessage::SignalSnapshotsUpdated {
             environment_id: "test".into(),
             snapshots: vec![snap("jobs", "healthy", "not json")],
