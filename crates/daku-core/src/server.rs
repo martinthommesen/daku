@@ -401,25 +401,22 @@ fn dispatch_request(
             let notification = request_id.is_nil();
             let session_id = request.session_id;
             let runtime_id = request.runtime_id;
-            let (outcome, executed) = if !notification
-                && let Some(cached) = hub.cached_response(request_id)
-            {
-                (cached, false)
-            } else {
-                let outcome = match backend.handle(
-                    request,
-                    hub.event_sink(session_id, runtime_id),
-                ) {
-                    Ok(payload) => ResponseOutcome::Ok { payload },
-                    Err(error) => ResponseOutcome::Error {
-                        error: RpcError::from(error),
-                    },
+            let (outcome, executed) =
+                if !notification && let Some(cached) = hub.cached_response(request_id) {
+                    (cached, false)
+                } else {
+                    let outcome =
+                        match backend.handle(request, hub.event_sink(session_id, runtime_id)) {
+                            Ok(payload) => ResponseOutcome::Ok { payload },
+                            Err(error) => ResponseOutcome::Error {
+                                error: RpcError::from(error),
+                            },
+                        };
+                    if !notification {
+                        hub.cache_response(request_id, outcome.clone());
+                    }
+                    (outcome, true)
                 };
-                if !notification {
-                    hub.cache_response(request_id, outcome.clone());
-                }
-                (outcome, true)
-            };
             if executed && matches!(&outcome, ResponseOutcome::Ok { .. }) {
                 if matches!(
                     outcome,

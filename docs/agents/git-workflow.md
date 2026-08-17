@@ -4,7 +4,7 @@ This repo is **trunk-based on `main`**. Pull requests and GitHub Actions are **d
 
 ## Rules
 
-1. **Commit and push to `main`.** There is no PR review gate and no Actions CI. Local verification (see each `plans/*` Done criteria / `cargo test` / `cargo check`) is the quality gate.
+1. **Commit and push to `main`.** There is no PR review gate and no Actions CI. Local verification is the quality gate: `bun run check` (fmt check + `cargo test --workspace` + oxlint) must exit 0, plus each `plans/*` Done criteria.
 2. **Do not open pull requests.** Do not create `.github/workflows/`. Do not ask for PR URLs or Actions runs.
 3. **Do not leave long-lived topic branches.** Prefer committing on `main`. Short-lived local branches are fine for experiments; delete them when finished. Do **not** push topic/research/prototype branches to `origin` as a standing archive — land useful artifacts on `main` (e.g. under `docs/research/`, `prototypes/`) then delete the branch.
 4. **`main` is protected** (no deletion, linear history, signed commits). Other refs are disposable.

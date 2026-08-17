@@ -85,6 +85,7 @@ type CargoMetadata = {
   packages: Array<{ name: string; version: string }>;
 };
 
+// SAFETY: `cargo metadata --format-version 1` is a stable schema; only `packages[].name/version` are read.
 const metadata = JSON.parse(
   await $`cargo metadata --no-deps --format-version 1`.quiet().text(),
 ) as CargoMetadata;
@@ -126,6 +127,7 @@ if (!unsigned && !adhoc && !skipNotarize && configuredSigningIdentity) {
     await $`xcrun notarytool submit ${outputPath} --keychain-profile ${notaryProfile} --wait --output-format json`
       .quiet()
       .text();
+  // SAFETY: notarytool `--output-format json` documents `id`/`message`/`status`; all are read as optional.
   const result = JSON.parse(resultText) as {
     id?: string;
     message?: string;

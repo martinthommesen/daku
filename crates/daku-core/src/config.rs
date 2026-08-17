@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use serde::Deserialize;
 
 use daku_protocol::identity::DATA_DIRECTORY_NAME;
@@ -119,8 +119,10 @@ mod tests {
             AuthMethod::OauthClientCredentials
         );
         assert_eq!(environments[2].auth_method, AuthMethod::Basic);
-        assert!(environments
-            .iter()
-            .all(|environment| environment.instance_url.contains("example.service-now.com")));
+        assert!(
+            environments
+                .iter()
+                .all(|environment| environment.instance_url.contains("example.service-now.com"))
+        );
     }
 }

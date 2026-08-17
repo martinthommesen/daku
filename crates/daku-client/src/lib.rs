@@ -5,8 +5,8 @@ pub mod persistence;
 mod process;
 
 pub use client::DaemonClient;
+pub use daku_protocol::*;
 pub use process::{
     DEFAULT_EXPOSED_DAEMON_PORT, DaemonExposureSettings, DaemonProcess, DaemonSupervisor,
     parse_allowed_origins,
 };
-pub use daku_protocol::*;

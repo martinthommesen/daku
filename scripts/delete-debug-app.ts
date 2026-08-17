@@ -38,6 +38,7 @@ async function addMatchingChildren(
   try {
     entries = await readdir(directory, { withFileTypes: true });
   } catch (error) {
+    // SAFETY: readdir rejects with a Node errno error; only `.code` is read.
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
@@ -61,6 +62,7 @@ async function existingTargets(): Promise<Target[]> {
             : "file",
       });
     } catch (error) {
+      // SAFETY: fs errors carry `.code`; any other error is rethrown.
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }

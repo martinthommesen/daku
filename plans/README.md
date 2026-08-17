@@ -33,6 +33,7 @@ Drift checks use `567179a..HEAD` against each plan’s **Scope** paths (not only
 | [008](008-health-rollup-protocol.md) | Environment health rollup + protocol events (+ samples) | P1 | DONE | **003** (stubs OK) |
 | [009](009-gpui-shell-variant-c.md) | GPUI shell — sidebar + detail + job/syslog sparklines | P1 | DONE | 008 |
 | [010](010-dmg-sparkle-homebrew.md) | Notarised DMG + Sparkle; Homebrew cask alternate | P3 | DONE | 009 |
+| [011](011-green-baseline-check-gate.md) | Make the local verification gate one command and green ([#34](https://github.com/martinthommesen/daku/issues/34)) | P1 | DONE | — |
 
 ## Dependency graph
 

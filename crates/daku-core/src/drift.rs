@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::anyhow;
 use rusqlite::Connection;
 
-use crate::availability::{classify_availability_response, AVAILABILITY_SIGNAL_ID, GLIDE_WAR_PATH};
+use crate::availability::{AVAILABILITY_SIGNAL_ID, GLIDE_WAR_PATH, classify_availability_response};
 use crate::collector::SignalCollector;
 use crate::config::{CredentialStore, EnvironmentConfig};
 use crate::persistence::{self, StateStore};

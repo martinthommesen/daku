@@ -23,3 +23,7 @@ Always use the `now-sdk` skill (`.claude/skills/now-sdk/SKILL.md`) for anything 
 ### Matt Pocock skills (mandatory)
 
 The `mattpocock-skills:*` skills are the canonical, mandatory skills for this project. Always use the one that fits the situation — e.g. `tdd` for features/bugs, `diagnosing-bugs` for debugging, `code-review` for reviews, `research` for docs/API questions, `domain-modeling` for CONTEXT.md/ADRs, `codebase-design` for module design, `writing-for-agents` for CLAUDE.md/skills, `wizard` for human-only steps, `grilling` to stress-test plans, `prototype` for design questions, `resolving-merge-conflicts` for conflicts. Also `improve-codebase-architecture` (`.claude/skills/`) for architecture audits.
+
+### Verification gate
+
+There is no CI. Before committing to `main`, run `bun run check` (fmt check + `cargo test --workspace` + oxlint) and require exit 0. Plans under `plans/` use it as a done criterion.

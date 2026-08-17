@@ -7,7 +7,8 @@
     "release": "bun ./scripts/release.ts",
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
-    "lint": "oxlint -c oxlint.config.ts ."
+    "lint": "oxlint -c oxlint.config.ts .",
+    "check": "cargo fmt --all --check && cargo test --workspace --no-fail-fast && oxlint -c oxlint.config.ts ."
   },
   "devDependencies": {
     "@libsql/client": "^0.17.4",
