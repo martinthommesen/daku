@@ -233,6 +233,26 @@ mod tests {
         Clock, HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
     };
 
+    #[test]
+    fn poll_interval_secs_reads_top_level_json_key() {
+        let settings: DaemonSettings =
+            serde_json::from_str(r#"{"poll_interval_secs": 30}"#).unwrap();
+        assert_eq!(poll_interval_secs(&settings), 30);
+    }
+
+    #[test]
+    fn poll_interval_secs_falls_back_to_default_for_zero_or_non_number() {
+        let zero: DaemonSettings = serde_json::from_str(r#"{"poll_interval_secs": 0}"#).unwrap();
+        assert_eq!(poll_interval_secs(&zero), DEFAULT_POLL_INTERVAL_SECS);
+        let text: DaemonSettings =
+            serde_json::from_str(r#"{"poll_interval_secs": "fast"}"#).unwrap();
+        assert_eq!(poll_interval_secs(&text), DEFAULT_POLL_INTERVAL_SECS);
+        assert_eq!(
+            poll_interval_secs(&DaemonSettings::default()),
+            DEFAULT_POLL_INTERVAL_SECS
+        );
+    }
+
     struct FixtureTransport;
 
     impl HttpTransport for FixtureTransport {
