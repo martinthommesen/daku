@@ -12,6 +12,9 @@ fn main() -> anyhow::Result<()> {
     if arguments.probe_availability {
         return run_probe_availability();
     }
+    if arguments.doctor {
+        return run_doctor_command();
+    }
     let auth = require_token(std::env::var(DAEMON_TOKEN_ENV))?;
     // The bearer capability belongs only to this server process. Remove it
     // before any provider or workspace subprocess can inherit the daemon's
@@ -77,6 +80,63 @@ fn run_probe_availability() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_doctor_command() -> anyhow::Result<()> {
+    let settings = daku_core::DaemonSettingsStore::open(daku_core::DaemonSettings::default_path())
+        .context("could not load daemon settings")?
+        .get();
+    let environments_path = daku_core::default_environments_path();
+    let report = daku_core::run_doctor(
+        &environments_path,
+        &settings,
+        Arc::new(daku_core::config::KeychainCredentialStore),
+        daku_core::servicenow::ServiceNowClient::new(
+            daku_core::servicenow::UreqTransport::default(),
+            daku_core::servicenow::SystemClock,
+        ),
+        daku_core::persistence::StateStore::daemon(
+            daku_core::persistence::StateStore::default_path(),
+        ),
+    )
+    .with_context(|| format!("doctor: {}", environments_path.display()))?;
+    println!("config: {}", report.environments_path.display());
+    println!("poll interval: {} s", report.poll_interval_secs);
+    for row in &report.rows {
+        println!("{}", format_doctor_row(row));
+    }
+    std::process::exit(doctor_exit_code(&report.rows));
+}
+
+/// Exit 1 when any Environment lacks a Credential or is unreachable; `asleep`
+/// (hibernating PDI) is not a failure.
+fn doctor_exit_code(rows: &[daku_core::DoctorRow]) -> i32 {
+    i32::from(
+        rows.iter()
+            .any(|row| !row.credential_present || row.reachability == "unreachable"),
+    )
+}
+
+fn format_doctor_row(row: &daku_core::DoctorRow) -> String {
+    let credential = match (row.credential_present, &row.credential_error) {
+        (true, _) => "credential: present".to_owned(),
+        (false, None) => "credential: MISSING (Keychain service daku, account = id)".to_owned(),
+        (false, Some(error)) => format!("credential: ERROR {error}"),
+    };
+    format!(
+        "{} ({}) · {} · {} {} · build {} · {} ms{}",
+        row.id,
+        row.label,
+        credential,
+        row.reachability,
+        row.state,
+        row.build.as_deref().unwrap_or("—"),
+        row.rtt_ms,
+        row.error
+            .as_deref()
+            .map(|error| format!(" · {error}"))
+            .unwrap_or_default(),
+    )
+}
+
 fn ensure_bind_allowed(address: SocketAddr, allow_non_loopback: bool) -> anyhow::Result<()> {
     if address.ip().is_loopback() || allow_non_loopback {
         return Ok(());
@@ -92,6 +152,7 @@ struct Arguments {
     allowed_origins: Vec<String>,
     allow_non_loopback: bool,
     probe_availability: bool,
+    doctor: bool,
 }
 
 impl Arguments {
@@ -101,11 +162,15 @@ impl Arguments {
         let mut allowed_origins = Vec::new();
         let mut allow_non_loopback = false;
         let mut probe_availability = false;
+        let mut doctor = false;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "probe-availability" => {
                     probe_availability = true;
+                }
+                "doctor" => {
+                    doctor = true;
                 }
                 "--bind" => {
                     bind = arguments
@@ -133,7 +198,7 @@ impl Arguments {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [probe-availability] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]...",
+                        "usage: {} [probe-availability] [doctor] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]...",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -147,6 +212,7 @@ impl Arguments {
             allowed_origins,
             allow_non_loopback,
             probe_availability,
+            doctor,
         })
     }
 }
@@ -218,5 +284,48 @@ mod tests {
     fn parses_probe_availability() {
         let arguments = Arguments::parse(["probe-availability".into()]).unwrap();
         assert!(arguments.probe_availability);
+    }
+
+    #[test]
+    fn parses_doctor() {
+        let arguments = Arguments::parse(["doctor".into()]).unwrap();
+        assert!(arguments.doctor);
+    }
+
+    fn doctor_row(credential_present: bool) -> daku_core::DoctorRow {
+        daku_core::DoctorRow {
+            id: "prod".into(),
+            label: "Production".into(),
+            credential_present,
+            credential_error: None,
+            reachability: if credential_present {
+                "asleep"
+            } else {
+                "unreachable"
+            },
+            state: "healthy",
+            build: None,
+            error: None,
+            rtt_ms: 12,
+        }
+    }
+
+    #[test]
+    fn format_doctor_row_never_prints_secrets_and_flags_missing_credential() {
+        let missing = format_doctor_row(&doctor_row(false));
+        assert!(missing.contains("MISSING"), "{missing}");
+        assert!(!missing.contains("client_secret") && !missing.contains("password"));
+        assert!(format_doctor_row(&doctor_row(true)).contains("credential: present"));
+    }
+
+    #[test]
+    fn doctor_exits_non_zero_only_for_missing_credentials_or_unreachable() {
+        assert_eq!(doctor_exit_code(&[doctor_row(true)]), 0);
+        assert_eq!(doctor_exit_code(&[doctor_row(true), doctor_row(false)]), 1);
+        let unreachable = daku_core::DoctorRow {
+            reachability: "unreachable",
+            ..doctor_row(true)
+        };
+        assert_eq!(doctor_exit_code(&[unreachable]), 1);
     }
 }

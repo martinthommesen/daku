@@ -8,9 +8,12 @@ version, pid).
 ```text
 DAKU_DAEMON_TOKEN=<secret> daku-daemon --bind 127.0.0.1:0 [--parent-pid PID] [--allow-origin ORIGIN]...
 daku-daemon probe-availability
+daku-daemon doctor
 ```
 
 `probe-availability` loads `~/.daku/environments.json`, resolves Credentials from the macOS Keychain (service `daku`), and writes an Availability snapshot. It does not need `DAKU_DAEMON_TOKEN`.
+
+`doctor` prints one line per Environment (config, Credential presence — never the value —, reachability, build) and exits 1 if any Environment lacks a Credential or is unreachable. It writes nothing.
 
 The desktop supervises this process. Debug builds use the feature-gated
 `daku-debug-daemon` target at `target/debug/daku-debug-daemon`. Release

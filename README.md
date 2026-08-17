@@ -52,6 +52,14 @@ Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settin
 
    Writes `signal_id=availability` into `~/.daku/app.db` (or `DAKU_DB_PATH`).
 
+4. Diagnose the setup (writes nothing):
+
+   ```sh
+   cargo run -p daku-daemon -- doctor
+   ```
+
+   One line per Environment; fix anything flagged before launching the app.
+
 ```sh
 cargo test -p daku-daemon
 ```

@@ -1,7 +1,7 @@
 //! Shared poll loop. Later Signals register here; they do not start timers.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -226,6 +226,66 @@ fn is_not_found(error: &anyhow::Error) -> bool {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorRow {
+    pub id: String,
+    pub label: String,
+    pub credential_present: bool,
+    pub credential_error: Option<String>,
+    pub reachability: &'static str,
+    pub state: &'static str,
+    pub build: Option<String>,
+    pub error: Option<String>,
+    pub rtt_ms: u64,
+}
+
+pub struct DoctorReport {
+    pub environments_path: PathBuf,
+    pub poll_interval_secs: u64,
+    pub rows: Vec<DoctorRow>,
+}
+
+/// Read-only diagnosis: config, Credential presence (never the value), and a
+/// live Availability probe per Environment. Writes nothing to SQLite.
+pub fn run_doctor(
+    environments_path: &Path,
+    settings: &DaemonSettings,
+    credentials: Arc<dyn CredentialStore>,
+    client: ServiceNowClient,
+    store: StateStore,
+) -> anyhow::Result<DoctorReport> {
+    let environments = load_environments(environments_path)?;
+    let probe =
+        AvailabilityCollector::new(environments.clone(), credentials.clone(), client, store);
+    let rows = environments
+        .iter()
+        .map(|environment| {
+            let (credential_present, credential_error) = match credentials.get(&environment.id) {
+                Ok(Some(_)) => (true, None),
+                Ok(None) => (false, None),
+                Err(error) => (false, Some(error.to_string())),
+            };
+            let observation = probe.probe(environment);
+            DoctorRow {
+                id: environment.id.clone(),
+                label: environment.label.clone(),
+                credential_present,
+                credential_error,
+                reachability: observation.reachability.as_str(),
+                state: observation.state.as_str(),
+                build: observation.build,
+                error: observation.error,
+                rtt_ms: observation.rtt_ms,
+            }
+        })
+        .collect();
+    Ok(DoctorReport {
+        environments_path: environments_path.to_owned(),
+        poll_interval_secs: poll_interval_secs(settings),
+        rows,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +430,61 @@ mod tests {
             ran.load(Ordering::Acquire),
             "later collectors must still run"
         );
+    }
+
+    #[test]
+    fn doctor_reports_missing_and_present_credential_without_writing() {
+        let db = TempDb::new("doctor");
+        let environments_path =
+            std::env::temp_dir().join(format!("daku-doctor-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &environments_path,
+            serde_json::to_vec(&[serde_json::json!({
+                "id": "prod",
+                "label": "Production",
+                "instance_url": prod().instance_url,
+                "auth_method": "basic",
+                "sort_order": 0,
+            })])
+            .unwrap(),
+        )
+        .unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        let doctor = || {
+            run_doctor(
+                &environments_path,
+                &DaemonSettings::default(),
+                credentials.clone(),
+                ServiceNowClient::new(FixtureTransport, SystemClock),
+                db.store(),
+            )
+            .unwrap()
+        };
+
+        let report = doctor();
+        assert_eq!(report.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
+        let row = &report.rows[0];
+        assert_eq!(row.id, "prod");
+        assert!(!row.credential_present);
+        assert_eq!(row.reachability, "unreachable");
+        assert!(row.error.is_some());
+
+        credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
+        let row = doctor().rows.remove(0);
+        assert!(row.credential_present);
+        assert_eq!(row.reachability, "reachable");
+        assert_eq!(
+            row.build.as_deref(),
+            Some("glide-zurich-12-18-2025__patch0-hotfix1")
+        );
+
+        let connection = db.store().open().unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM signal_snapshots", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "doctor must not write snapshots");
+        let _ = std::fs::remove_file(&environments_path);
     }
 }
