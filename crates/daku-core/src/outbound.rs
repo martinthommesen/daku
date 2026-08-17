@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+use crate::availability::{REACHABILITY_REUSE_SECS, Reachability, recent_reachability};
 use crate::collector::SignalCollector;
 use crate::config::{CredentialStore, EnvironmentConfig};
 use crate::persistence::{self, StateStore};
@@ -54,6 +55,25 @@ impl SignalCollector for OutboundCollector {
             .unwrap_or(0);
         let mut first_error = None;
         for environment in &self.environments {
+            if let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
+                recent_reachability(
+                    &connection,
+                    &environment.id,
+                    observed_at,
+                    REACHABILITY_REUSE_SECS,
+                )
+            {
+                if let Err(error) = persistence::persist_signal_skipped(
+                    &connection,
+                    &environment.id,
+                    OUTBOUND_SIGNAL_ID,
+                    observed_at,
+                    reachability.as_str(),
+                ) {
+                    first_error.get_or_insert_with(|| anyhow::Error::from(error));
+                }
+                continue;
+            }
             let count = fetch_aggregate_count(
                 &self.client,
                 environment,
@@ -268,5 +288,62 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    struct NoProbeTransport;
+
+    impl HttpTransport for NoProbeTransport {
+        fn execute(&self, _request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+            panic!("must not probe an asleep Environment");
+        }
+    }
+
+    #[test]
+    fn outbound_signal_skips_when_availability_asleep() {
+        use crate::availability::{
+            AvailabilityObservation, Reachability, SignalState, persist_availability_snapshot,
+        };
+
+        let db = TempDb::new("outbound-asleep");
+        let store = db.store();
+        let observed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        {
+            let connection = store.open().unwrap();
+            persist_availability_snapshot(
+                &connection,
+                "prod",
+                &AvailabilityObservation {
+                    reachability: Reachability::Asleep,
+                    state: SignalState::Healthy,
+                    build: None,
+                    rtt_ms: 0,
+                    error: None,
+                },
+                observed_at,
+            )
+            .unwrap();
+        }
+
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
+        OutboundCollector::new(
+            vec![prod()],
+            credentials,
+            ServiceNowClient::new(NoProbeTransport, SystemClock),
+            store,
+        )
+        .collect()
+        .unwrap();
+
+        let connection = db.store().open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, "prod", OUTBOUND_SIGNAL_ID)
+            .unwrap()
+            .expect("snapshot");
+        assert_eq!(row.state, "skipped");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        assert_eq!(payload["skipped"], "asleep");
     }
 }

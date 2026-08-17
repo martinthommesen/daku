@@ -125,6 +125,38 @@ fn looks_like_table_api(body: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Freshness window for reusing this tick's Availability result in later
+/// Signals. Availability runs first in the same tick, so seconds usually
+/// separate the two; the window only tolerates a slow tick.
+pub const REACHABILITY_REUSE_SECS: i64 = 300;
+
+/// Reachability the Availability Signal recorded for `environment_id` within
+/// `max_age_secs` of `observed_at`, if any.
+pub fn recent_reachability(
+    connection: &Connection,
+    environment_id: &str,
+    observed_at: i64,
+    max_age_secs: i64,
+) -> Option<Reachability> {
+    let snapshot =
+        persistence::load_signal_snapshot(connection, environment_id, AVAILABILITY_SIGNAL_ID)
+            .ok()
+            .flatten()?;
+    if observed_at.saturating_sub(snapshot.observed_at) > max_age_secs {
+        return None;
+    }
+    let payload: serde_json::Value = serde_json::from_str(&snapshot.payload_json).ok()?;
+    match payload
+        .get("reachability")
+        .and_then(|value| value.as_str())?
+    {
+        "reachable" => Some(Reachability::Reachable),
+        "unreachable" => Some(Reachability::Unreachable),
+        "asleep" => Some(Reachability::Asleep),
+        _ => None,
+    }
+}
+
 pub fn persist_availability_snapshot(
     connection: &Connection,
     environment_id: &str,
@@ -314,5 +346,46 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    fn asleep_snapshot(connection: &rusqlite::Connection, observed_at: i64) {
+        let observation = AvailabilityObservation {
+            reachability: Reachability::Asleep,
+            state: SignalState::Healthy,
+            build: None,
+            rtt_ms: 0,
+            error: None,
+        };
+        persist_availability_snapshot(connection, "prod", &observation, observed_at).unwrap();
+    }
+
+    #[test]
+    fn recent_reachability_reads_fresh_asleep_snapshot() {
+        let db = TempDb::new("avail-recent-fresh");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        asleep_snapshot(&connection, 1_700_000_000);
+
+        assert_eq!(
+            recent_reachability(&connection, "prod", 1_700_000_010, REACHABILITY_REUSE_SECS),
+            Some(Reachability::Asleep)
+        );
+    }
+
+    #[test]
+    fn recent_reachability_ignores_stale_snapshot() {
+        let db = TempDb::new("avail-recent-stale");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        asleep_snapshot(&connection, 1_700_000_000);
+
+        assert_eq!(
+            recent_reachability(&connection, "prod", 1_700_000_301, REACHABILITY_REUSE_SECS),
+            None
+        );
+        assert_eq!(
+            recent_reachability(&connection, "dev", 1_700_000_010, REACHABILITY_REUSE_SECS),
+            None
+        );
     }
 }

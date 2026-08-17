@@ -301,6 +301,9 @@ fn summarize_payload(signal_id: &str, payload_json: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) else {
         return String::new();
     };
+    if value.get("skipped").is_some() {
+        return String::new();
+    }
     match signal_id {
         "availability" => match (
             value.get("rtt_ms").and_then(|item| item.as_u64()),
@@ -584,5 +587,14 @@ mod tests {
         let strip = state.compare_strip();
         assert!(strip.visible);
         assert!(strip.has_mismatch);
+    }
+
+    #[test]
+    fn summarize_payload_is_empty_for_skipped() {
+        assert_eq!(summarize_payload("jobs", r#"{"skipped":"asleep"}"#), "");
+        assert_eq!(
+            summarize_payload("drift", r#"{"skipped":"need_two_environments"}"#),
+            ""
+        );
     }
 }

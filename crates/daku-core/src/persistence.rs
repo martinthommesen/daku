@@ -158,6 +158,26 @@ pub struct SignalSnapshot {
     pub payload_json: String,
 }
 
+/// Records that `signal_id` deliberately skipped probing (`reason` is
+/// `"asleep"` or `"unreachable"` — the Availability outcome it deferred to).
+pub fn persist_signal_skipped(
+    connection: &Connection,
+    environment_id: &str,
+    signal_id: &str,
+    observed_at: i64,
+    reason: &str,
+) -> io::Result<()> {
+    let payload = serde_json::json!({ "skipped": reason });
+    persist_signal_snapshot(
+        connection,
+        environment_id,
+        signal_id,
+        observed_at,
+        SKIPPED_STATE,
+        &payload.to_string(),
+    )
+}
+
 pub fn persist_signal_snapshot(
     connection: &Connection,
     environment_id: &str,
