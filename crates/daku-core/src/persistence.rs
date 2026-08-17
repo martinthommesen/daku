@@ -158,6 +158,28 @@ pub fn persist_signal_snapshot(
     Ok(())
 }
 
+pub fn load_all_signal_snapshots(connection: &Connection) -> io::Result<Vec<SignalSnapshot>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT environment_id, signal_id, observed_at, state, payload_json
+             FROM signal_snapshots
+             ORDER BY environment_id, signal_id",
+        )
+        .map_err(to_io_error)?;
+    let mut rows = statement.query([]).map_err(to_io_error)?;
+    let mut snapshots = Vec::new();
+    while let Some(row) = rows.next().map_err(to_io_error)? {
+        snapshots.push(SignalSnapshot {
+            environment_id: row.get(0).map_err(to_io_error)?,
+            signal_id: row.get(1).map_err(to_io_error)?,
+            observed_at: row.get(2).map_err(to_io_error)?,
+            state: row.get(3).map_err(to_io_error)?,
+            payload_json: row.get(4).map_err(to_io_error)?,
+        });
+    }
+    Ok(snapshots)
+}
+
 pub fn load_signal_snapshot(
     connection: &Connection,
     environment_id: &str,

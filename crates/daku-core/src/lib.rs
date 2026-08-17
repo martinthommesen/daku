@@ -4,6 +4,7 @@ pub mod availability;
 pub mod collector;
 pub mod config;
 pub mod drift;
+pub mod health;
 pub mod hollow_backend;
 pub mod jobs;
 pub mod last_clone;
@@ -20,8 +21,9 @@ pub use collector::{probe_availability_once, start_default_loop};
 pub use config::default_environments_path;
 pub use daku_protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
-    MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
-    ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireDriverEvent,
+    EnvironmentHealth, EnvironmentSummary, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, Reachability,
+    ReplayCursor, Request, ResponseOutcome, ResponsePayload, RpcError, SamplePoint, SequencedEvent,
+    ServerMessage, SignalSnapshotDto, WireDriverEvent,
 };
 pub use hollow_backend::HollowBackend;
 pub use server::{Backend, EventSink, ServerOptions, serve};

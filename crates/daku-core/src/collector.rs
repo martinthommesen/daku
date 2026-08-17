@@ -2,17 +2,20 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crossbeam_channel::{Receiver, unbounded};
+use daku_protocol::ServerMessage;
 use daku_protocol::settings::DaemonSettings;
 
 use crate::availability::AvailabilityCollector;
 use crate::config::{
-    load_environments, CredentialStore, EnvironmentConfig, KeychainCredentialStore,
+    CredentialStore, EnvironmentConfig, KeychainCredentialStore, load_environments,
 };
 use crate::drift::DriftCollector;
+use crate::health::publish_dashboard;
 use crate::jobs::JobsCollector;
 use crate::last_clone::LastCloneCollector;
 use crate::mid_ecc::MidEccCollector;
@@ -67,11 +70,12 @@ impl CollectorLoop {
         }
     }
 
-    pub fn run(&self, shutdown: &AtomicBool, clock: &dyn Clock) {
+    pub fn run(&self, shutdown: &AtomicBool, clock: &dyn Clock, after: &dyn Fn()) {
         while !shutdown.load(Ordering::Acquire) {
             if let Err(error) = self.tick() {
                 eprintln!("daku collector tick failed: {error}");
             }
+            after();
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
@@ -80,11 +84,15 @@ impl CollectorLoop {
     }
 }
 
-pub fn spawn_collector_loop(loop_: CollectorLoop, shutdown: Arc<AtomicBool>) {
+pub fn spawn_collector_loop(
+    loop_: CollectorLoop,
+    shutdown: Arc<AtomicBool>,
+    after_tick: impl Fn() + Send + 'static,
+) {
     std::thread::Builder::new()
         .name("daku-collector".into())
         .spawn(move || {
-            loop_.run(&shutdown, &SystemClock);
+            loop_.run(&shutdown, &SystemClock, &after_tick);
         })
         .expect("spawn collector loop");
 }
@@ -150,7 +158,7 @@ pub fn start_default_loop(
     store: StateStore,
     settings: &DaemonSettings,
     shutdown: Arc<AtomicBool>,
-) {
+) -> Option<Receiver<ServerMessage>> {
     let environments = match load_environments(environments_path) {
         Ok(environments) => environments,
         Err(error) => {
@@ -159,15 +167,18 @@ pub fn start_default_loop(
                     "daku collector idle: missing {}",
                     environments_path.display()
                 );
-                return;
+                return None;
             }
             eprintln!("daku collector not started: {error}");
-            return;
+            return None;
         }
     };
     if environments.is_empty() {
-        return;
+        return None;
     }
+    let (dashboard_tx, dashboard_rx) = unbounded();
+    let dashboard_environments = environments.clone();
+    let dashboard_store = store.clone();
     let loop_ = build_default_loop(
         environments,
         Arc::new(KeychainCredentialStore),
@@ -175,7 +186,21 @@ pub fn start_default_loop(
         Duration::from_secs(poll_interval_secs(settings)),
         ServiceNowClient::new(UreqTransport::default(), SystemClock),
     );
-    spawn_collector_loop(loop_, shutdown);
+    spawn_collector_loop(loop_, shutdown, move || {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        if let Err(error) = publish_dashboard(
+            &dashboard_environments,
+            &dashboard_store,
+            &dashboard_tx,
+            now,
+        ) {
+            eprintln!("daku dashboard publish failed: {error}");
+        }
+    });
+    Some(dashboard_rx)
 }
 
 pub fn probe_availability_once(environments_path: &Path, store: StateStore) -> anyhow::Result<()> {
@@ -201,11 +226,11 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::availability::{AvailabilityCollector, AVAILABILITY_SIGNAL_ID};
+    use crate::availability::{AVAILABILITY_SIGNAL_ID, AvailabilityCollector};
     use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore};
     use crate::persistence::{self, StateStore};
     use crate::servicenow::{
-        HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
+        Clock, HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
     };
 
     struct FixtureTransport;
@@ -267,5 +292,25 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn collector_loop_run_invokes_after_tick() {
+        let shutdown = AtomicBool::new(false);
+        let called = AtomicBool::new(false);
+        let loop_ = CollectorLoop::new(Duration::from_millis(1));
+        struct StopOnSleep<'a>(&'a AtomicBool);
+        impl Clock for StopOnSleep<'_> {
+            fn now(&self) -> std::time::SystemTime {
+                std::time::SystemTime::now()
+            }
+            fn sleep(&self, _: Duration) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|| {
+            called.store(true, Ordering::Release);
+        });
+        assert!(called.load(Ordering::Acquire));
     }
 }

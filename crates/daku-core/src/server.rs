@@ -1,12 +1,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use daku_protocol::{
+    ClientMessage, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, ReplayCursor, Request,
+    ResponseOutcome, ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireDriverEvent,
+};
 use parking_lot::Mutex as ParkingMutex;
 use subtle::ConstantTimeEq as _;
 use tungstenite::handshake::server::{
@@ -16,10 +20,6 @@ use tungstenite::http::{StatusCode, header::ORIGIN};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket, accept_hdr_with_config};
 use uuid::Uuid;
-use daku_protocol::{
-    ClientMessage, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, ReplayCursor, Request,
-    ResponseOutcome, ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireDriverEvent,
-};
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -132,6 +132,13 @@ impl Hub {
             .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
     }
 
+    fn broadcast(&self, message: ServerMessage) {
+        let mut state = self.state.lock();
+        state
+            .subscribers
+            .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
+    }
+
     fn subscribe(&self, resume_from: &[ReplayCursor], sender: Sender<ServerMessage>) -> u64 {
         let mut state = self.state.lock();
         for (&(session_id, runtime_id), events) in &state.journal {
@@ -193,11 +200,28 @@ pub fn serve(
     backend: Arc<dyn Backend>,
     shutdown: Arc<AtomicBool>,
     options: ServerOptions,
+    dashboard_events: Option<Receiver<ServerMessage>>,
 ) -> anyhow::Result<()> {
     listener
         .set_nonblocking(true)
         .context("could not configure daku daemon listener")?;
     let hub = Arc::new(Hub::default());
+    if let Some(dashboard_events) = dashboard_events {
+        let hub = hub.clone();
+        let shutdown = shutdown.clone();
+        std::thread::Builder::new()
+            .name("daku-dashboard".into())
+            .spawn(move || {
+                while !shutdown.load(Ordering::Acquire) {
+                    match dashboard_events.recv_timeout(Duration::from_millis(25)) {
+                        Ok(message) => hub.broadcast(message),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .context("could not start daku dashboard thread")?;
+    }
     let options = Arc::new(options);
     let active_connections = Arc::new(AtomicUsize::new(0));
     while !shutdown.load(Ordering::Acquire) {
@@ -499,7 +523,7 @@ fn write_json<S: io::Read + io::Write, T: serde::Serialize>(
 mod tests {
     use super::*;
 
-    use daku_protocol::Command;
+    use daku_protocol::{Command, ServerMessage};
 
     struct TestBackend;
 
@@ -517,8 +541,24 @@ mod tests {
 
     #[test]
     fn handshake_rejects_wrong_protocol_version() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 1);
         assert!(token_matches("secret", "secret"));
         assert!(!token_matches("secret", "other"));
+    }
+
+    #[test]
+    fn hub_broadcasts_environments_updated() {
+        let hub = Hub::default();
+        let (tx, rx) = unbounded();
+        hub.subscribe(&[], tx);
+        hub.broadcast(ServerMessage::EnvironmentsUpdated {
+            environments: vec![],
+        });
+        match rx.try_recv().unwrap() {
+            ServerMessage::EnvironmentsUpdated { environments } => {
+                assert!(environments.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

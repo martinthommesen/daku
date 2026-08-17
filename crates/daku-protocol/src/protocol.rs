@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::settings::DaemonSettings;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "DAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "DAKU_DAEMON_ADDRESS";
@@ -64,9 +64,7 @@ pub struct ReplayCursor {
 pub enum Command {
     Ping,
     GetSettings,
-    UpdateSettings {
-        settings: DaemonSettings,
-    },
+    UpdateSettings { settings: DaemonSettings },
     LoadTaskState,
 }
 
@@ -97,6 +95,49 @@ pub struct SequencedEvent {
     pub event: WireDriverEvent,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EnvironmentHealth {
+    Healthy,
+    Degraded,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Reachability {
+    Reachable,
+    Unreachable,
+    Asleep,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentSummary {
+    pub id: String,
+    pub label: String,
+    pub platform_id: String,
+    pub health: EnvironmentHealth,
+    pub reachability: Reachability,
+    pub last_observed_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalSnapshotDto {
+    pub signal_id: String,
+    pub state: String,
+    pub observed_at: i64,
+    pub payload_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplePoint {
+    pub observed_at: i64,
+    pub value_real: Option<f64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(
     tag = "type",
@@ -118,6 +159,18 @@ pub enum ServerMessage {
     Event(SequencedEvent),
     TaskStateChanged {
         revision: u64,
+    },
+    EnvironmentsUpdated {
+        environments: Vec<EnvironmentSummary>,
+    },
+    SignalSnapshotsUpdated {
+        environment_id: String,
+        snapshots: Vec<SignalSnapshotDto>,
+    },
+    SignalSamplesUpdated {
+        environment_id: String,
+        signal_id: String,
+        points: Vec<SamplePoint>,
     },
     ShuttingDown,
 }
@@ -187,5 +240,96 @@ mod tests {
         assert_eq!(json["type"], "hello");
         assert_eq!(json["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(json["resumeFrom"][0]["sequence"], 9);
+    }
+
+    #[test]
+    fn environments_updated_round_trips() {
+        let message = ServerMessage::EnvironmentsUpdated {
+            environments: vec![EnvironmentSummary {
+                id: "prod".into(),
+                label: "Production".into(),
+                platform_id: "servicenow".into(),
+                health: EnvironmentHealth::Healthy,
+                reachability: Reachability::Asleep,
+                last_observed_at: Some(1_700_000_000),
+            }],
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["type"], "environmentsUpdated");
+        assert_eq!(json["environments"][0]["platformId"], "servicenow");
+        assert_eq!(json["environments"][0]["health"], "healthy");
+        assert_eq!(json["environments"][0]["reachability"], "asleep");
+        assert_eq!(json["environments"][0]["lastObservedAt"], 1_700_000_000);
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::EnvironmentsUpdated { environments } => {
+                assert_eq!(environments[0].health, EnvironmentHealth::Healthy);
+                assert_eq!(environments[0].reachability, Reachability::Asleep);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signal_snapshots_updated_round_trips() {
+        let message = ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "prod".into(),
+            snapshots: vec![SignalSnapshotDto {
+                signal_id: "jobs".into(),
+                state: "degraded".into(),
+                observed_at: 11,
+                payload_json: r#"{"overdue":1}"#.into(),
+            }],
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["type"], "signalSnapshotsUpdated");
+        assert_eq!(json["environmentId"], "prod");
+        assert_eq!(json["snapshots"][0]["signalId"], "jobs");
+        assert_eq!(json["snapshots"][0]["payloadJson"], r#"{"overdue":1}"#);
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, ServerMessage::SignalSnapshotsUpdated { .. }));
+    }
+
+    #[test]
+    fn signal_samples_updated_round_trips_including_empty_points() {
+        let empty = ServerMessage::SignalSamplesUpdated {
+            environment_id: "prod".into(),
+            signal_id: "syslog".into(),
+            points: vec![],
+        };
+        let json = serde_json::to_value(&empty).unwrap();
+        assert_eq!(json["type"], "signalSamplesUpdated");
+        assert_eq!(json["signalId"], "syslog");
+        assert_eq!(json["points"].as_array().unwrap().len(), 0);
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::SignalSamplesUpdated { points, .. } => assert!(points.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let with_points = ServerMessage::SignalSamplesUpdated {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            points: vec![SamplePoint {
+                observed_at: 20,
+                value_real: Some(3.0),
+            }],
+        };
+        let json = serde_json::to_value(&with_points).unwrap();
+        assert_eq!(json["points"][0]["observedAt"], 20);
+        assert_eq!(json["points"][0]["valueReal"], 3.0);
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::SignalSamplesUpdated { points, .. } => {
+                assert_eq!(points.len(), 1);
+                assert_eq!(points[0].value_real, Some(3.0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_version_is_daku_domain() {
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 }

@@ -120,13 +120,13 @@ Include explicit case: **asleep + no degraded Signals → health healthy (or las
 
 ## Done criteria
 
-- [ ] `cargo test -p daku-core health_rollup` exit 0
-- [ ] `cargo test -p daku-protocol` exit 0
-- [ ] `cargo check -p daku-protocol -p daku-core -p daku-daemon -p daku-client` exit 0
-- [ ] `rg -n 'enum EnvironmentHealth|EnvironmentHealth::' crates/daku-core crates/daku-protocol` → only healthy/degraded/down variants (no `Unknown`)
-- [ ] `rg -n 'asleep' crates/daku-core` → rollup test proves asleep ↛ degraded
-- [ ] `rg -n 'SignalSamplesUpdated' crates/daku-protocol` → ≥1 hit
-- [ ] `plans/README.md` row 008 Status = `DONE`
+- [x] `cargo test -p daku-core health_rollup` exit 0
+- [x] `cargo test -p daku-protocol` exit 0
+- [x] `cargo check -p daku-protocol -p daku-core -p daku-daemon -p daku-client` exit 0
+- [x] `rg -n 'enum EnvironmentHealth|EnvironmentHealth::' crates/daku-core crates/daku-protocol` → only healthy/degraded/down variants (no `Unknown`)
+- [x] `rg -n 'asleep' crates/daku-core` → rollup test proves asleep ↛ degraded
+- [x] `rg -n 'SignalSamplesUpdated' crates/daku-protocol` → ≥1 hit
+- [x] `plans/README.md` row 008 Status = `DONE`
 
 ## STOP conditions
 

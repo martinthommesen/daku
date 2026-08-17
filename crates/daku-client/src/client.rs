@@ -34,6 +34,7 @@ struct ClientInner {
     sessions: Mutex<HashMap<(Uuid, Uuid), Sender<SequencedEvent>>>,
     pending_events: Mutex<HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>>,
     task_state_subscribers: Mutex<Vec<Sender<u64>>>,
+    dashboard: Mutex<Vec<Sender<ServerMessage>>>,
     last_sequences: Mutex<HashMap<(Uuid, Uuid), LastSequence>>,
     disconnected: AtomicBool,
 }
@@ -110,6 +111,7 @@ impl DaemonClient {
             sessions: Mutex::new(HashMap::new()),
             pending_events: Mutex::new(HashMap::new()),
             task_state_subscribers: Mutex::new(Vec::new()),
+            dashboard: Mutex::new(Vec::new()),
             last_sequences: Mutex::new(last_sequences),
             disconnected: AtomicBool::new(false),
         });
@@ -144,6 +146,12 @@ impl DaemonClient {
     pub fn subscribe_task_state(&self) -> Receiver<u64> {
         let (events, receiver) = unbounded();
         self.inner.task_state_subscribers.lock().push(events);
+        receiver
+    }
+
+    pub fn subscribe_dashboard(&self) -> Receiver<ServerMessage> {
+        let (events, receiver) = unbounded();
+        self.inner.dashboard.lock().push(events);
         receiver
     }
 
@@ -317,6 +325,14 @@ fn run_client(
                             .lock()
                             .retain(|subscriber| subscriber.send(revision).is_ok());
                     }
+                    ServerMessage::EnvironmentsUpdated { .. }
+                    | ServerMessage::SignalSnapshotsUpdated { .. }
+                    | ServerMessage::SignalSamplesUpdated { .. } => {
+                        inner
+                            .dashboard
+                            .lock()
+                            .retain(|subscriber| subscriber.send(message.clone()).is_ok());
+                    }
                     ServerMessage::ShuttingDown => break,
                     ServerMessage::Hello { .. } | ServerMessage::Rejected { .. } => {}
                 }
@@ -359,6 +375,7 @@ fn run_client(
         });
     }
     inner.task_state_subscribers.lock().clear();
+    inner.dashboard.lock().clear();
 }
 
 fn set_client_read_timeout(
@@ -431,5 +448,61 @@ mod tests {
             daemon_url("wss://daku.example.test/old?ignored=1").unwrap(),
             "wss://daku.example.test/v1"
         );
+    }
+
+    #[test]
+    fn protocol_dashboard_decodes_environments_updated() {
+        let json = serde_json::json!({
+            "type": "environmentsUpdated",
+            "environments": [{
+                "id": "prod",
+                "label": "Production",
+                "platformId": "servicenow",
+                "health": "healthy",
+                "reachability": "asleep",
+                "lastObservedAt": 1_700_000_000
+            }]
+        });
+        match serde_json::from_value::<ServerMessage>(json).unwrap() {
+            ServerMessage::EnvironmentsUpdated { environments } => {
+                assert_eq!(environments[0].id, "prod");
+                assert_eq!(
+                    environments[0].health,
+                    daku_protocol::EnvironmentHealth::Healthy
+                );
+                assert_eq!(
+                    environments[0].reachability,
+                    daku_protocol::Reachability::Asleep
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_dashboard_decodes_signal_samples_updated() {
+        let json = serde_json::json!({
+            "type": "signalSamplesUpdated",
+            "environmentId": "prod",
+            "signalId": "jobs",
+            "points": [
+                { "observedAt": 10, "valueReal": 2.0 },
+                { "observedAt": 20, "valueReal": null }
+            ]
+        });
+        match serde_json::from_value::<ServerMessage>(json).unwrap() {
+            ServerMessage::SignalSamplesUpdated {
+                environment_id,
+                signal_id,
+                points,
+            } => {
+                assert_eq!(environment_id, "prod");
+                assert_eq!(signal_id, "jobs");
+                assert_eq!(points.len(), 2);
+                assert_eq!(points[0].value_real, Some(2.0));
+                assert_eq!(points[1].value_real, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

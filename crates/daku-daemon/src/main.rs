@@ -1,11 +1,11 @@
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context as _};
-use daku_protocol::{DaemonReady, DAEMON_TOKEN_ENV, PROTOCOL_VERSION};
+use anyhow::{Context as _, anyhow, bail};
+use daku_protocol::{DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION};
 
 fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse(std::env::args().skip(1))?;
@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
     )
     .context("could not load daemon settings")?;
     let task_store = daku_core::persistence::StateStore::daemon(task_path.clone());
-    daku_core::start_default_loop(
+    let dashboard_events = daku_core::start_default_loop(
         &daku_core::default_environments_path(),
         daku_core::persistence::StateStore::daemon(task_path),
         &settings.get(),
@@ -67,6 +67,7 @@ fn main() -> anyhow::Result<()> {
             allowed_origins: arguments.allowed_origins.into_iter().collect(),
             allow_shutdown: arguments.parent_pid.is_some(),
         },
+        dashboard_events,
     )
 }
 
