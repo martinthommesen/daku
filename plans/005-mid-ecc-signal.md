@@ -84,10 +84,10 @@ Dead MID Servers and ECC backlog are v1 Signal #3. Empty MID lists on a baseline
 
 ## Done criteria
 
-- [ ] `cargo test -p daku-core mid_ecc` exit 0
-- [ ] `rg -n 'mid_ecc' crates/daku-core` → ≥1 hit
-- [ ] No private poll timer in MID module
-- [ ] `plans/README.md` row 005 Status = `DONE`
+- [x] `cargo test -p daku-core mid_ecc` exit 0
+- [x] `rg -n 'mid_ecc' crates/daku-core` → ≥1 hit
+- [x] No private poll timer in MID module
+- [x] `plans/README.md` row 005 Status = `DONE`
 
 ## STOP conditions
 

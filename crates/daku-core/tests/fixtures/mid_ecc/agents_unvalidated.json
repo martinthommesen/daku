@@ -1,0 +1,10 @@
+{
+  "result": [
+    {
+      "status": "Up",
+      "validated": "false",
+      "version": "5.0.0",
+      "host_name": "mid-1"
+    }
+  ]
+}
