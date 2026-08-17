@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -77,6 +77,7 @@ struct HubState {
     next_sequences: HashMap<(Uuid, Uuid), u64>,
     journal: HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>,
     responses: VecDeque<(Uuid, ResponseOutcome)>,
+    dashboard: BTreeMap<String, ServerMessage>,
 }
 
 struct Hub {
@@ -139,6 +140,17 @@ impl Hub {
             .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
     }
 
+    /// Broadcasts a dashboard message and remembers it for late subscribers.
+    fn publish_dashboard(&self, message: ServerMessage) {
+        let mut state = self.state.lock();
+        if let Some(key) = message.dashboard_cache_key() {
+            state.dashboard.insert(key, message.clone());
+        }
+        state
+            .subscribers
+            .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
+    }
+
     fn subscribe(&self, resume_from: &[ReplayCursor], sender: Sender<ServerMessage>) -> u64 {
         let mut state = self.state.lock();
         for (&(session_id, runtime_id), events) in &state.journal {
@@ -154,6 +166,9 @@ impl Hub {
             for event in events.iter().filter(|event| event.sequence > sequence) {
                 let _ = sender.send(ServerMessage::Event(event.clone()));
             }
+        }
+        for message in state.dashboard.values() {
+            let _ = sender.send(message.clone());
         }
         let id = state.next_subscriber_id;
         state.next_subscriber_id = state.next_subscriber_id.saturating_add(1);
@@ -214,7 +229,7 @@ pub fn serve(
             .spawn(move || {
                 while !shutdown.load(Ordering::Acquire) {
                     match dashboard_events.recv_timeout(Duration::from_millis(25)) {
-                        Ok(message) => hub.broadcast(message),
+                        Ok(message) => hub.publish_dashboard(message),
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
@@ -557,5 +572,32 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn hub_replays_latest_dashboard_state_to_late_subscriber() {
+        let hub = Hub::default();
+        hub.publish_dashboard(ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "prod".into(),
+            snapshots: vec![],
+        });
+        hub.publish_dashboard(ServerMessage::EnvironmentsUpdated {
+            environments: vec![],
+        });
+        hub.publish_dashboard(ServerMessage::EnvironmentsUpdated {
+            environments: vec![],
+        });
+        let (tx, rx) = unbounded();
+        hub.subscribe(&[], tx);
+        let replayed: Vec<ServerMessage> = rx.try_iter().collect();
+        assert_eq!(replayed.len(), 2);
+        assert!(matches!(
+            replayed[0],
+            ServerMessage::EnvironmentsUpdated { .. }
+        ));
+        assert!(matches!(
+            replayed[1],
+            ServerMessage::SignalSnapshotsUpdated { .. }
+        ));
     }
 }

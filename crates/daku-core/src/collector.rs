@@ -71,6 +71,9 @@ impl CollectorLoop {
     }
 
     pub fn run(&self, shutdown: &AtomicBool, clock: &dyn Clock, after: &dyn Fn()) {
+        // Publish last-known state from SQLite so a fresh subscriber is not blank
+        // until the first tick completes.
+        after();
         while !shutdown.load(Ordering::Acquire) {
             if let Err(error) = self.tick() {
                 eprintln!("daku collector tick failed: {error}");
@@ -232,6 +235,7 @@ mod tests {
     use crate::servicenow::{
         Clock, HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
     };
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn poll_interval_secs_reads_top_level_json_key() {
@@ -315,9 +319,9 @@ mod tests {
     }
 
     #[test]
-    fn collector_loop_run_invokes_after_tick() {
+    fn collector_loop_run_publishes_before_and_after_tick() {
         let shutdown = AtomicBool::new(false);
-        let called = AtomicBool::new(false);
+        let calls = AtomicUsize::new(0);
         let loop_ = CollectorLoop::new(Duration::from_millis(1));
         struct StopOnSleep<'a>(&'a AtomicBool);
         impl Clock for StopOnSleep<'_> {
@@ -329,8 +333,8 @@ mod tests {
             }
         }
         loop_.run(&shutdown, &StopOnSleep(&shutdown), &|| {
-            called.store(true, Ordering::Release);
+            calls.fetch_add(1, Ordering::Release);
         });
-        assert!(called.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 }

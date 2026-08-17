@@ -175,6 +175,26 @@ pub enum ServerMessage {
     ShuttingDown,
 }
 
+impl ServerMessage {
+    /// Cache key for "latest dashboard state" replay. `EnvironmentsUpdated`
+    /// sorts first so a replaying client sets its selection before snapshots
+    /// and samples arrive. `None` for non-dashboard messages.
+    pub fn dashboard_cache_key(&self) -> Option<String> {
+        match self {
+            Self::EnvironmentsUpdated { .. } => Some("0:environments".to_owned()),
+            Self::SignalSnapshotsUpdated { environment_id, .. } => {
+                Some(format!("1:snapshots:{environment_id}"))
+            }
+            Self::SignalSamplesUpdated {
+                environment_id,
+                signal_id,
+                ..
+            } => Some(format!("2:samples:{environment_id}:{signal_id}")),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(
     tag = "status",
@@ -331,5 +351,32 @@ mod tests {
     #[test]
     fn protocol_version_is_daku_domain() {
         assert_eq!(PROTOCOL_VERSION, 1);
+    }
+
+    #[test]
+    fn dashboard_cache_key_orders_environments_first() {
+        let environments = ServerMessage::EnvironmentsUpdated {
+            environments: Vec::new(),
+        }
+        .dashboard_cache_key()
+        .expect("environments key");
+        let snapshots = ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "prod".into(),
+            snapshots: Vec::new(),
+        }
+        .dashboard_cache_key()
+        .expect("snapshots key");
+        let samples = ServerMessage::SignalSamplesUpdated {
+            environment_id: "prod".into(),
+            signal_id: "drift".into(),
+            points: Vec::new(),
+        }
+        .dashboard_cache_key()
+        .expect("samples key");
+
+        assert_eq!(environments, "0:environments");
+        assert!(environments < snapshots);
+        assert!(snapshots < samples);
+        assert_eq!(ServerMessage::ShuttingDown.dashboard_cache_key(), None);
     }
 }

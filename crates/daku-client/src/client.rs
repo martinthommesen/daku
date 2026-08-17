@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -35,6 +35,7 @@ struct ClientInner {
     pending_events: Mutex<HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>>,
     task_state_subscribers: Mutex<Vec<Sender<u64>>>,
     dashboard: Mutex<Vec<Sender<ServerMessage>>>,
+    dashboard_cache: Mutex<BTreeMap<String, ServerMessage>>,
     last_sequences: Mutex<HashMap<(Uuid, Uuid), LastSequence>>,
     disconnected: AtomicBool,
 }
@@ -112,6 +113,7 @@ impl DaemonClient {
             pending_events: Mutex::new(HashMap::new()),
             task_state_subscribers: Mutex::new(Vec::new()),
             dashboard: Mutex::new(Vec::new()),
+            dashboard_cache: Mutex::new(BTreeMap::new()),
             last_sequences: Mutex::new(last_sequences),
             disconnected: AtomicBool::new(false),
         });
@@ -151,6 +153,9 @@ impl DaemonClient {
 
     pub fn subscribe_dashboard(&self) -> Receiver<ServerMessage> {
         let (events, receiver) = unbounded();
+        for message in self.inner.dashboard_cache.lock().values() {
+            let _ = events.send(message.clone());
+        }
         self.inner.dashboard.lock().push(events);
         receiver
     }
@@ -328,6 +333,9 @@ fn run_client(
                     ServerMessage::EnvironmentsUpdated { .. }
                     | ServerMessage::SignalSnapshotsUpdated { .. }
                     | ServerMessage::SignalSamplesUpdated { .. } => {
+                        if let Some(key) = message.dashboard_cache_key() {
+                            inner.dashboard_cache.lock().insert(key, message.clone());
+                        }
                         inner
                             .dashboard
                             .lock()
@@ -376,6 +384,7 @@ fn run_client(
     }
     inner.task_state_subscribers.lock().clear();
     inner.dashboard.lock().clear();
+    inner.dashboard_cache.lock().clear();
 }
 
 fn set_client_read_timeout(
