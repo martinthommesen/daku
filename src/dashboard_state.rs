@@ -259,6 +259,23 @@ impl DashboardState {
         summarize_payload(signal_id, &snapshot.payload_json)
     }
 
+    /// One-line diagnostic for the selected Environment's Signal: the daemon's
+    /// persisted `error` (availability) or `detail` (other Signals) string,
+    /// or a human phrase for a skipped probe. Empty when there is nothing to say.
+    pub fn card_detail(&self, signal_id: &str) -> String {
+        let Some(environment_id) = self.selected_id.as_deref() else {
+            return String::new();
+        };
+        let Some(snapshot) = self
+            .snapshots
+            .get(environment_id)
+            .and_then(|map| map.get(signal_id))
+        else {
+            return String::new();
+        };
+        detail_from_payload(&snapshot.payload_json)
+    }
+
     pub fn compare_rows(&self) -> Vec<(String, String, Option<String>)> {
         self.environments
             .iter()
@@ -376,6 +393,26 @@ fn summarize_payload(signal_id: &str, payload_json: &str) -> String {
     }
 }
 
+fn detail_from_payload(payload_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) else {
+        return String::new();
+    };
+    if let Some(reason) = value.get("skipped").and_then(|item| item.as_str()) {
+        // The card's main line already reads "skipped"; do not repeat the word.
+        return match reason {
+            "asleep" => "Environment asleep".to_owned(),
+            "unreachable" => "Environment unreachable".to_owned(),
+            "need_two_environments" => "needs two Environments".to_owned(),
+            other => other.to_owned(),
+        };
+    }
+    ["error", "detail"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(|item| item.as_str()))
+        .map(|text| text.chars().take(160).collect())
+        .unwrap_or_default()
+}
+
 pub fn ui_fixture_enabled() -> bool {
     matches!(std::env::var("DAKU_UI_FIXTURE").as_deref(), Ok("1"))
 }
@@ -432,7 +469,11 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                     "healthy",
                     r#"{"agents_total":2,"agents_unhealthy":0,"ecc_output_ready":3,"ecc_error":0}"#,
                 ),
-                snap("outbound", "healthy", r#"{"outbound_http_4xx_5xx_1h":0}"#),
+                snap(
+                    "outbound",
+                    "down",
+                    r#"{"reachability":"unreachable","detail":"HTTP 429"}"#,
+                ),
                 snap(
                     "drift",
                     "degraded",
@@ -596,5 +637,43 @@ mod tests {
             summarize_payload("drift", r#"{"skipped":"need_two_environments"}"#),
             ""
         );
+    }
+
+    #[test]
+    fn card_detail_reads_error_and_detail() {
+        assert_eq!(
+            detail_from_payload(
+                r#"{"reachability":"unreachable","error":"no credential for environment prod"}"#
+            ),
+            "no credential for environment prod"
+        );
+        assert_eq!(
+            detail_from_payload(r#"{"reachability":"unreachable","detail":"HTTP 429"}"#),
+            "HTTP 429"
+        );
+        assert_eq!(detail_from_payload("{}"), "");
+        assert_eq!(detail_from_payload("not json"), "");
+        // `error` is a count in the jobs payload, not a message.
+        assert_eq!(detail_from_payload(r#"{"overdue_ready":2,"error":1}"#), "");
+    }
+
+    #[test]
+    fn card_detail_phrases_skipped() {
+        assert_eq!(
+            detail_from_payload(r#"{"skipped":"asleep"}"#),
+            "Environment asleep"
+        );
+        assert_eq!(
+            detail_from_payload(r#"{"skipped":"need_two_environments"}"#),
+            "needs two Environments"
+        );
+    }
+
+    #[test]
+    fn card_detail_for_selected_environment() {
+        let mut state = loaded();
+        state.select("test");
+        assert_eq!(state.card_detail("outbound"), "HTTP 429");
+        assert_eq!(state.card_detail("jobs"), "");
     }
 }
