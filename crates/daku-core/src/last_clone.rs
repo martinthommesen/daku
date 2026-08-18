@@ -5,9 +5,10 @@ use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 
-use daku_protocol::SignalState;
+use daku_protocol::{Reachability, SignalState};
 use rusqlite::Connection;
 
+use crate::availability::{REACHABILITY_REUSE_SECS, recent_reachability};
 use crate::collector::{SignalCollector, unix_now};
 use crate::config::{CredentialStore, EnvironmentConfig};
 use crate::persistence::{self, StateStore};
@@ -152,6 +153,32 @@ impl SignalCollector for LastCloneCollector {
             )?;
             return Ok(());
         };
+        // Mirrors the gate in `collector.rs`: an asleep or unreachable source
+        // cannot list clones, so say so instead of probing it every tick.
+        if let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
+            recent_reachability(
+                &connection,
+                &source.id,
+                observed_at,
+                REACHABILITY_REUSE_SECS,
+            )
+        {
+            persistence::persist_signal_skipped(
+                &connection,
+                &source.id,
+                LAST_CLONE_SIGNAL_ID,
+                observed_at,
+                reachability.as_str(),
+            )?;
+            skip_targets(
+                &connection,
+                &self.environments,
+                Some(source.id.as_str()),
+                observed_at,
+                &format!("clone_source_{}", reachability.as_str()),
+            )?;
+            return Ok(());
+        }
         let response = match self.client.request(
             source,
             self.credentials.as_ref(),
@@ -627,5 +654,60 @@ mod tests {
         assert_eq!(row.state, "down");
         // Pins the transport arm rather than a credential lookup failure.
         assert!(row.payload_json.contains("connection refused"));
+    }
+
+    struct NoProbeTransport;
+
+    impl HttpTransport for NoProbeTransport {
+        fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+            panic!("must not probe an asleep clone source: {}", request.url);
+        }
+    }
+
+    #[test]
+    fn last_clone_signal_skips_an_asleep_source() {
+        let db = TempDb::new("last-clone-asleep");
+        let store = db.store();
+        {
+            let connection = store.open().unwrap();
+            crate::availability::persist_availability_snapshot(
+                &connection,
+                "prod",
+                &crate::availability::AvailabilityObservation {
+                    reachability: Reachability::Asleep,
+                    state: SignalState::Healthy,
+                    build: None,
+                    rtt_ms: 0,
+                    error: None,
+                },
+                unix_now(),
+            )
+            .unwrap();
+        }
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        for id in ["prod", "test"] {
+            credentials.insert(id, r#"{"username":"reader","password":"secret"}"#);
+        }
+        LastCloneCollector::new(
+            vec![
+                env("prod", "acme-prod", true),
+                env("test", "acme-test", false),
+            ],
+            credentials,
+            ServiceNowClient::new(NoProbeTransport, SystemClock),
+            store,
+        )
+        .collect()
+        .unwrap();
+
+        let connection = db.store().open().unwrap();
+        for (id, reason) in [("prod", "asleep"), ("test", "clone_source_asleep")] {
+            let row = persistence::load_signal_snapshot(&connection, id, LAST_CLONE_SIGNAL_ID)
+                .unwrap()
+                .expect("snapshot");
+            assert_eq!(row.state, "skipped");
+            let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+            assert_eq!(payload["skipped"], reason);
+        }
     }
 }

@@ -6,10 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use daku_protocol::SignalState;
+use daku_protocol::{Reachability, SignalState};
 use rusqlite::Connection;
 
-use crate::availability::{AVAILABILITY_SIGNAL_ID, GLIDE_WAR_PATH, classify_availability_response};
+use crate::availability::{
+    AVAILABILITY_SIGNAL_ID, GLIDE_WAR_PATH, REACHABILITY_REUSE_SECS,
+    classify_availability_response, recent_reachability,
+};
 use crate::collector::{SignalCollector, unix_now};
 use crate::config::{CredentialStore, EnvironmentConfig};
 use crate::persistence::{self, StateStore};
@@ -25,8 +28,10 @@ pub const SYS_STORE_APP_PATH: &str = "/api/now/table/sys_store_app?sysparm_field
 /// often. Builds are still compared every tick via the availability snapshot.
 pub const INVENTORY_REFRESH_SECS: i64 = 30 * 60;
 
-pub fn drift_state(build_matches: bool, mismatches: u64) -> SignalState {
-    if build_matches && mismatches == 0 {
+/// `build_matches: None` means at least one side's build could not be read —
+/// unknown is not a mismatch, and two unknowns are not agreement.
+pub fn drift_state(build_matches: Option<bool>, mismatches: u64) -> SignalState {
+    if build_matches != Some(false) && mismatches == 0 {
         SignalState::Healthy
     } else {
         SignalState::Degraded
@@ -142,6 +147,26 @@ impl DriftCollector {
         max_age_secs: i64,
         source: Option<&EnvInventory>,
     ) -> anyhow::Result<()> {
+        // Mirrors the gate in `collector.rs` for the per-Environment Signals:
+        // an asleep Environment is skipped, never probed and never degraded.
+        // Runs before the missing-source branch so an asleep target is not
+        // overwritten with "clone source unreachable".
+        if let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
+            recent_reachability(
+                connection,
+                &environment.id,
+                observed_at,
+                REACHABILITY_REUSE_SECS,
+            )
+        {
+            return persist_drift_skipped(
+                connection,
+                &environment.id,
+                observed_at,
+                reachability.as_str(),
+            )
+            .map_err(anyhow::Error::from);
+        }
         let Some(source) = source else {
             return persist_drift_down(
                 connection,
@@ -173,10 +198,48 @@ impl SignalCollector for DriftCollector {
             .iter()
             .find(|environment| environment.clone_source)
         else {
-            return persist_all_skipped(&connection, &self.environments, observed_at);
+            return persist_all_skipped(
+                &connection,
+                &self.environments,
+                observed_at,
+                "no_clone_source",
+            );
         };
         if self.environments.len() < 2 {
-            return persist_all_skipped(&connection, &self.environments, observed_at);
+            return persist_all_skipped(
+                &connection,
+                &self.environments,
+                observed_at,
+                "need_two_environments",
+            );
+        }
+        // Nothing can be compared without the source, so an asleep or
+        // unreachable source skips every card rather than probing anything.
+        if let Some(reachability @ (Reachability::Asleep | Reachability::Unreachable)) =
+            recent_reachability(
+                &connection,
+                &source.id,
+                observed_at,
+                REACHABILITY_REUSE_SECS,
+            )
+        {
+            let mut first_error = None;
+            for environment in &self.environments {
+                let reason = if environment.id == source.id {
+                    reachability.as_str().to_owned()
+                } else {
+                    format!("clone_source_{}", reachability.as_str())
+                };
+                if let Err(error) =
+                    persist_drift_skipped(&connection, &environment.id, observed_at, &reason)
+                {
+                    first_error.get_or_insert_with(|| anyhow::Error::from(error));
+                }
+            }
+            return match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
         }
         let max_age_secs = (self.poll_interval.as_secs() as i64).saturating_mul(2);
         let source_inventory = self.env_inventory(source, &connection, observed_at, max_age_secs);
@@ -340,7 +403,10 @@ fn persist_drift_compare(
 ) -> io::Result<()> {
     let mismatch_list = diff_plugin_inventory(&source.plugins, &other.plugins);
     let mismatches = mismatch_list.len() as u64;
-    let build_matches = source.build == other.build;
+    let build_matches = match (&source.build, &other.build) {
+        (Some(source_build), Some(other_build)) => Some(source_build == other_build),
+        _ => None,
+    };
     let payload = serde_json::json!({
         "mismatches": mismatches,
         "build_matches": build_matches,
@@ -362,10 +428,12 @@ fn persist_all_skipped(
     connection: &Connection,
     environments: &[EnvironmentConfig],
     observed_at: i64,
+    reason: &str,
 ) -> anyhow::Result<()> {
     let mut first_error = None;
     for environment in environments {
-        if let Err(error) = persist_drift_skipped(connection, &environment.id, observed_at) {
+        if let Err(error) = persist_drift_skipped(connection, &environment.id, observed_at, reason)
+        {
             first_error.get_or_insert_with(|| anyhow::Error::from(error));
         }
     }
@@ -379,13 +447,14 @@ fn persist_drift_skipped(
     connection: &Connection,
     environment_id: &str,
     observed_at: i64,
+    reason: &str,
 ) -> io::Result<()> {
     persistence::persist_signal_skipped(
         connection,
         environment_id,
         DRIFT_SIGNAL_ID,
         observed_at,
-        "need_two_environments",
+        reason,
     )
 }
 
@@ -795,7 +864,7 @@ mod tests {
                 .expect("snapshot");
             assert_eq!(row.state, "skipped");
             let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
-            assert_eq!(payload["skipped"], "need_two_environments");
+            assert_eq!(payload["skipped"], "no_clone_source");
         }
     }
 
@@ -1106,5 +1175,209 @@ mod tests {
         let snapshot = mismatches(db.path(), "test");
         assert_eq!(snapshot["state"], "healthy");
         assert_eq!(snapshot["mismatches"], 0);
+    }
+
+    /// Serves a per-Environment `glide.war` body so a build can be unreadable
+    /// on one side, both sides, or neither.
+    struct BuildTransport {
+        source_build: &'static str,
+        other_build: &'static str,
+    }
+
+    impl HttpTransport for BuildTransport {
+        fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+            let source = request.url.contains("acme-prod");
+            let body = if request.url.contains("/api/now/table/sys_plugins") {
+                include_str!("../tests/fixtures/drift/plugins_a.json")
+            } else if request.url.contains("/api/now/table/sys_store_app") {
+                include_str!("../tests/fixtures/drift/store_apps_empty.json")
+            } else if request.url.contains("glide.war") {
+                if source {
+                    self.source_build
+                } else {
+                    self.other_build
+                }
+            } else {
+                panic!("unexpected drift URL: {}", request.url);
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: body.into(),
+            })
+        }
+    }
+
+    /// `{"result":{}}` is a 200 that is not a Table API array — exactly what a
+    /// hibernating or fenced Environment returns, so `build` is `None` with no
+    /// error, which is the case this tri-state exists for.
+    const UNREADABLE_BUILD: &str = r#"{"result":{}}"#;
+
+    fn collect_builds(
+        label: &str,
+        source_build: &'static str,
+        other_build: &'static str,
+    ) -> serde_json::Value {
+        let db = TempDb::new(label);
+        let store = db.store();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
+        credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
+        DriftCollector::new(
+            vec![
+                env("prod", "acme-prod", true),
+                env("test", "acme-test", false),
+            ],
+            credentials,
+            ServiceNowClient::new(
+                BuildTransport {
+                    source_build,
+                    other_build,
+                },
+                SystemClock,
+            ),
+            store,
+            Duration::from_secs(120),
+        )
+        .collect()
+        .unwrap();
+        let connection = db.store().open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, "test", DRIFT_SIGNAL_ID)
+            .unwrap()
+            .expect("snapshot");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        serde_json::json!({ "state": row.state, "build_matches": payload["build_matches"] })
+    }
+
+    #[test]
+    fn drift_unknown_build_on_one_side_is_not_a_mismatch() {
+        let result = collect_builds(
+            "drift-build-unknown-one",
+            include_str!("../tests/fixtures/availability/ok.json"),
+            UNREADABLE_BUILD,
+        );
+        assert_eq!(result["build_matches"], serde_json::Value::Null);
+        assert_eq!(result["state"], "healthy");
+    }
+
+    #[test]
+    fn drift_two_unknown_builds_do_not_report_agreement() {
+        let result = collect_builds(
+            "drift-build-unknown-both",
+            UNREADABLE_BUILD,
+            UNREADABLE_BUILD,
+        );
+        assert_eq!(
+            result["build_matches"],
+            serde_json::Value::Null,
+            "two unreadable builds must not report agreement"
+        );
+    }
+
+    #[test]
+    fn drift_known_builds_still_compare() {
+        let same = collect_builds(
+            "drift-build-same",
+            include_str!("../tests/fixtures/availability/ok.json"),
+            include_str!("../tests/fixtures/availability/ok.json"),
+        );
+        assert_eq!(same["build_matches"], true);
+        assert_eq!(same["state"], "healthy");
+
+        let differing = collect_builds(
+            "drift-build-differs",
+            include_str!("../tests/fixtures/availability/ok.json"),
+            r#"{"result":[{"value":"glide-yokohama-01-01-2026__patch0"}]}"#,
+        );
+        assert_eq!(differing["build_matches"], false);
+        assert_eq!(differing["state"], "degraded");
+    }
+
+    fn persist_asleep(store: &StateStore, environment_id: &str, observed_at: i64) {
+        let connection = store.open().unwrap();
+        crate::availability::persist_availability_snapshot(
+            &connection,
+            environment_id,
+            &crate::availability::AvailabilityObservation {
+                reachability: daku_protocol::Reachability::Asleep,
+                state: SignalState::Healthy,
+                build: None,
+                rtt_ms: 0,
+                error: None,
+            },
+            observed_at,
+        )
+        .unwrap();
+    }
+
+    fn skip_reason(store: &StateStore, environment_id: &str) -> serde_json::Value {
+        let connection = store.open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, environment_id, DRIFT_SIGNAL_ID)
+            .unwrap()
+            .expect("snapshot");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        serde_json::json!({ "state": row.state, "skipped": payload["skipped"] })
+    }
+
+    #[test]
+    fn drift_signal_skips_an_asleep_target() {
+        let db = TempDb::new("drift-target-asleep");
+        persist_asleep(&db.store(), "test", unix_now());
+        let (collector, plugin_requests) = counting_collector(
+            db.path(),
+            include_str!("../tests/fixtures/drift/plugins_a.json"),
+            include_str!("../tests/fixtures/drift/plugins_a.json"),
+            vec![],
+        );
+        collector.collect().unwrap();
+
+        let result = skip_reason(&db.store(), "test");
+        assert_eq!(result["state"], "skipped");
+        assert_eq!(result["skipped"], "asleep");
+        assert_eq!(
+            plugin_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an asleep target must not be probed; only the source's two pages"
+        );
+    }
+
+    #[test]
+    fn drift_signal_skips_everything_when_the_source_is_asleep() {
+        let db = TempDb::new("drift-source-asleep");
+        let store = db.store();
+        persist_asleep(&store, "prod", unix_now());
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
+        credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
+        DriftCollector::new(
+            vec![
+                env("prod", "acme-prod", true),
+                env("test", "acme-test", false),
+            ],
+            credentials,
+            ServiceNowClient::new(NoProbeTransport, SystemClock),
+            store,
+            Duration::from_secs(120),
+        )
+        .collect()
+        .unwrap();
+
+        let store = db.store();
+        assert_eq!(
+            skip_reason(&store, "prod"),
+            serde_json::json!({ "state": "skipped", "skipped": "asleep" })
+        );
+        assert_eq!(
+            skip_reason(&store, "test"),
+            serde_json::json!({ "state": "skipped", "skipped": "clone_source_asleep" })
+        );
+    }
+
+    struct NoProbeTransport;
+
+    impl HttpTransport for NoProbeTransport {
+        fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+            panic!("must not probe an asleep Environment: {}", request.url);
+        }
     }
 }
