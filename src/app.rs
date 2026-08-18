@@ -20,11 +20,11 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::CloseWindow;
 use crate::dashboard_state::{
     CompareRow, DashboardState, DrillIn, SignalCard, fixture_events, freshness, signal_label,
     ui_fixture_enabled,
 };
-use crate::CloseWindow;
 
 const SIDEBAR_WIDTH: f32 = 220.0;
 

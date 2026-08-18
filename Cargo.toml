@@ -41,7 +41,6 @@ libc = "0.2"
 serde_json = "1.0"
 daku-client = { path = "crates/daku-client" }
 daku-protocol = { path = "crates/daku-protocol" }
-rust-i18n = "4"
 
 [features]
 channel-homebrew = []

@@ -1,16 +1,5 @@
 #![recursion_limit = "256"]
 
-rust_i18n::i18n!("locales", fallback = "en");
-
-macro_rules! tr {
-    ($key:expr) => {
-        rust_i18n::t!($key).into_owned()
-    };
-    ($key:expr, $($args:tt)*) => {
-        rust_i18n::t!($key, $($args)*).into_owned()
-    };
-}
-
 mod app;
 pub mod daemon;
 mod dashboard_state;
@@ -27,10 +16,7 @@ use gpui::{
 use crate::app::Daku;
 use crate::identity::{APP_ID, APP_NAME};
 
-actions!(
-    daku,
-    [Quit, About, CloseWindow, CheckForUpdates]
-);
+actions!(daku, [Quit, About, CloseWindow, CheckForUpdates]);
 
 const DEFAULT_WINDOW_WIDTH: f32 = 1380.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 880.0;
@@ -136,24 +122,19 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
             name: APP_NAME.into(),
             disabled: false,
             items: {
-                let mut items = vec![MenuItem::action(tr!("menu.about", app = APP_NAME), About)];
+                let mut items = vec![MenuItem::action(format!("About {APP_NAME}"), About)];
                 if updater_available {
-                    items.push(MenuItem::action(
-                        tr!("menu.check_for_updates"),
-                        CheckForUpdates,
-                    ));
+                    items.push(MenuItem::action("Check for Updates…", CheckForUpdates));
                 }
                 items.push(MenuItem::separator());
-                items.push(MenuItem::action(tr!("menu.quit", app = APP_NAME), Quit));
+                items.push(MenuItem::action(format!("Quit {APP_NAME}"), Quit));
                 items
             },
         },
         Menu {
-            name: tr!("menu.window").into(),
+            name: "Window".into(),
             disabled: false,
-            items: vec![
-                MenuItem::action(tr!("menu.close_window"), CloseWindow),
-            ],
+            items: vec![MenuItem::action("Close Window", CloseWindow)],
         },
     ]);
 }
