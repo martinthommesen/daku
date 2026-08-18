@@ -741,7 +741,13 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
         }
         "last_clone" => {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
-                "clone source".into()
+                // `supported: false` is the source's own 403: it cannot list
+                // clones, so no target will ever get an answer from it.
+                if value.get("supported") == Some(&serde_json::Value::Bool(false)) {
+                    "clone source \u{b7} cannot list clones".into()
+                } else {
+                    "clone source".into()
+                }
             } else if let Some(days) = value.get("age_days").and_then(|item| item.as_i64()) {
                 match days {
                     0 => "today".into(),
@@ -815,6 +821,28 @@ fn parse_payload(payload_json: &str) -> serde_json::Value {
     serde_json::from_str(payload_json).unwrap_or(serde_json::Value::Null)
 }
 
+/// The payloads `crates/daku-core` regenerates from its own collectors and
+/// pins (see `crates/daku-core/src/payload_contract.rs`). The fixture UI and
+/// the payload tests below both read them from here, so neither can drift
+/// from what the daemon writes.
+const PINNED_PAYLOADS: &str = include_str!("../crates/daku-core/tests/fixtures/payloads.json");
+
+/// One pinned case as the wire would carry it. Panics on an unknown name: the
+/// only callers are the fixture below and its tests.
+fn pinned(name: &str) -> SignalSnapshotDto {
+    let cases: serde_json::Value =
+        serde_json::from_str(PINNED_PAYLOADS).expect("pinned payloads parse");
+    let case = cases
+        .get(name)
+        .unwrap_or_else(|| panic!("no pinned payload named {name}"));
+    SignalSnapshotDto {
+        signal_id: case["signal_id"].as_str().expect("signal_id").to_owned(),
+        state: case["state"].as_str().expect("state").to_owned(),
+        observed_at: 1_700_000_000,
+        payload_json: case["payload"].to_string(),
+    }
+}
+
 pub fn ui_fixture_enabled() -> bool {
     matches!(std::env::var("DAKU_UI_FIXTURE").as_deref(), Ok("1"))
 }
@@ -839,54 +867,32 @@ pub fn fixture_events() -> Vec<ServerMessage> {
         },
         ServerMessage::SignalSnapshotsUpdated {
             environment_id: "prod".into(),
-            snapshots: vec![
-                snap(
-                    "availability",
-                    "healthy",
-                    r#"{"reachability":"reachable","rtt_ms":142,"build":"glide-zurich-patch3"}"#,
-                ),
-                snap("jobs", "degraded", r#"{"overdue_ready":2,"error":1}"#),
-                snap("syslog", "degraded", r#"{"error_count_1h":38}"#),
-                snap(
-                    "mid_ecc",
-                    "healthy",
-                    r#"{"agents_total":3,"agents_unhealthy":0,"agents_unhealthy_list":[],"agents_unhealthy_list_truncated":false,"ecc_output_ready":12,"ecc_error":0}"#,
-                ),
-                snap("outbound", "degraded", r#"{"outbound_http_4xx_5xx_1h":4}"#),
-                snap("drift", "healthy", r#"{"role":"source"}"#),
-            ],
+            // No last_clone: prod is the clone source in this fixture and the
+            // card stays on Waiting, which the shell must also render.
+            snapshots: [
+                "availability_reachable",
+                "jobs_counts",
+                "syslog_count",
+                "mid_ecc_healthy",
+                "outbound_count",
+                "drift_source",
+            ]
+            .map(pinned)
+            .into(),
         },
         ServerMessage::SignalSnapshotsUpdated {
             environment_id: "test".into(),
-            snapshots: vec![
-                snap(
-                    "availability",
-                    "healthy",
-                    r#"{"reachability":"asleep","rtt_ms":20,"build":"glide-yokohama-patch1"}"#,
-                ),
-                snap("jobs", "healthy", r#"{"overdue_ready":0,"error":0}"#),
-                snap("syslog", "healthy", r#"{"error_count_1h":4}"#),
-                snap(
-                    "mid_ecc",
-                    "degraded",
-                    r#"{"agents_total":3,"agents_unhealthy":2,"agents_unhealthy_list":[{"host_name":"mid-a","status":"Down","version":"5.0.0"},{"host_name":"mid-b","status":"Up","version":null}],"agents_unhealthy_list_truncated":false,"ecc_output_ready":3,"ecc_error":0}"#,
-                ),
-                snap(
-                    "outbound",
-                    "down",
-                    r#"{"reachability":"unreachable","detail":"HTTP 429"}"#,
-                ),
-                snap(
-                    "drift",
-                    "degraded",
-                    r#"{"mismatches":3,"build_matches":false,"truncated":false,"mismatch_list":[{"id":"com.example.plugin_a","source_version":"1.0.0","other_version":"1.1.0"},{"id":"com.example.plugin_b","source_version":"2.0.0","other_version":null},{"id":"com.example.plugin_c","source_version":null,"other_version":"0.9.0"}],"mismatch_list_truncated":false}"#,
-                ),
-                snap(
-                    "last_clone",
-                    "healthy",
-                    r#"{"completed":"2026-08-05 09:00:00","age_days":12,"source_id":"prod"}"#,
-                ),
-            ],
+            snapshots: [
+                "availability_reachable_other_build",
+                "jobs_zero",
+                "syslog_zero",
+                "mid_ecc_unhealthy",
+                "down_probe_failed",
+                "drift_compare",
+                "last_clone_target_completed",
+            ]
+            .map(pinned)
+            .into(),
         },
         ServerMessage::SignalSamplesUpdated {
             environment_id: "prod".into(),
@@ -955,6 +961,7 @@ fn env(
     }
 }
 
+#[cfg(test)]
 fn snap(signal_id: &str, state: &str, payload_json: &str) -> SignalSnapshotDto {
     SignalSnapshotDto {
         signal_id: signal_id.into(),
@@ -967,6 +974,134 @@ fn snap(signal_id: &str, state: &str, payload_json: &str) -> SignalSnapshotDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the client must render for every payload
+    /// `crates/daku-core/tests/fixtures/payloads.json` pins: (case,
+    /// `card_summary`, `card_detail`). Add a pinned case there and
+    /// `pinned_payloads_render` fails until it is listed here — that is the
+    /// point of the pin.
+    const RENDERED: [(&str, &str, &str); 27] = [
+        ("availability_asleep", "142 ms", ""),
+        (
+            "availability_reachable",
+            "142 ms \u{b7} glide-zurich-12-18-2025__patch0-hotfix1",
+            "",
+        ),
+        (
+            "availability_reachable_other_build",
+            "142 ms \u{b7} glide-yokohama-07-02-2025__patch1",
+            "",
+        ),
+        ("availability_unreachable", "142 ms", "HTTP 429"),
+        // The counting summary reads a key a `down` payload does not carry, so
+        // the card pairs "0 HTTP fail" with the real reason. The status is
+        // `down`, and the detail says why; see the report for plan 065.
+        ("down_probe_failed", "0 HTTP fail", "HTTP 429"),
+        ("drift_compare", "3 plugins differ", ""),
+        ("drift_source", "source of truth", ""),
+        ("jobs_counts", "2 overdue \u{b7} 0 error", ""),
+        ("jobs_zero", "0 overdue \u{b7} 0 error", ""),
+        (
+            "last_clone_source_cannot_list",
+            "clone source \u{b7} cannot list clones",
+            "",
+        ),
+        ("last_clone_source_supported", "clone source", ""),
+        ("last_clone_target_completed", "12 days ago", ""),
+        ("last_clone_target_never", "no clone found", ""),
+        (
+            "last_clone_target_older_than_page",
+            "not in the last 10 clones",
+            "",
+        ),
+        ("mid_ecc_healthy", "3/3 up \u{b7} queue 2", ""),
+        ("mid_ecc_unhealthy", "1/3 up \u{b7} queue 2", ""),
+        ("outbound_count", "3 HTTP fail", ""),
+        ("outbound_zero", "0 HTTP fail", ""),
+        ("skipped_asleep", "", "Environment asleep"),
+        ("skipped_clone_source_asleep", "", "clone source asleep"),
+        (
+            "skipped_clone_source_cannot_list_clones",
+            "",
+            "clone source cannot list clones",
+        ),
+        (
+            "skipped_clone_source_unreachable",
+            "",
+            "clone source unreachable",
+        ),
+        (
+            "skipped_need_two_environments",
+            "",
+            "needs two Environments",
+        ),
+        ("skipped_no_clone_source", "", "no clone source configured"),
+        ("skipped_unreachable", "", "Environment unreachable"),
+        ("syslog_count", "4 errors / h", ""),
+        ("syslog_zero", "0 errors / h", ""),
+    ];
+
+    /// One Environment carrying one pinned snapshot, selected.
+    fn with_pinned(case: &str) -> (DashboardState, String) {
+        let snapshot = pinned(case);
+        let signal_id = snapshot.signal_id.clone();
+        let mut state = DashboardState::new();
+        state.set_connected(true);
+        state.apply_all(&[
+            ServerMessage::EnvironmentsUpdated {
+                environments: vec![env(
+                    "e",
+                    "E",
+                    EnvironmentHealth::Healthy,
+                    Reachability::Reachable,
+                )],
+            },
+            ServerMessage::SignalSnapshotsUpdated {
+                environment_id: "e".into(),
+                snapshots: vec![snapshot],
+            },
+        ]);
+        state.select("e");
+        (state, signal_id)
+    }
+
+    #[test]
+    fn pinned_payloads_render() {
+        let cases: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(PINNED_PAYLOADS).unwrap();
+        let mut listed: Vec<&str> = RENDERED.iter().map(|(case, ..)| *case).collect();
+        listed.sort_unstable();
+        assert_eq!(
+            listed,
+            cases.keys().map(String::as_str).collect::<Vec<_>>(),
+            "every pinned payload needs a rendering here, and vice versa"
+        );
+        for (case, summary, detail) in RENDERED {
+            let (state, signal_id) = with_pinned(case);
+            assert_eq!(state.card_summary(&signal_id), summary, "{case} summary");
+            assert_eq!(state.card_detail(&signal_id), detail, "{case} detail");
+            assert!(
+                !summary.is_empty() || !detail.is_empty(),
+                "{case} renders nothing at all"
+            );
+            // A skip reason with no phrase would leak the raw snake_case token.
+            if let Some(reason) = cases[case]["payload"]["skipped"].as_str() {
+                assert_ne!(detail, reason, "{case} detail is the raw reason");
+            }
+        }
+    }
+
+    #[test]
+    fn every_signal_id_has_a_pinned_payload() {
+        let cases: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(PINNED_PAYLOADS).unwrap();
+        for signal_id in SIGNAL_IDS {
+            assert!(
+                cases.values().any(|case| case["signal_id"] == signal_id),
+                "no pinned payload for {signal_id}"
+            );
+        }
+    }
 
     fn loaded() -> DashboardState {
         let mut state = DashboardState::new();
@@ -1107,8 +1242,8 @@ mod tests {
             DrillIn::Rows {
                 headers: vec!["MID", "Status", "Version"],
                 rows: vec![
-                    vec!["mid-a".to_owned(), "Down".to_owned(), "5.0.0".to_owned()],
-                    vec!["mid-b".to_owned(), "Up".to_owned(), "\u{2014}".to_owned()],
+                    vec!["mid-b".to_owned(), "Down".to_owned(), "5.0.0".to_owned()],
+                    vec!["\u{2014}".to_owned(), "Up".to_owned(), "5.0.1".to_owned()],
                 ],
                 truncated: false,
             }
@@ -1120,7 +1255,7 @@ mod tests {
         let state = loaded();
         assert_eq!(
             state.drill_in("mid_ecc"),
-            DrillIn::Text("3/3 up \u{b7} queue 12".into())
+            DrillIn::Text("3/3 up \u{b7} queue 2".into())
         );
     }
 
@@ -1131,7 +1266,7 @@ mod tests {
         // prod carries no syslog samples: fall back to the one-line summary.
         assert_eq!(
             state.drill_in("syslog"),
-            DrillIn::Text("38 errors / h".into())
+            DrillIn::Text("4 errors / h".into())
         );
         state.select("test");
         assert_eq!(state.drill_in("outbound"), DrillIn::Text("HTTP 429".into()));
@@ -1140,7 +1275,7 @@ mod tests {
             DrillIn::Rows {
                 headers: vec!["Completed", "Age", "Source"],
                 rows: vec![vec![
-                    "2026-08-05 09:00:00".to_owned(),
+                    "2026-01-15 12:00:00".to_owned(),
                     "12 days ago".to_owned(),
                     "prod".to_owned(),
                 ]],
@@ -1205,7 +1340,7 @@ mod tests {
             .find(|card| card.signal_id == "jobs")
             .unwrap();
         assert_eq!(jobs.sparkline.len(), 3);
-        assert_eq!(state.card_summary("jobs"), "2 overdue · 1 error");
+        assert_eq!(state.card_summary("jobs"), "2 overdue · 0 error");
         let syslog = state
             .cards()
             .into_iter()
@@ -1656,11 +1791,11 @@ mod tests {
         let mut state = loaded();
         assert_eq!(
             state.card_summary("availability"),
-            "142 ms · glide-zurich-patch3"
+            "142 ms · glide-zurich-12-18-2025__patch0-hotfix1"
         );
-        assert_eq!(state.card_summary("syslog"), "38 errors / h");
-        assert_eq!(state.card_summary("mid_ecc"), "3/3 up · queue 12");
-        assert_eq!(state.card_summary("outbound"), "4 HTTP fail");
+        assert_eq!(state.card_summary("syslog"), "4 errors / h");
+        assert_eq!(state.card_summary("mid_ecc"), "3/3 up · queue 2");
+        assert_eq!(state.card_summary("outbound"), "3 HTTP fail");
         assert_eq!(state.card_summary("drift"), "source of truth");
         state.select("test");
         assert_eq!(state.card_summary("drift"), "3 plugins differ");
@@ -1703,11 +1838,11 @@ mod tests {
         let before = state.snapshots.clone();
         assert_eq!(
             state.card_summary("availability"),
-            "142 ms · glide-zurich-patch3"
+            "142 ms · glide-zurich-12-18-2025__patch0-hotfix1"
         );
         assert_eq!(
             state.card_summary("availability"),
-            "142 ms · glide-zurich-patch3"
+            "142 ms · glide-zurich-12-18-2025__patch0-hotfix1"
         );
         assert_eq!(state.drill_in("drift"), state.drill_in("drift"));
         assert_eq!(state.snapshots, before);

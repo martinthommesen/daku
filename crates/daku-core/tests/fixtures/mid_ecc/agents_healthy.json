@@ -1,0 +1,22 @@
+{
+  "result": [
+    {
+      "status": "Up",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-a"
+    },
+    {
+      "status": "Up",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-b"
+    },
+    {
+      "status": "Up",
+      "validated": "true",
+      "version": "5.0.1",
+      "host_name": "mid-c"
+    }
+  ]
+}

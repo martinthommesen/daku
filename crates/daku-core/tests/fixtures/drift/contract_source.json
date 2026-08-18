@@ -1,0 +1,14 @@
+{
+  "result": [
+    {
+      "id": "com.example.plugin_a",
+      "version": "1.0.0",
+      "active": "true"
+    },
+    {
+      "id": "com.example.plugin_b",
+      "version": "2.0.0",
+      "active": "true"
+    }
+  ]
+}

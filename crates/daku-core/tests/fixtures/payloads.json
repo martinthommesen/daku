@@ -1,0 +1,254 @@
+{
+  "availability_asleep": {
+    "payload": {
+      "build": null,
+      "error": null,
+      "reachability": "asleep",
+      "rtt_ms": 142
+    },
+    "signal_id": "availability",
+    "state": "healthy"
+  },
+  "availability_reachable": {
+    "payload": {
+      "build": "glide-zurich-12-18-2025__patch0-hotfix1",
+      "error": null,
+      "reachability": "reachable",
+      "rtt_ms": 142
+    },
+    "signal_id": "availability",
+    "state": "healthy"
+  },
+  "availability_reachable_other_build": {
+    "payload": {
+      "build": "glide-yokohama-07-02-2025__patch1",
+      "error": null,
+      "reachability": "reachable",
+      "rtt_ms": 142
+    },
+    "signal_id": "availability",
+    "state": "healthy"
+  },
+  "availability_unreachable": {
+    "payload": {
+      "build": null,
+      "error": "HTTP 429",
+      "reachability": "unreachable",
+      "rtt_ms": 142
+    },
+    "signal_id": "availability",
+    "state": "down"
+  },
+  "down_probe_failed": {
+    "payload": {
+      "detail": "HTTP 429",
+      "reachability": "unreachable"
+    },
+    "signal_id": "outbound",
+    "state": "down"
+  },
+  "drift_compare": {
+    "payload": {
+      "build_matches": false,
+      "mismatch_list": [
+        {
+          "id": "com.example.plugin_a",
+          "other_version": "1.1.0",
+          "source_version": "1.0.0"
+        },
+        {
+          "id": "com.example.plugin_b",
+          "other_version": null,
+          "source_version": "2.0.0"
+        },
+        {
+          "id": "com.example.plugin_c",
+          "other_version": "0.9.0",
+          "source_version": null
+        }
+      ],
+      "mismatch_list_truncated": false,
+      "mismatches": 3,
+      "truncated": false
+    },
+    "signal_id": "drift",
+    "state": "degraded"
+  },
+  "drift_source": {
+    "payload": {
+      "role": "source"
+    },
+    "signal_id": "drift",
+    "state": "healthy"
+  },
+  "jobs_counts": {
+    "payload": {
+      "error": 0,
+      "overdue_ready": 2
+    },
+    "signal_id": "jobs",
+    "state": "degraded"
+  },
+  "jobs_zero": {
+    "payload": {
+      "error": 0,
+      "overdue_ready": 0
+    },
+    "signal_id": "jobs",
+    "state": "healthy"
+  },
+  "last_clone_source_cannot_list": {
+    "payload": {
+      "role": "source",
+      "supported": false
+    },
+    "signal_id": "last_clone",
+    "state": "healthy"
+  },
+  "last_clone_source_supported": {
+    "payload": {
+      "role": "source",
+      "supported": true
+    },
+    "signal_id": "last_clone",
+    "state": "healthy"
+  },
+  "last_clone_target_completed": {
+    "payload": {
+      "age_days": 12,
+      "completed": "2026-01-15 12:00:00",
+      "source_id": "prod"
+    },
+    "signal_id": "last_clone",
+    "state": "healthy"
+  },
+  "last_clone_target_never": {
+    "payload": {
+      "completed": null,
+      "supported": true
+    },
+    "signal_id": "last_clone",
+    "state": "healthy"
+  },
+  "last_clone_target_older_than_page": {
+    "payload": {
+      "completed": null,
+      "supported": true,
+      "unknown": "older_than_page"
+    },
+    "signal_id": "last_clone",
+    "state": "healthy"
+  },
+  "mid_ecc_healthy": {
+    "payload": {
+      "agents_total": 3,
+      "agents_unhealthy": 0,
+      "agents_unhealthy_list": [],
+      "agents_unhealthy_list_truncated": false,
+      "ecc_error": 0,
+      "ecc_output_ready": 2
+    },
+    "signal_id": "mid_ecc",
+    "state": "healthy"
+  },
+  "mid_ecc_unhealthy": {
+    "payload": {
+      "agents_total": 3,
+      "agents_unhealthy": 2,
+      "agents_unhealthy_list": [
+        {
+          "host_name": "mid-b",
+          "status": "Down",
+          "version": "5.0.0"
+        },
+        {
+          "host_name": null,
+          "status": "Up",
+          "version": "5.0.1"
+        }
+      ],
+      "agents_unhealthy_list_truncated": false,
+      "ecc_error": 0,
+      "ecc_output_ready": 2
+    },
+    "signal_id": "mid_ecc",
+    "state": "degraded"
+  },
+  "outbound_count": {
+    "payload": {
+      "outbound_http_4xx_5xx_1h": 3
+    },
+    "signal_id": "outbound",
+    "state": "degraded"
+  },
+  "outbound_zero": {
+    "payload": {
+      "outbound_http_4xx_5xx_1h": 0
+    },
+    "signal_id": "outbound",
+    "state": "healthy"
+  },
+  "skipped_asleep": {
+    "payload": {
+      "skipped": "asleep"
+    },
+    "signal_id": "jobs",
+    "state": "skipped"
+  },
+  "skipped_clone_source_asleep": {
+    "payload": {
+      "skipped": "clone_source_asleep"
+    },
+    "signal_id": "last_clone",
+    "state": "skipped"
+  },
+  "skipped_clone_source_cannot_list_clones": {
+    "payload": {
+      "skipped": "clone_source_cannot_list_clones"
+    },
+    "signal_id": "last_clone",
+    "state": "skipped"
+  },
+  "skipped_clone_source_unreachable": {
+    "payload": {
+      "skipped": "clone_source_unreachable"
+    },
+    "signal_id": "last_clone",
+    "state": "skipped"
+  },
+  "skipped_need_two_environments": {
+    "payload": {
+      "skipped": "need_two_environments"
+    },
+    "signal_id": "drift",
+    "state": "skipped"
+  },
+  "skipped_no_clone_source": {
+    "payload": {
+      "skipped": "no_clone_source"
+    },
+    "signal_id": "drift",
+    "state": "skipped"
+  },
+  "skipped_unreachable": {
+    "payload": {
+      "skipped": "unreachable"
+    },
+    "signal_id": "jobs",
+    "state": "skipped"
+  },
+  "syslog_count": {
+    "payload": {
+      "error_count_1h": 4
+    },
+    "signal_id": "syslog",
+    "state": "degraded"
+  },
+  "syslog_zero": {
+    "payload": {
+      "error_count_1h": 0
+    },
+    "signal_id": "syslog",
+    "state": "healthy"
+  }
+}

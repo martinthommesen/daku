@@ -18,6 +18,9 @@ pub mod syslog;
 mod server;
 
 #[cfg(test)]
+mod payload_contract;
+
+#[cfg(test)]
 pub(crate) mod test_support;
 
 pub use collector::{

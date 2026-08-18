@@ -302,7 +302,7 @@ fn skip_targets(
     Ok(())
 }
 
-fn persist_clone_source(
+pub(crate) fn persist_clone_source(
     connection: &Connection,
     environment_id: &str,
     supported: bool,
@@ -319,7 +319,7 @@ fn persist_clone_source(
     )
 }
 
-fn persist_clone_target(
+pub(crate) fn persist_clone_target(
     connection: &Connection,
     environment_id: &str,
     row: Option<&CloneRow>,
