@@ -251,14 +251,23 @@ impl CollectorLoop {
                 .collect();
             handles
                 .into_iter()
-                .filter_map(|handle| match handle.join() {
+                .enumerate()
+                .filter_map(|(index, handle)| match handle.join() {
                     Ok(result) => result.err(),
-                    Err(_) => Some(anyhow::anyhow!("collector group panicked")),
+                    Err(_) => Some(anyhow::anyhow!("collector group {index} panicked")),
                 })
                 .collect()
         });
-        if let Err(error) = run_sequential(&self.shared) {
-            errors.push(error);
+        // The shared collectors read across every Environment, so they must run
+        // after every group has joined — plan 049 needs this tick's availability
+        // snapshot committed first. Give them their own joined scope so a panic
+        // becomes a tick error instead of killing the collector thread.
+        let shared =
+            std::thread::scope(|scope| scope.spawn(|| run_sequential(&self.shared)).join());
+        match shared {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(_) => errors.push(anyhow::anyhow!("shared collectors panicked")),
         }
         let elapsed = started.elapsed();
         if elapsed > self.interval {
@@ -278,19 +287,27 @@ impl CollectorLoop {
     pub fn run(&self, shutdown: &AtomicBool, clock: &dyn Clock, after: &dyn Fn()) {
         // Publish last-known state from SQLite so a fresh subscriber is not blank
         // until the first tick completes.
-        after();
+        publish(after);
         while !shutdown.load(Ordering::Acquire) {
             let (result, elapsed) = self.tick_timed();
             if let Err(error) = result {
                 eprintln!("daku collector tick failed: {error}");
             }
-            after();
+            publish(after);
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
             // An overrunning tick sleeps zero and ticks again immediately.
             clock.sleep(self.interval.saturating_sub(elapsed));
         }
+    }
+}
+
+/// Publishes the dashboard, costing one tick's publish rather than the whole
+/// loop if it panics.
+fn publish(after: &dyn Fn()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(after)).is_err() {
+        eprintln!("daku dashboard publish panicked");
     }
 }
 
@@ -311,13 +328,17 @@ pub fn spawn_collector_loop(
     loop_: CollectorLoop,
     shutdown: Arc<AtomicBool>,
     after_tick: impl Fn() + Send + 'static,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("daku-collector".into())
         .spawn(move || {
             loop_.run(&shutdown, &SystemClock, &after_tick);
+            // Reached only on shutdown or an unwind out of `run`. Either way the
+            // daemon stops polling, so say so in ~/.daku/daemon.log rather than
+            // leaving the last snapshot to look current forever.
+            eprintln!("daku collector loop ended");
         })
-        .expect("spawn collector loop");
+        .expect("spawn collector loop")
 }
 
 pub fn build_default_loop(
@@ -698,6 +719,74 @@ mod tests {
         assert!(
             ran.load(Ordering::Acquire),
             "later collectors must still run"
+        );
+    }
+
+    struct Panicking;
+    impl SignalCollector for Panicking {
+        fn collect(&self) -> anyhow::Result<()> {
+            panic!("collector exploded")
+        }
+    }
+
+    /// Silences the panic backtrace the panicking-collector tests provoke.
+    fn without_panic_output<T>(body: impl FnOnce() -> T) -> T {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = body();
+        std::panic::set_hook(previous);
+        result
+    }
+
+    #[test]
+    fn tick_reports_a_panicking_shared_collector_as_an_error() {
+        let mut loop_ = CollectorLoop::new(Duration::from_secs(120));
+        loop_.register(Panicking);
+        let error = without_panic_output(|| loop_.tick().unwrap_err());
+        assert!(error.to_string().contains("shared collectors panicked"));
+    }
+
+    #[test]
+    fn tick_still_runs_the_other_collectors_when_one_panics() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut loop_ = CollectorLoop::new(Duration::from_secs(120));
+        loop_.register_group(vec![Box::new(Panicking)]);
+        loop_.register_group(vec![Box::new(SleepingCollector(
+            Duration::ZERO,
+            calls.clone(),
+        ))]);
+        loop_.register(SleepingCollector(Duration::ZERO, calls.clone()));
+        let error = without_panic_output(|| loop_.tick().unwrap_err());
+        assert!(error.to_string().contains("collector group 0 panicked"));
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn run_survives_a_panicking_publish() {
+        let shutdown = AtomicBool::new(false);
+        let calls = AtomicUsize::new(0);
+        let loop_ = CollectorLoop::new(Duration::from_millis(1));
+        struct StopAfterTwo<'a>(&'a AtomicBool, &'a AtomicUsize);
+        impl Clock for StopAfterTwo<'_> {
+            fn now(&self) -> std::time::SystemTime {
+                std::time::SystemTime::now()
+            }
+            fn sleep(&self, _: Duration) {
+                if self.1.load(Ordering::Acquire) >= 2 {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+        }
+        without_panic_output(|| {
+            loop_.run(&shutdown, &StopAfterTwo(&shutdown, &calls), &|| {
+                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    panic!("publish exploded");
+                }
+            });
+        });
+        assert!(
+            calls.load(Ordering::Acquire) > 1,
+            "a panicking publish must not end the loop"
         );
     }
 
