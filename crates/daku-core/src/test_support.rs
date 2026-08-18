@@ -37,6 +37,37 @@ impl Drop for TempDb {
     }
 }
 
+/// Unique JSON path under the OS temp dir; removes the file on drop (also on
+/// panic). The file only exists if the test wrote one — `new` hands out a path
+/// for the tests that need a *missing* file.
+pub struct TempFile {
+    path: PathBuf,
+}
+
+impl TempFile {
+    pub fn new(label: &str) -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!("daku-{label}-{}.json", uuid::Uuid::new_v4())),
+        }
+    }
+
+    pub fn with_contents(label: &str, contents: impl AsRef<[u8]>) -> Self {
+        let file = Self::new(label);
+        std::fs::write(&file.path, contents).unwrap();
+        file
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// The Basic-auth `prod` Environment used across collector tests.
 pub fn prod() -> EnvironmentConfig {
     EnvironmentConfig {
@@ -65,5 +96,16 @@ mod tests {
         let mut wal = path.clone().into_os_string();
         wal.push("-wal");
         assert!(!Path::new(&wal).exists());
+    }
+
+    #[test]
+    fn temp_file_is_removed_on_drop() {
+        let path;
+        {
+            let file = TempFile::with_contents("self", "[]");
+            path = file.path().to_path_buf();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+        }
+        assert!(!path.exists());
     }
 }

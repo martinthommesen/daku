@@ -121,6 +121,7 @@ fn keychain_get(_environment_id: &str) -> anyhow::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempFile;
 
     #[test]
     fn example_environments_json_parses() {
@@ -140,10 +141,8 @@ mod tests {
         );
     }
 
-    fn write_temp(json: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("daku-env-{}.json", uuid::Uuid::new_v4()));
-        fs::write(&path, json).unwrap();
-        path
+    fn write_temp(json: &str) -> TempFile {
+        TempFile::with_contents("env", json)
     }
 
     fn one_environment(instance_url: &str) -> String {
@@ -154,19 +153,17 @@ mod tests {
 
     #[test]
     fn load_environments_rejects_http_url() {
-        let path = write_temp(&one_environment("http://acme-dev.example.service-now.com"));
-        let error = load_environments(&path).unwrap_err().to_string();
-        let _ = fs::remove_file(&path);
+        let file = write_temp(&one_environment("http://acme-dev.example.service-now.com"));
+        let error = load_environments(file.path()).unwrap_err().to_string();
         assert!(error.contains("must start with https://"), "{error}");
     }
 
     #[test]
     fn load_environments_rejects_userinfo() {
-        let path = write_temp(&one_environment(
+        let file = write_temp(&one_environment(
             "https://user:pw@acme.example.service-now.com",
         ));
-        let error = load_environments(&path).unwrap_err().to_string();
-        let _ = fs::remove_file(&path);
+        let error = load_environments(file.path()).unwrap_err().to_string();
         assert!(error.contains("userinfo"), "{error}");
     }
 
@@ -176,36 +173,33 @@ mod tests {
             "https://acme.example.service-now.com/?x=1",
             "https://acme.example.service-now.com/#frag",
         ] {
-            let path = write_temp(&one_environment(url));
-            let error = load_environments(&path).unwrap_err().to_string();
-            let _ = fs::remove_file(&path);
+            let file = write_temp(&one_environment(url));
+            let error = load_environments(file.path()).unwrap_err().to_string();
             assert!(error.contains("query or fragment"), "{error}");
         }
     }
 
     #[test]
     fn load_environments_accepts_trailing_slash() {
-        let path = write_temp(&one_environment("https://acme.example.service-now.com/"));
-        let environments = load_environments(&path).unwrap();
-        let _ = fs::remove_file(&path);
+        let file = write_temp(&one_environment("https://acme.example.service-now.com/"));
+        let environments = load_environments(file.path()).unwrap();
         assert_eq!(environments.len(), 1);
     }
     #[test]
     fn load_environments_invalid_json_error_names_the_path() {
-        let path = write_temp("{not json");
-        let error = format!("{:#}", load_environments(&path).unwrap_err());
-        let _ = fs::remove_file(&path);
+        let file = write_temp("{not json");
+        let error = format!("{:#}", load_environments(file.path()).unwrap_err());
         assert!(error.contains("parsing "), "{error}");
         assert!(
-            error.contains(path.file_name().unwrap().to_str().unwrap()),
+            error.contains(file.path().file_name().unwrap().to_str().unwrap()),
             "{error}"
         );
     }
 
     #[test]
     fn load_environments_missing_file_error_names_the_path() {
-        let path = std::env::temp_dir().join(format!("daku-missing-{}.json", uuid::Uuid::new_v4()));
-        let error = load_environments(&path).unwrap_err();
+        let missing = TempFile::new("missing");
+        let error = load_environments(missing.path()).unwrap_err();
         assert!(format!("{error:#}").contains("reading "), "{error:#}");
         // `collector::is_not_found` relies on the io::Error surviving in the chain.
         assert!(error.chain().any(|cause| {
@@ -217,11 +211,10 @@ mod tests {
 
     #[test]
     fn load_environments_rejects_unknown_auth_method() {
-        let path = write_temp(
+        let file = write_temp(
             r#"[{"id":"dev","label":"Dev","instance_url":"https://acme.example.service-now.com","auth_method":"saml","sort_order":0}]"#,
         );
-        let error = load_environments(&path).unwrap_err();
-        let _ = fs::remove_file(&path);
+        let error = load_environments(file.path()).unwrap_err();
         assert!(format!("{error:#}").contains("parsing "), "{error:#}");
     }
 
@@ -233,9 +226,8 @@ mod tests {
                 r#"{{"id":"{id}","label":"{id}","instance_url":"https://{id}.example.service-now.com","auth_method":"basic","sort_order":{sort_order}}}"#
             )
         };
-        let path = write_temp(&format!("[{},{}]", entry("second", 2), entry("first", 1)));
-        let environments = load_environments(&path).unwrap();
-        let _ = fs::remove_file(&path);
+        let file = write_temp(&format!("[{},{}]", entry("second", 2), entry("first", 1)));
+        let environments = load_environments(file.path()).unwrap();
         assert_eq!(
             environments
                 .iter()
@@ -244,9 +236,8 @@ mod tests {
             ["first", "second"]
         );
 
-        let path = write_temp(&format!("[{},{}]", entry("prod", 0), entry("prod", 1)));
-        let duplicates = load_environments(&path).unwrap();
-        let _ = fs::remove_file(&path);
+        let file = write_temp(&format!("[{},{}]", entry("prod", 0), entry("prod", 1)));
+        let duplicates = load_environments(file.path()).unwrap();
         assert_eq!(duplicates.len(), 2);
     }
 

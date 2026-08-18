@@ -538,7 +538,7 @@ mod tests {
     use crate::servicenow::{
         Clock, HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
     };
-    use crate::test_support::{TempDb, prod};
+    use crate::test_support::{TempDb, TempFile, prod};
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
@@ -1043,10 +1043,8 @@ mod tests {
     #[test]
     fn doctor_reports_missing_and_present_credential_without_writing() {
         let db = TempDb::new("doctor");
-        let environments_path =
-            std::env::temp_dir().join(format!("daku-doctor-{}.json", uuid::Uuid::new_v4()));
-        std::fs::write(
-            &environments_path,
+        let environments = TempFile::with_contents(
+            "doctor",
             serde_json::to_vec(&[serde_json::json!({
                 "id": "prod",
                 "label": "Production",
@@ -1055,12 +1053,11 @@ mod tests {
                 "sort_order": 0,
             })])
             .unwrap(),
-        )
-        .unwrap();
+        );
         let credentials = Arc::new(MemoryCredentialStore::default());
         let doctor = || {
             run_doctor(
-                &environments_path,
+                environments.path(),
                 &DaemonSettings::default(),
                 credentials.clone(),
                 ServiceNowClient::new(FixtureTransport, SystemClock),
@@ -1093,7 +1090,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0, "doctor must not write snapshots");
-        let _ = std::fs::remove_file(&environments_path);
     }
     #[test]
     fn start_default_loop_returns_none_for_missing_and_empty_config() {
@@ -1108,13 +1104,10 @@ mod tests {
             )
         };
 
-        let missing =
-            std::env::temp_dir().join(format!("daku-missing-{}.json", uuid::Uuid::new_v4()));
-        assert!(start(&missing).is_none());
+        let missing = TempFile::new("missing");
+        assert!(start(missing.path()).is_none());
 
-        let empty = std::env::temp_dir().join(format!("daku-empty-{}.json", uuid::Uuid::new_v4()));
-        std::fs::write(&empty, "[]").unwrap();
-        assert!(start(&empty).is_none());
-        let _ = std::fs::remove_file(&empty);
+        let empty = TempFile::with_contents("empty", "[]");
+        assert!(start(empty.path()).is_none());
     }
 }

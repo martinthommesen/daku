@@ -103,50 +103,66 @@ fn to_io_error(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
 
-    fn temp_path() -> PathBuf {
-        let directory =
-            std::env::temp_dir().join(format!("daku-app-settings-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        directory.join("app.json")
+    /// Unique app-settings path; removed on drop, so a failing assertion does
+    /// not leave the file behind.
+    struct TempSettings(PathBuf);
+
+    impl TempSettings {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("daku-app-settings-{}.json", uuid::Uuid::new_v4())),
+            )
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempSettings {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
     }
 
     #[test]
     fn missing_app_settings_are_written_with_a_token() {
-        let path = temp_path();
-        let settings = load_or_create_app_settings_at(&path).unwrap();
+        let settings_file = TempSettings::new();
+        let path = settings_file.path();
+        let settings = load_or_create_app_settings_at(path).unwrap();
         assert!(!settings.daemon_exposure.token.trim().is_empty());
         assert!(path.exists());
         #[cfg(unix)]
         assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
     fn an_empty_token_is_minted_and_rewritten() {
-        let path = temp_path();
-        fs::write(&path, r#"{"daemon_exposure":{"token":""}}"#).unwrap();
-        let settings = load_or_create_app_settings_at(&path).unwrap();
+        let settings_file = TempSettings::new();
+        let path = settings_file.path();
+        fs::write(path, r#"{"daemon_exposure":{"token":""}}"#).unwrap();
+        let settings = load_or_create_app_settings_at(path).unwrap();
         assert!(!settings.daemon_exposure.token.trim().is_empty());
-        let written: AppSettings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let written: AppSettings = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(
             written.daemon_exposure.token,
             settings.daemon_exposure.token
         );
-        fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
     fn a_persisted_token_survives_legacy_keys_without_a_rewrite() {
-        let path = temp_path();
+        let settings_file = TempSettings::new();
+        let path = settings_file.path();
         let original =
             r#"{"daemon_exposure":{"token":"abc"},"theme":"dark","analytics_enabled":false}"#;
-        fs::write(&path, original).unwrap();
-        let settings = load_or_create_app_settings_at(&path).unwrap();
+        fs::write(path, original).unwrap();
+        let settings = load_or_create_app_settings_at(path).unwrap();
         assert_eq!(settings.daemon_exposure.token, "abc");
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 }
