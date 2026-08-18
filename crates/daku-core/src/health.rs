@@ -110,7 +110,7 @@ pub fn publish_dashboard(
             environment_id: environment.id.clone(),
             snapshots: env_snaps,
         });
-        for signal_id in [JOBS_SIGNAL_ID, SYSLOG_SIGNAL_ID] {
+        for signal_id in [AVAILABILITY_SIGNAL_ID, JOBS_SIGNAL_ID, SYSLOG_SIGNAL_ID] {
             let points = persistence::load_signal_samples(&connection, &environment.id, signal_id)?
                 .into_iter()
                 .filter(|sample| sample.observed_at >= cutoff)

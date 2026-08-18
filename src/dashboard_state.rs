@@ -32,7 +32,11 @@ pub fn signal_label(signal_id: &str) -> &'static str {
     }
 }
 
-const TREND_SIGNALS: [&str; 2] = ["jobs", "syslog"];
+const TREND_SIGNALS: [&str; 3] = ["availability", "jobs", "syslog"];
+
+/// The daemon keeps samples this long (`persistence::SAMPLE_RETENTION_SECS`);
+/// every sparkline spans it.
+pub const TREND_WINDOW_LABEL: &str = "24 h";
 
 /// The Drill-in is a bounded region, not a table browser.
 const DRILL_IN_ROW_LIMIT: usize = 50;
@@ -60,7 +64,11 @@ pub const STALE_AFTER_SECS: i64 = 300;
 pub struct Freshness {
     pub label: String,
     pub stale: bool,
+    /// Stale for over an hour: the numbers on screen are history, not state.
+    pub critical: bool,
 }
+
+const CRITICAL_AFTER_SECS: i64 = 3600;
 
 /// "polled 42 s ago" / "polled 3 min ago" / "polled 2 h ago" for the selected
 /// Environment. An Environment with no observation yet reads "never polled" and
@@ -70,6 +78,7 @@ pub fn freshness(last_observed_at: Option<i64>, now: i64) -> Freshness {
         return Freshness {
             label: "never polled".to_owned(),
             stale: true,
+            critical: false,
         };
     };
     let age = now.saturating_sub(last_observed_at).max(0);
@@ -83,6 +92,7 @@ pub fn freshness(last_observed_at: Option<i64>, now: i64) -> Freshness {
     Freshness {
         label,
         stale: age > STALE_AFTER_SECS,
+        critical: age > CRITICAL_AFTER_SECS,
     }
 }
 
@@ -394,7 +404,7 @@ impl DashboardState {
                     truncated: false,
                 }
             }
-            "jobs" | "syslog" => {
+            "availability" | "jobs" | "syslog" => {
                 let points: Vec<f64> = self
                     .samples
                     .get(&(
@@ -442,7 +452,7 @@ impl DashboardState {
     pub fn cards(&self) -> Vec<SignalCard> {
         let environment_id = self.selected_id.as_deref().unwrap_or("");
         let snapshots = self.snapshots.get(environment_id);
-        SIGNAL_IDS
+        let mut cards = SIGNAL_IDS
             .iter()
             .map(|&signal_id| {
                 let snapshot = snapshots.and_then(|map| map.get(signal_id));
@@ -459,16 +469,34 @@ impl DashboardState {
                 } else {
                     Vec::new()
                 };
+                let status = match snapshot {
+                    // Zero MID servers is "nothing to measure", not health.
+                    Some(snapshot)
+                        if signal_id == "mid_ecc"
+                            && snapshot
+                                .payload
+                                .get("agents_total")
+                                .and_then(|v| v.as_u64())
+                                == Some(0) =>
+                    {
+                        "unknown".to_owned()
+                    }
+                    Some(snapshot) => snapshot.dto.state.clone(),
+                    None => WAITING.to_owned(),
+                };
                 SignalCard {
                     signal_id,
-                    status: snapshot
-                        .map(|snapshot| snapshot.dto.state.clone())
-                        .unwrap_or_else(|| WAITING.to_owned()),
+                    status,
                     sparkline,
                     muted: !self.connected,
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // Problems first, then the rest in Signal order; unconfigured probes
+        // last so they stop competing with live ones. Stable sort keeps
+        // `SIGNAL_IDS` order within a rank.
+        cards.sort_by_key(|card| severity_rank(&card.status));
+        cards
     }
 
     pub fn compare_strip(&self) -> CompareStrip {
@@ -541,7 +569,55 @@ impl DashboardState {
         else {
             return String::new();
         };
-        summarize_value(signal_id, &snapshot.payload)
+        let summary = summarize_value(signal_id, &snapshot.payload);
+        // The build string is inventory, so it lives with the plugin inventory,
+        // not under the latency number.
+        if signal_id == "drift" && !summary.is_empty() {
+            let build = self
+                .snapshots
+                .get(environment_id)
+                .and_then(|map| map.get("availability"))
+                .and_then(|snapshot| snapshot.payload.get("build"))
+                .and_then(|build| build.as_str());
+            if let Some(build) = build {
+                return format!("{summary} \u{b7} {build}");
+            }
+        }
+        summary
+    }
+
+    /// What to do about a skipped probe, when it is a configuration matter
+    /// rather than the instance's state. Empty otherwise.
+    pub fn card_hint(&self, signal_id: &str) -> &'static str {
+        let reason = self
+            .selected_id
+            .as_deref()
+            .and_then(|environment_id| self.snapshots.get(environment_id))
+            .and_then(|map| map.get(signal_id))
+            .and_then(|snapshot| snapshot.payload.get("skipped"))
+            .and_then(|reason| reason.as_str());
+        match reason {
+            Some("no_clone_source") => "mark one Environment \"clone_source\": true",
+            Some("need_two_environments") => "add a second Environment",
+            _ => "",
+        }
+    }
+
+    /// The worst health across observed Environments, for the sidebar
+    /// roll-up. `None` when disconnected or nothing has been polled yet.
+    pub fn worst_health(&self) -> Option<EnvironmentHealth> {
+        if !self.connected {
+            return None;
+        }
+        self.environments
+            .iter()
+            .filter(|environment| environment.last_observed_at.is_some())
+            .map(|environment| environment.health)
+            .max_by_key(|health| match health {
+                EnvironmentHealth::Healthy => 0,
+                EnvironmentHealth::Degraded => 1,
+                EnvironmentHealth::Down => 2,
+            })
     }
 
     /// One-line diagnostic for the selected Environment's Signal: the daemon's
@@ -644,6 +720,18 @@ impl DashboardState {
     }
 }
 
+/// Lower sorts first on the card grid.
+pub fn severity_rank(status: &str) -> u8 {
+    match status {
+        "down" => 0,
+        "degraded" => 1,
+        WAITING => 2,
+        "healthy" => 3,
+        "skipped" => 5,
+        _ => 4,
+    }
+}
+
 fn environment_build(
     snapshots: &HashMap<String, HashMap<String, Snapshot>>,
     environment_id: &str,
@@ -690,13 +778,12 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
             value.get("rtt_ms").and_then(|item| item.as_u64()),
             value.get("build").and_then(|item| item.as_str()),
         ) {
-            (Some(ms), Some(build)) => format!("{ms} ms · {build}"),
-            (Some(ms), None) => format!("{ms} ms"),
+            (Some(ms), _) => format!("{ms} ms"),
             (None, Some(build)) => build.to_owned(),
             _ => String::new(),
         },
         "jobs" => format!(
-            "{} overdue · {} error",
+            "{} overdue · {} in error",
             value
                 .get("overdue_ready")
                 .and_then(|item| item.as_u64())
@@ -707,7 +794,7 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 .unwrap_or(0)
         ),
         "syslog" => format!(
-            "{} errors / h",
+            "{} errors · last hour",
             value
                 .get("error_count_1h")
                 .and_then(|item| item.as_u64())
@@ -722,8 +809,11 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 .get("agents_unhealthy")
                 .and_then(|item| item.as_u64())
                 .unwrap_or(0);
+            if total == 0 {
+                return "no MID servers".into();
+            }
             format!(
-                "{}/{} up · queue {}",
+                "{}/{} MID up · queue {}",
                 total.saturating_sub(unhealthy),
                 total,
                 value
@@ -733,7 +823,7 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
             )
         }
         "outbound" => format!(
-            "{} HTTP fail",
+            "{} HTTP failures · last hour",
             value
                 .get("outbound_http_4xx_5xx_1h")
                 .and_then(|item| item.as_u64())
@@ -991,24 +1081,18 @@ mod tests {
     /// point of the pin.
     const RENDERED: [(&str, &str, &str); 27] = [
         ("availability_asleep", "142 ms", ""),
-        (
-            "availability_reachable",
-            "142 ms \u{b7} glide-zurich-12-18-2025__patch0-hotfix1",
-            "",
-        ),
-        (
-            "availability_reachable_other_build",
-            "142 ms \u{b7} glide-yokohama-07-02-2025__patch1",
-            "",
-        ),
+        // The build string is shown with the plugin inventory (drift), not
+        // under the latency number.
+        ("availability_reachable", "142 ms", ""),
+        ("availability_reachable_other_build", "142 ms", ""),
         ("availability_unreachable", "142 ms", "HTTP 429"),
         // A failed probe carries no counts, so there is no summary to render:
         // the card falls back to its status word and the detail says why.
         ("down_probe_failed", "", "HTTP 429"),
         ("drift_compare", "3 plugins differ", ""),
         ("drift_source", "source of truth", ""),
-        ("jobs_counts", "2 overdue \u{b7} 0 error", ""),
-        ("jobs_zero", "0 overdue \u{b7} 0 error", ""),
+        ("jobs_counts", "2 overdue \u{b7} 0 in error", ""),
+        ("jobs_zero", "0 overdue \u{b7} 0 in error", ""),
         (
             "last_clone_source_cannot_list",
             "clone source \u{b7} cannot list clones",
@@ -1022,10 +1106,10 @@ mod tests {
             "not in the last 10 clones",
             "",
         ),
-        ("mid_ecc_healthy", "3/3 up \u{b7} queue 2", ""),
-        ("mid_ecc_unhealthy", "1/3 up \u{b7} queue 2", ""),
-        ("outbound_count", "3 HTTP fail", ""),
-        ("outbound_zero", "0 HTTP fail", ""),
+        ("mid_ecc_healthy", "3/3 MID up \u{b7} queue 2", ""),
+        ("mid_ecc_unhealthy", "1/3 MID up \u{b7} queue 2", ""),
+        ("outbound_count", "3 HTTP failures \u{b7} last hour", ""),
+        ("outbound_zero", "0 HTTP failures \u{b7} last hour", ""),
         ("skipped_asleep", "", "Environment asleep"),
         ("skipped_clone_source_asleep", "", "clone source asleep"),
         (
@@ -1045,8 +1129,8 @@ mod tests {
         ),
         ("skipped_no_clone_source", "", "no clone source configured"),
         ("skipped_unreachable", "", "Environment unreachable"),
-        ("syslog_count", "4 errors / h", ""),
-        ("syslog_zero", "0 errors / h", ""),
+        ("syslog_count", "4 errors \u{b7} last hour", ""),
+        ("syslog_zero", "0 errors \u{b7} last hour", ""),
     ];
 
     /// One Environment carrying one pinned snapshot, selected.
@@ -1237,7 +1321,7 @@ mod tests {
         state.select("prod");
         assert_eq!(
             state.drill_in("drift"),
-            DrillIn::Text("source of truth".into())
+            DrillIn::Text("source of truth · glide-zurich-12-18-2025__patch0-hotfix1".into())
         );
     }
 
@@ -1263,7 +1347,7 @@ mod tests {
         let state = loaded();
         assert_eq!(
             state.drill_in("mid_ecc"),
-            DrillIn::Text("3/3 up \u{b7} queue 2".into())
+            DrillIn::Text("3/3 MID up \u{b7} queue 2".into())
         );
     }
 
@@ -1274,7 +1358,7 @@ mod tests {
         // prod carries no syslog samples: fall back to the one-line summary.
         assert_eq!(
             state.drill_in("syslog"),
-            DrillIn::Text("4 errors / h".into())
+            DrillIn::Text("4 errors · last hour".into())
         );
         state.select("test");
         assert_eq!(state.drill_in("outbound"), DrillIn::Text("HTTP 429".into()));
@@ -1348,7 +1432,7 @@ mod tests {
             .find(|card| card.signal_id == "jobs")
             .unwrap();
         assert_eq!(jobs.sparkline.len(), 3);
-        assert_eq!(state.card_summary("jobs"), "2 overdue · 0 error");
+        assert_eq!(state.card_summary("jobs"), "2 overdue · 0 in error");
         let syslog = state
             .cards()
             .into_iter()
@@ -1694,7 +1778,7 @@ mod tests {
         // Samples for a non-trend Signal are kept but never charted.
         state.apply(&ServerMessage::SignalSamplesUpdated {
             environment_id: "prod".into(),
-            signal_id: "availability".into(),
+            signal_id: "outbound".into(),
             points,
         });
         let card = |signal_id: &str| {
@@ -1705,7 +1789,80 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(card("jobs").sparkline, vec![0.0, 4.0]);
-        assert!(card("availability").sparkline.is_empty());
+        assert!(card("outbound").sparkline.is_empty());
+    }
+
+    #[test]
+    fn cards_sort_problems_first_and_skipped_last() {
+        let mut state = loaded();
+        state.select("test");
+        let statuses: Vec<(&str, String)> = state
+            .cards()
+            .into_iter()
+            .map(|card| (card.signal_id, card.status))
+            .collect();
+        let ranks: Vec<u8> = statuses
+            .iter()
+            .map(|(_, status)| severity_rank(status))
+            .collect();
+        let mut sorted = ranks.clone();
+        sorted.sort_unstable();
+        assert_eq!(ranks, sorted, "{statuses:?}");
+        assert!(severity_rank("down") < severity_rank("degraded"));
+        assert!(severity_rank("degraded") < severity_rank("healthy"));
+        assert!(severity_rank("healthy") < severity_rank("skipped"));
+    }
+
+    #[test]
+    fn mid_ecc_with_no_agents_is_unknown_not_healthy() {
+        let mut state = DashboardState::new();
+        state.set_connected(true);
+        state.apply_all(&[
+            ServerMessage::EnvironmentsUpdated {
+                environments: vec![env(
+                    "e",
+                    "E",
+                    EnvironmentHealth::Healthy,
+                    Reachability::Reachable,
+                )],
+            },
+            ServerMessage::SignalSnapshotsUpdated {
+                environment_id: "e".into(),
+                snapshots: vec![snap(
+                    "mid_ecc",
+                    "healthy",
+                    r#"{"agents_total":0,"agents_unhealthy":0,"ecc_output_ready":0}"#,
+                )],
+            },
+        ]);
+        state.select("e");
+        let card = state
+            .cards()
+            .into_iter()
+            .find(|card| card.signal_id == "mid_ecc")
+            .unwrap();
+        assert_eq!(card.status, "unknown");
+        assert_eq!(state.card_summary("mid_ecc"), "no MID servers");
+    }
+
+    #[test]
+    fn worst_health_and_card_hint() {
+        let mut state = loaded();
+        assert_eq!(state.worst_health(), Some(EnvironmentHealth::Degraded));
+        state.set_connected(false);
+        assert_eq!(state.worst_health(), None);
+        state.set_connected(true);
+        state.apply(&ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "prod".into(),
+            snapshots: vec![snap(
+                "last_clone",
+                "skipped",
+                r#"{"skipped":"no_clone_source"}"#,
+            )],
+        });
+        state.select("prod");
+        assert!(state.card_hint("last_clone").contains("clone_source"));
+        assert_eq!(state.card_hint("jobs"), "");
     }
 
     #[test]
@@ -1813,16 +1970,23 @@ mod tests {
     #[test]
     fn dashboard_state_card_summary_per_signal() {
         let mut state = loaded();
+        assert_eq!(state.card_summary("availability"), "142 ms");
+        assert_eq!(state.card_summary("syslog"), "4 errors · last hour");
+        assert_eq!(state.card_summary("mid_ecc"), "3/3 MID up · queue 2");
         assert_eq!(
-            state.card_summary("availability"),
-            "142 ms · glide-zurich-12-18-2025__patch0-hotfix1"
+            state.card_summary("outbound"),
+            "3 HTTP failures · last hour"
         );
-        assert_eq!(state.card_summary("syslog"), "4 errors / h");
-        assert_eq!(state.card_summary("mid_ecc"), "3/3 up · queue 2");
-        assert_eq!(state.card_summary("outbound"), "3 HTTP fail");
-        assert_eq!(state.card_summary("drift"), "source of truth");
+        // Drift carries the build from the availability snapshot as context.
+        assert_eq!(
+            state.card_summary("drift"),
+            "source of truth · glide-zurich-12-18-2025__patch0-hotfix1"
+        );
         state.select("test");
-        assert_eq!(state.card_summary("drift"), "3 plugins differ");
+        assert_eq!(
+            state.card_summary("drift"),
+            "3 plugins differ · glide-yokohama-07-02-2025__patch1"
+        );
         assert_eq!(state.card_summary("last_clone"), "12 days ago");
         state.apply(&ServerMessage::SignalSnapshotsUpdated {
             environment_id: "test".into(),
@@ -1860,14 +2024,8 @@ mod tests {
     fn payload_is_parsed_once_per_apply() {
         let state = loaded();
         let before = state.snapshots.clone();
-        assert_eq!(
-            state.card_summary("availability"),
-            "142 ms · glide-zurich-12-18-2025__patch0-hotfix1"
-        );
-        assert_eq!(
-            state.card_summary("availability"),
-            "142 ms · glide-zurich-12-18-2025__patch0-hotfix1"
-        );
+        assert_eq!(state.card_summary("availability"), "142 ms");
+        assert_eq!(state.card_summary("availability"), "142 ms");
         assert_eq!(state.drill_in("drift"), state.drill_in("drift"));
         assert_eq!(state.snapshots, before);
     }

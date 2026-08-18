@@ -121,3 +121,42 @@ mod tests {
         assert_eq!(parse_boolean_setting("default"), None);
     }
 }
+
+/// GPUI's `WindowBackgroundAppearance::Blurred` inserts an `NSVisualEffectView`
+/// with the colourless `Selection` material, which on macOS 26+ no longer
+/// creates a backdrop layer — the window ends up plain transparent. Swap it to
+/// `UnderWindowBackground`, the material meant for exactly this, so the app
+/// gets a real behind-window blur under its translucent tint.
+#[cfg(target_os = "macos")]
+pub fn enable_backdrop_blur(window: &mut Window) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSView, NSVisualEffectMaterial, NSVisualEffectView};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    let Some(_main_thread) = MainThreadMarker::new() else {
+        return;
+    };
+
+    // GPUI owns this view and its NSWindow; AppKit access stays on the main
+    // thread. The blur view is a sibling of GPUI's view under the content view.
+    unsafe {
+        let view = handle.ns_view.cast::<NSView>().as_ref();
+        let Some(content_view) = view.window().and_then(|w| w.contentView()) else {
+            return;
+        };
+        for sub in content_view.subviews().iter() {
+            if let Ok(effect) = sub.downcast::<NSVisualEffectView>() {
+                effect.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn enable_backdrop_blur(_: &mut Window) {}

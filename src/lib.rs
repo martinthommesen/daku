@@ -85,7 +85,7 @@ pub fn run() {
                         titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                         is_movable: true,
                         app_owns_titlebar_drag: cfg!(target_os = "macos"),
-                        window_background: WindowBackgroundAppearance::Opaque,
+                        window_background: WindowBackgroundAppearance::Blurred,
                         app_id: Some(APP_ID.to_owned()),
                         window_bounds: Some(window_bounds),
                         display_id: None,
@@ -100,13 +100,21 @@ pub fn run() {
                             })
                             .detach();
                         let view = Daku::new(window, cx, daemon);
-                        cx.new(|cx| gpui_component::Root::new(view, window, cx))
+                        // Root paints an opaque `background`; clear it so the
+                        // window's blurred backdrop shows through `Daku`'s tint.
+                        cx.new(|cx| {
+                            gpui::Styled::bg(
+                                gpui_component::Root::new(view, window, cx),
+                                gpui::transparent_black(),
+                            )
+                        })
                     },
                 )
                 .expect("failed to open daku window");
 
             window
                 .update(cx, |_, window, cx| {
+                    crate::platform::enable_backdrop_blur(window);
                     gpui_component::Theme::sync_system_appearance(Some(window), cx);
                     cx.activate(true);
                 })

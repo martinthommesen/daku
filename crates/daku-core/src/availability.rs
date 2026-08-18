@@ -185,6 +185,10 @@ impl Signal for AvailabilitySignal {
         false
     }
 
+    fn keeps_samples(&self) -> bool {
+        true
+    }
+
     fn probe(
         &self,
         client: &ServiceNowClient,
@@ -192,10 +196,14 @@ impl Signal for AvailabilitySignal {
         environment: &EnvironmentConfig,
     ) -> anyhow::Result<Observation> {
         let observed = self.observe(client, credentials, environment);
+        // Round-trip time is a trend worth a sparkline; a failed probe's
+        // elapsed time is a timeout, not a latency, so it is not sampled.
+        let sample =
+            (observed.reachability == Reachability::Reachable).then_some(observed.rtt_ms as f64);
         Ok(Observation {
             state: observed.state,
             payload: availability_payload(&observed),
-            sample: None,
+            sample,
         })
     }
 }
