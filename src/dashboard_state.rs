@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use daku_protocol::{
     EnvironmentHealth, EnvironmentSummary, Reachability, SamplePoint, ServerMessage,
-    SignalSnapshotDto,
+    SignalSnapshotDto, is_supported_instance_url,
 };
 
 pub const SIGNAL_IDS: [&str; 7] = [
@@ -264,7 +264,14 @@ impl DashboardState {
             "last_clone" => "/clone_instance_list.do",
             _ => return None,
         };
-        let base = self.selected()?.instance_url.trim_end_matches('/');
+        let instance_url = &self.selected()?.instance_url;
+        // The daemon validates this when it loads environments.json, but the
+        // desktop can be attached to a daemon it does not own
+        // (DAKU_DAEMON_ADDRESS), and this string reaches the OS URL opener.
+        if !is_supported_instance_url(instance_url) {
+            return None;
+        }
+        let base = instance_url.trim_end_matches('/');
         Some(format!("{base}{}", encode_query(path)))
     }
 
@@ -910,6 +917,65 @@ mod tests {
         );
         assert!(state.signal_url("nonsense").is_none());
         assert!(DashboardState::new().signal_url("drift").is_none());
+    }
+
+    /// `loaded()` with the selected Environment's `instance_url` replaced.
+    fn with_instance_url(url: &str) -> DashboardState {
+        let mut state = loaded();
+        state.select("test");
+        for environment in &mut state.environments {
+            if environment.id == "test" {
+                environment.instance_url = url.into();
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn signal_url_rejects_a_non_https_instance_url() {
+        assert!(
+            with_instance_url("http://test.example.service-now.com")
+                .signal_url("drift")
+                .is_none()
+        );
+        assert!(
+            with_instance_url("file:///etc/passwd")
+                .signal_url("drift")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn signal_url_rejects_userinfo() {
+        assert!(
+            with_instance_url("https://user@evil.example.com/")
+                .signal_url("drift")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn signal_url_rejects_a_query_or_fragment() {
+        assert!(
+            with_instance_url("https://test.example.service-now.com/?x=1")
+                .signal_url("drift")
+                .is_none()
+        );
+        assert!(
+            with_instance_url("https://test.example.service-now.com/#f")
+                .signal_url("drift")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn signal_url_still_builds_for_a_valid_environment() {
+        assert_eq!(
+            with_instance_url("https://test.example.service-now.com/")
+                .signal_url("drift")
+                .unwrap(),
+            "https://test.example.service-now.com/v_plugin_list.do"
+        );
     }
 
     #[test]

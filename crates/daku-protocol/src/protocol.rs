@@ -134,6 +134,35 @@ pub struct EnvironmentSummary {
     pub last_observed_at: Option<i64>,
 }
 
+/// ADR-0004: Environment URLs carry Credentials on every request, so they are
+/// https only, with no userinfo and no query/fragment. Trailing `/` is
+/// tolerated (`join_url` trims it). Returns the reason a URL is unsupported.
+///
+/// The daemon enforces this when it loads `environments.json`; the desktop
+/// re-checks it because `instance_url` arrives over the wire and reaches the
+/// OS URL opener.
+pub fn instance_url_error(url: &str) -> Option<&'static str> {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Some("instance_url must start with https://");
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        return Some("instance_url has no host");
+    }
+    if host.contains('@') {
+        return Some("instance_url must not contain userinfo");
+    }
+    if rest.contains('?') || rest.contains('#') {
+        return Some("instance_url must not contain a query or fragment");
+    }
+    None
+}
+
+/// `true` when [`instance_url_error`] finds nothing to complain about.
+pub fn is_supported_instance_url(url: &str) -> bool {
+    instance_url_error(url).is_none()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalSnapshotDto {
@@ -424,5 +453,31 @@ mod tests {
         assert!(environments < snapshots);
         assert!(snapshots < samples);
         assert_eq!(ServerMessage::ShuttingDown.dashboard_cache_key(), None);
+    }
+
+    #[test]
+    fn instance_url_rules_match_adr_0004() {
+        assert!(is_supported_instance_url("https://acme.service-now.com"));
+        assert!(is_supported_instance_url("https://acme.service-now.com/"));
+        assert_eq!(
+            instance_url_error("http://acme.service-now.com"),
+            Some("instance_url must start with https://")
+        );
+        assert_eq!(
+            instance_url_error("https://"),
+            Some("instance_url has no host")
+        );
+        assert_eq!(
+            instance_url_error("https://user@acme.service-now.com"),
+            Some("instance_url must not contain userinfo")
+        );
+        assert_eq!(
+            instance_url_error("https://acme.service-now.com/?x=1"),
+            Some("instance_url must not contain a query or fragment")
+        );
+        assert_eq!(
+            instance_url_error("https://acme.service-now.com/#f"),
+            Some("instance_url must not contain a query or fragment")
+        );
     }
 }

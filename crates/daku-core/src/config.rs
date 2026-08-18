@@ -50,27 +50,13 @@ pub fn load_environments(path: &Path) -> anyhow::Result<Vec<EnvironmentConfig>> 
 
 /// Environment URLs carry Credentials on every request: https only, no
 /// userinfo, no query/fragment. Trailing `/` is tolerated (`join_url` trims it).
+/// The rules themselves live in `daku_protocol::instance_url_error` so the
+/// desktop can apply the same policy (ADR-0004).
 fn validate_instance_url(id: &str, url: &str) -> anyhow::Result<()> {
-    let Some(rest) = url.strip_prefix("https://") else {
-        return Err(anyhow!(
-            "environment {id}: instance_url must start with https://"
-        ));
-    };
-    let host = rest.split('/').next().unwrap_or("");
-    if host.is_empty() {
-        return Err(anyhow!("environment {id}: instance_url has no host"));
+    match daku_protocol::instance_url_error(url) {
+        Some(reason) => Err(anyhow!("environment {id}: {reason}")),
+        None => Ok(()),
     }
-    if host.contains('@') {
-        return Err(anyhow!(
-            "environment {id}: instance_url must not contain userinfo"
-        ));
-    }
-    if rest.contains('?') || rest.contains('#') {
-        return Err(anyhow!(
-            "environment {id}: instance_url must not contain a query or fragment"
-        ));
-    }
-    Ok(())
 }
 
 /// Looks up the secret blob for an Environment id.
@@ -262,5 +248,29 @@ mod tests {
         let duplicates = load_environments(&path).unwrap();
         let _ = fs::remove_file(&path);
         assert_eq!(duplicates.len(), 2);
+    }
+
+    /// The rules moved to `daku-protocol`; these are the strings `daku-daemon
+    /// doctor` shows, so they are pinned verbatim.
+    #[test]
+    fn validate_instance_url_messages_are_unchanged() {
+        let message = |url: &str| validate_instance_url("test", url).unwrap_err().to_string();
+        assert_eq!(
+            message("http://x.example.com"),
+            "environment test: instance_url must start with https://"
+        );
+        assert_eq!(
+            message("https://"),
+            "environment test: instance_url has no host"
+        );
+        assert_eq!(
+            message("https://user@x.example.com"),
+            "environment test: instance_url must not contain userinfo"
+        );
+        assert_eq!(
+            message("https://x.example.com/?a=1"),
+            "environment test: instance_url must not contain a query or fragment"
+        );
+        assert!(validate_instance_url("test", "https://x.example.com/").is_ok());
     }
 }
