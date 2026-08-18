@@ -1,6 +1,6 @@
 //! Pure dashboard model: protocol events in, sidebar/detail/compare out.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use daku_protocol::{
     EnvironmentHealth, EnvironmentSummary, Reachability, SamplePoint, ServerMessage,
@@ -135,6 +135,9 @@ pub struct SignalCard {
     pub signal_id: &'static str,
     pub status: String,
     pub sparkline: Vec<f64>,
+    /// Disconnected: the status colour is stale, so the Environment detail
+    /// paints it grey. Unlike `SidebarRow.muted` this is `!connected` only.
+    pub muted: bool,
 }
 
 /// Content of the Drill-in region under the Signal cards, built from what the
@@ -195,6 +198,17 @@ impl DashboardState {
                         .first()
                         .map(|environment| environment.id.clone());
                 }
+                // An Environment that left the config must not leave its last
+                // snapshots behind: adding the same id back would render last
+                // session's health until the next poll overwrites it.
+                let known: HashSet<&str> = self
+                    .environments
+                    .iter()
+                    .map(|environment| environment.id.as_str())
+                    .collect();
+                self.snapshots.retain(|id, _| known.contains(id.as_str()));
+                self.samples
+                    .retain(|(id, _), _| known.contains(id.as_str()));
             }
             ServerMessage::SignalSnapshotsUpdated {
                 environment_id,
@@ -451,6 +465,7 @@ impl DashboardState {
                         .map(|snapshot| snapshot.dto.state.clone())
                         .unwrap_or_else(|| WAITING.to_owned()),
                     sparkline,
+                    muted: !self.connected,
                 }
             })
             .collect()
@@ -1417,6 +1432,51 @@ mod tests {
         assert!(state.sidebar().iter().all(|row| row.muted));
         state.set_connected(true);
         assert!(state.sidebar().iter().all(|row| !row.muted));
+    }
+
+    #[test]
+    fn removing_an_environment_drops_its_snapshots() {
+        let mut state = loaded();
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![env(
+                "prod",
+                "Production",
+                EnvironmentHealth::Degraded,
+                Reachability::Reachable,
+            )],
+        });
+        state.apply_all(&fixture_events()[..1]);
+        state.select("test");
+        assert!(state.cards().iter().all(|card| card.status == WAITING));
+    }
+
+    #[test]
+    fn removing_an_environment_drops_its_samples() {
+        let mut state = loaded();
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![env(
+                "prod",
+                "Production",
+                EnvironmentHealth::Degraded,
+                Reachability::Reachable,
+            )],
+        });
+        state.apply_all(&fixture_events()[..1]);
+        state.select("test");
+        let syslog = state
+            .cards()
+            .into_iter()
+            .find(|card| card.signal_id == "syslog")
+            .unwrap();
+        assert!(syslog.sparkline.is_empty());
+    }
+
+    #[test]
+    fn signal_cards_are_muted_while_disconnected() {
+        let mut state = loaded();
+        assert!(state.cards().iter().all(|card| !card.muted));
+        state.set_connected(false);
+        assert!(state.cards().iter().all(|card| card.muted));
     }
 
     #[test]

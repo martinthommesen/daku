@@ -240,11 +240,18 @@ impl Daku {
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .child(environment.label.clone()),
                                     )
-                                    .when(environment.last_observed_at.is_some(), |element| {
-                                        element
-                                            .child(health_tag(environment.health))
-                                            .child(reachability_tag(environment.reachability))
-                                    }),
+                                    // Disconnected or never polled: the label,
+                                    // the URL and the freshness line stay, but
+                                    // stale colours would contradict them.
+                                    .when(
+                                        self.state.connected()
+                                            && environment.last_observed_at.is_some(),
+                                        |element| {
+                                            element
+                                                .child(health_tag(environment.health))
+                                                .child(reachability_tag(environment.reachability))
+                                        },
+                                    ),
                             )
                             .child(
                                 h_flex()
@@ -326,7 +333,11 @@ impl Daku {
             Vec::new()
         };
         let waiting = card.status == crate::dashboard_state::WAITING;
-        let color = status_color(&card.status, cx);
+        let color = if card.muted {
+            cx.theme().muted_foreground
+        } else {
+            status_color(&card.status, cx)
+        };
         let (value, context) = split_summary(if summary.is_empty() {
             &card.status
         } else {
@@ -397,7 +408,7 @@ impl Daku {
                 element.child(
                     div()
                         .text_xs()
-                        .text_color(if card.status == "down" {
+                        .text_color(if card.status == "down" && !card.muted {
                             cx.theme().danger
                         } else {
                             cx.theme().muted_foreground
