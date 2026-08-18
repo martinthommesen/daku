@@ -151,3 +151,123 @@ Decided in a grill session; ADR-0008 + ADR-0005 amendment. **Tracking issue:** [
 | [044](044-gpui-component-shell-and-pin.md) | Shell on gpui-component: Root, TitleBar, Sidebar, tokens; zed sha pinned in Cargo.lock only ([#68](https://github.com/martinthommesen/daku/issues/68)) | P1 | M | — | DONE |
 | [045](045-environment-detail-restyle.md) | Environment detail restyle: header, pills, Signal cards, compare strip ([#69](https://github.com/martinthommesen/daku/issues/69)) | P1 | M | 044 | DONE |
 | [046](046-drill-in-and-deep-links.md) | Card selection → Drill-in region + Open-in-ServiceNow links ([#70](https://github.com/martinthommesen/daku/issues/70)) | P2 | M | 045 | DONE |
+
+---
+
+## Advisor audit — 2026-08-18 (`/improve deep`, planned at `2bdeaba`)
+
+Second full-repo audit, run one day after the 011–043 batch and immediately
+after the gpui-component adoption (044–046) landed. Six parallel read-only
+agents (daemon runtime, Signal collectors, GPUI shell + client, security/deps/
+packaging, test coverage, docs + direction), each given the "considered and
+rejected" list above as a suppression list. Every finding below was re-read in
+the source by the advisor before a plan was written. The maintainer asked for
+all of them plus three direction plans. Numbering continues monotonically from
+046. Drift checks for 047+ use `2bdeaba..HEAD` against each plan's Scope paths.
+
+**Baseline at `2bdeaba`:** `bun run check` exits 0 — fmt, `clippy -D warnings`,
+201 tests, oxlint. No verification-baseline plan was needed this time.
+
+**Not audited:** GPUI render output (untestable in this setup — verified only by
+the Operator running `DAKU_UI_FIXTURE=1 bun run dev`); anything needing a live
+ServiceNow instance (plans 057, 058 and 068 each name an Operator-run check);
+`prototypes/`; vendored git dependencies. `cargo-audit` is not installed, so
+dependency posture was reasoned from `Cargo.lock` rather than scanned.
+
+**Tracking issue:** [#94](https://github.com/martinthommesen/daku/issues/94).
+**Gate for 047+:** `bun run check` must exit 0 as a done criterion.
+**No protocol bumps** in this batch — 047 and 065 both explicitly avoid one.
+
+### Execution order & status
+
+Recommended order = table order (tiers: **A** correctness that makes the console
+lie, **B** narrower correctness + security, **C** perf/debt, **D** tests/docs/DX,
+**E** direction). Within a tier, plans are independent unless "Depends on" says
+otherwise.
+
+| Plan | Title | Priority | Effort | Depends on | Status |
+|------|-------|----------|--------|------------|--------|
+| [047](047-unobserved-environment-is-not-healthy.md) | An Environment daku has never probed must not render as healthy and reachable ([#72](https://github.com/martinthommesen/daku/issues/72)) | P1 | S | — | TODO |
+| [048](048-last-clone-persists-every-target-on-failure.md) | Last-clone records why it has no answer when the clone-source probe fails ([#73](https://github.com/martinthommesen/daku/issues/73)) | P1 | S | — | TODO |
+| [050](050-compare-strip-one-reference-build.md) | The Compare strip tints against the same build it calls a mismatch, and the rule becomes testable ([#75](https://github.com/martinthommesen/daku/issues/75)) | P1 | S | — | TODO |
+| [051](051-local-daemon-reconnect-and-supervisor-test.md) | The supervisor recovers a local daemon whose socket dropped, and the restart loop finally has a test ([#76](https://github.com/martinthommesen/daku/issues/76)) | P1 | S–M | — | TODO |
+| [049](049-drift-build-tri-state-skip-reason-and-asleep-gate.md) | Drift stops guessing — unknown builds are unknown, the skip reason is true, and asleep Environments are not probed ([#74](https://github.com/martinthommesen/daku/issues/74)) | P2 | S–M | 048 | TODO |
+| [052](052-release-integrity-cask-checksum-and-appcast.md) | Neither distribution channel ships bytes nobody verified ([#77](https://github.com/martinthommesen/daku/issues/77)) | P2 | S | — | TODO |
+| [053](053-client-state-hygiene.md) | Prune removed Environments, close the subscribe gap, mute the detail when disconnected ([#78](https://github.com/martinthommesen/daku/issues/78)) | P2 | S | 047 | TODO |
+| [054](054-poll-cadence-and-oauth-ttl-floor.md) | The poll interval means the poll interval, and an OAuth grant is never born expired ([#79](https://github.com/martinthommesen/daku/issues/79)) | P2 | S | — | TODO |
+| [055](055-panic-isolation-for-shared-collectors.md) | A panic in a shared collector cannot silently end polling ([#80](https://github.com/martinthommesen/daku/issues/80)) | P2 | S | — | TODO |
+| [056](056-parse-signal-payloads-once.md) | Parse each Signal payload once when it arrives, not once per element per frame ([#81](https://github.com/martinthommesen/daku/issues/81)) | P2 | M | 050 | TODO |
+| [057](057-last-clone-truncation-vs-never-cloned.md) | "No clone in the page I read" stops looking like "never cloned" ([#82](https://github.com/martinthommesen/daku/issues/82)) | P2 | S–M | 048 | TODO |
+| [058](058-drift-truncation-count-order-and-surface.md) | Drift knows when it only saw part of the inventory, and says so ([#83](https://github.com/martinthommesen/daku/issues/83)) | P3 | M | 049 | TODO |
+| [059](059-test-hygiene-sandbox-home-and-429-mapping.md) | Tests clean up after themselves, stop racing on the environment, and pin what a rate-limited Environment looks like ([#84](https://github.com/martinthommesen/daku/issues/84)) | P3 | S–M | soft 051 | TODO |
+| [060](060-docs-reconciliation.md) | The docs stop asserting things that are no longer true ([#85](https://github.com/martinthommesen/daku/issues/85)) | P3 | S | — | TODO |
+| [061](061-gpui-component-bump-recipe.md) | The documented recipe for bumping the UI toolkit actually works ([#86](https://github.com/martinthommesen/daku/issues/86)) | P3 | S | — | TODO |
+| [062](062-delete-fps-counter-and-i18n.md) | Delete the FPS counter that renders the word "FPS", and the i18n framework serving four English strings ([#87](https://github.com/martinthommesen/daku/issues/87)) | P3 | S | — | TODO |
+| [063](063-typescript-typecheck-in-the-gate.md) | The TypeScript in this repo is type-checked, and the lint plugin is linted ([#88](https://github.com/martinthommesen/daku/issues/88)) | P3 | S | 052 | TODO |
+| [064](064-client-side-instance-url-check.md) | The desktop validates the URL it hands to macOS, instead of trusting the daemon ([#89](https://github.com/martinthommesen/daku/issues/89)) | P3 | S | — | TODO |
+| [065](065-payload-key-contract-test.md) | The payload keys the daemon writes and the desktop reads are pinned to each other ([#90](https://github.com/martinthommesen/daku/issues/90)) | P3 | M | 048, 049, 057 | TODO |
+| [066](066-mid-ecc-drill-in-rows.md) | The MID/ECC Drill-in shows which MID is down, from data daku already fetches ([#91](https://github.com/martinthommesen/daku/issues/91)) | P2 | S | — | TODO |
+| [067](067-reload-command-spike.md) | **Spike** — how the Operator reloads config and forces a poll without relaunching ([#92](https://github.com/martinthommesen/daku/issues/92)) | P3 | M | 051 | TODO |
+| [068](068-daemon-setup-subcommand-spike.md) | **Spike** — should `daku-daemon` fix what `doctor` already diagnoses ([#93](https://github.com/martinthommesen/daku/issues/93)) | P3 | M | — | TODO |
+
+### Dependency notes
+
+- **048 before 049 and 057** — 048 extracts the `skip_targets` helper both reuse.
+- **049 before 058** — 049 makes `build_matches` tri-state; 058 then works on the
+  final payload shape.
+- **047 before 053** — both edit `sidebar()`'s `muted`; 053 is additive on top.
+- **050 before 056** — 050 changes `compare_rows()`; 056 then makes it cheap.
+- **052 before 063** — both edit `scripts/release.ts`; type-check the final shape.
+- **051 before 059 and 067** — 051 adds tests to `crates/daku-daemon/tests/process.rs`
+  (059 then fixes that file's hygiene) and changes when the supervisor respawns
+  (one of 067's candidate mechanisms).
+- **048, 049, 057 before 065** — each adds or changes a payload key; 065 pins the
+  final shapes.
+- **049 vs 055**: both touch how drift and last-clone are scheduled. 055 moves
+  them inside `tick`'s panic-capturing scope and **must preserve their ordering
+  after the per-Environment groups join** — 049's availability gate depends on
+  this tick's availability snapshot already being committed. Land one at a time
+  and re-read 055's STOP conditions.
+- **060 vs everything**: 060 corrects verification commands inside DONE plans
+  003/007/026/027/031/046. If a corrected command *fails* rather than returning a
+  different number, that is an incompletely-landed plan — 060 says to report it,
+  not to edit the expectation.
+
+### Findings considered and rejected
+
+- `encode_query` escaping only four characters (`src/dashboard_state.rs`) — every
+  string it receives is one of seven hardcoded literals; the only variable part
+  is `instance_url`, which `config.rs` validates. No ServiceNow field value ever
+  reaches a URL. (Plan 064 covers the `instance_url` half.)
+- `StateStore::open`'s `OPEN_LOCK` being process-local while `probe-availability`
+  and `doctor` open the same DB from other processes — the `journal_mode` PRAGMA
+  only contends on a database not yet in WAL, so this is a first-run-only race.
+  The migration half is already correct across processes.
+- SQLite `-wal`/`-shm` sidecars created at the process umask rather than `0600` —
+  `~/.daku` is forced `0700`, so nothing outside the Operator's account reaches
+  them; the code comments already acknowledge it.
+- `_ => {}` in `DashboardState::apply` — the only unhandled variants are
+  transport-owned (`Hello`, `Rejected`, `Response`); `ShuttingDown` never reaches
+  `apply`.
+- The dead `|| list.len() > DRILL_IN_ROW_LIMIT` clause in `drill_in` — correct
+  belt-and-braces if either constant moves.
+- `freshness` sub-minute precision drifting against the 30 s re-render tick —
+  cosmetic; shortening the tick costs frames.
+- A `rust-toolchain.toml` — marginal for a single-Operator repo where
+  `rust-version = "1.96"` already errors on an old toolchain.
+- `chrono`/`time` and `base64` version duplication, and deprecated
+  `@esbuild-kit/*` under `drizzle-kit` — all transitive, none actionable.
+- Multiple `clone_source: true` silently resolving to the first by `sort_order` —
+  real but the weakest item found; fold into 049 if that file is open anyway.
+- `SYS_STORE_APP_PATH` requesting `latest_version` and never reading it — a few
+  bytes.
+- Environment health never returning `down` for a reachable Environment whose
+  Signal is `down` — matches `docs/spec/v1.md` §5 ("unreachable → down"); by
+  design, not drift.
+- `docs/packaging.md`'s `DAKU_CHANNEL` row omitting `scripts/release.ts` as a
+  reader — misleads nobody into a broken action.
+- Adding a watchdog that auto-restarts a dead collector thread — 055 makes the
+  death observable; self-healing is a separate design decision.
+- Real pagination for drift's plugin inventory, and one-request-per-target for
+  last-clone — both genuine options, both request-count trade-offs that need the
+  Operator's call. Recorded as recommendations inside 057 and 058 instead.
