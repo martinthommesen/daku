@@ -5,12 +5,16 @@
 //! `environments.json`) and never reaches the Keychain or the network.
 //!
 //! **Every test in this file takes `serialize_tests()` as its first statement.**
-//! The supervisor spawns its child with the *inherited* environment, so the
-//! sandbox has to be this process's own `HOME` for the length of those tests —
-//! and `set_var` is only sound while no sibling thread is reading the
-//! environment (`spawn_daemon` reads `PATH` on every call). Serializing the
-//! binary is what removes that race; libtest still starts a thread per test,
-//! but each blocks on the lock before touching anything.
+//! The supervisor spawns its child with the *inherited* environment and derives
+//! its own daemon-log path from `HOME`, so those tests have to point this
+//! process's `HOME` at their sandbox — and `set_var` is only sound while no
+//! sibling thread reads the environment (`spawn_daemon` reads `PATH` on every
+//! call). One lock for the whole binary is what removes that race: libtest
+//! still starts a thread per test, but each blocks on the lock before touching
+//! anything, and every supervisor test waits for its daemon to be reaped before
+//! releasing it. `DaemonSupervisor`'s monitor thread is not joined on drop, but
+//! it re-reads `running` after every poll tick and returns before any work that
+//! would read the environment.
 
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::{Path, PathBuf};
@@ -60,8 +64,8 @@ impl Drop for SandboxHome {
 
 /// A sandbox that is also *this* process's `HOME`, because the supervisor
 /// spawns its child with the inherited environment and derives its own daemon
-/// log path from `HOME`. Sound only while `serialize_tests()` is held: no other
-/// thread in this binary is reading the environment.
+/// log path from `HOME`. Sound only while `serialize_tests()` is held — see the
+/// module docs for the invariant it rests on.
 #[cfg(unix)]
 fn supervisor_home() -> SandboxHome {
     let home = SandboxHome::new();
@@ -334,7 +338,12 @@ fn supervisor_records_an_error_when_the_daemon_cannot_be_respawned() {
         ResponsePayload::Ack
     ));
 
+    let pid = only_supervised_daemon_pid();
     drop(supervisor);
+    assert!(
+        wait_until(Duration::from_secs(5), || !pid_alive(pid)),
+        "daemon {pid} outlived its supervisor"
+    );
 }
 
 #[cfg(unix)]
