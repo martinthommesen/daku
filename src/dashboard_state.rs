@@ -63,9 +63,16 @@ pub struct Freshness {
 }
 
 /// "polled 42 s ago" / "polled 3 min ago" / "polled 2 h ago" for the selected
-/// Environment, or `None` before the first observation.
-pub fn freshness(last_observed_at: Option<i64>, now: i64) -> Option<Freshness> {
-    let age = now.saturating_sub(last_observed_at?).max(0);
+/// Environment. An Environment with no observation yet reads "never polled" and
+/// is stale by definition — daku has not contacted it.
+pub fn freshness(last_observed_at: Option<i64>, now: i64) -> Freshness {
+    let Some(last_observed_at) = last_observed_at else {
+        return Freshness {
+            label: "never polled".to_owned(),
+            stale: true,
+        };
+    };
+    let age = now.saturating_sub(last_observed_at).max(0);
     let label = if age < 60 {
         format!("polled {age} s ago")
     } else if age < 3600 {
@@ -73,10 +80,10 @@ pub fn freshness(last_observed_at: Option<i64>, now: i64) -> Option<Freshness> {
     } else {
         format!("polled {} h ago", age / 3600)
     };
-    Some(Freshness {
+    Freshness {
         label,
         stale: age > STALE_AFTER_SECS,
-    })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -354,7 +361,7 @@ impl DashboardState {
                 id: environment.id.clone(),
                 label: environment.label.clone(),
                 health: environment.health,
-                muted: !self.connected,
+                muted: !self.connected || environment.last_observed_at.is_none(),
             })
             .collect()
     }
@@ -1089,27 +1096,57 @@ mod tests {
 
     #[test]
     fn freshness_formats_seconds_minutes_hours() {
-        let now_secs = freshness(Some(1000), 1042).unwrap();
+        let now_secs = freshness(Some(1000), 1042);
         assert_eq!(now_secs.label, "polled 42 s ago");
         assert!(!now_secs.stale);
-        assert_eq!(
-            freshness(Some(1000), 1000 + 180).unwrap().label,
-            "polled 3 min ago"
-        );
-        let hours = freshness(Some(1000), 1000 + 7200).unwrap();
+        assert_eq!(freshness(Some(1000), 1000 + 180).label, "polled 3 min ago");
+        let hours = freshness(Some(1000), 1000 + 7200);
         assert_eq!(hours.label, "polled 2 h ago");
         assert!(hours.stale);
     }
 
     #[test]
-    fn freshness_none_before_first_observation() {
-        assert_eq!(freshness(None, 1000), None);
+    fn freshness_without_an_observation_says_never_polled() {
+        let never = freshness(None, 1_700_000_000);
+        assert_eq!(never.label, "never polled");
+        assert!(never.stale);
+    }
+
+    #[test]
+    fn freshness_keeps_its_existing_labels() {
+        let now = 1_700_000_000;
+        let recent = freshness(Some(now - 42), now);
+        assert_eq!(recent.label, "polled 42 s ago");
+        assert!(!recent.stale);
+        assert!(freshness(Some(now - 400), now).stale);
+    }
+
+    #[test]
+    fn sidebar_mutes_an_environment_with_no_observation() {
+        let mut state = DashboardState::new();
+        state.set_connected(true);
+        let mut summary = env(
+            "prod",
+            "Production",
+            EnvironmentHealth::Healthy,
+            Reachability::Reachable,
+        );
+        summary.last_observed_at = None;
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![summary.clone()],
+        });
+        assert!(state.sidebar()[0].muted);
+        summary.last_observed_at = Some(1_700_000_000);
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![summary],
+        });
+        assert!(!state.sidebar()[0].muted);
     }
 
     #[test]
     fn freshness_stale_after_threshold() {
-        assert!(!freshness(Some(0), STALE_AFTER_SECS).unwrap().stale);
-        assert!(freshness(Some(0), STALE_AFTER_SECS + 1).unwrap().stale);
+        assert!(!freshness(Some(0), STALE_AFTER_SECS).stale);
+        assert!(freshness(Some(0), STALE_AFTER_SECS + 1).stale);
     }
 
     #[test]

@@ -259,8 +259,11 @@ impl Daku {
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .child(environment.label.clone()),
                                     )
-                                    .child(health_tag(environment.health))
-                                    .child(reachability_tag(environment.reachability)),
+                                    .when(environment.last_observed_at.is_some(), |element| {
+                                        element
+                                            .child(health_tag(environment.health))
+                                            .child(reachability_tag(environment.reachability))
+                                    }),
                             )
                             .child(
                                 h_flex()
@@ -274,20 +277,18 @@ impl Daku {
                                             .trim_start_matches("https://")
                                             .to_owned(),
                                     )
-                                    .when_some(
-                                        freshness(environment.last_observed_at, unix_now()),
-                                        |element, fresh| {
-                                            element.child("\u{b7}").child(
-                                                div()
-                                                    .text_color(if fresh.stale {
-                                                        cx.theme().warning
-                                                    } else {
-                                                        cx.theme().muted_foreground
-                                                    })
-                                                    .child(fresh.label),
-                                            )
-                                        },
-                                    ),
+                                    .child("\u{b7}")
+                                    .child({
+                                        let fresh =
+                                            freshness(environment.last_observed_at, unix_now());
+                                        div()
+                                            .text_color(if fresh.stale {
+                                                cx.theme().warning
+                                            } else {
+                                                cx.theme().muted_foreground
+                                            })
+                                            .child(fresh.label)
+                                    }),
                             ),
                     )
                     .child(
