@@ -109,6 +109,10 @@ pub struct CompareRow {
     pub id: String,
     pub label: String,
     pub build: Option<String>,
+    /// True when this Environment's build is known, the reference build is
+    /// known, and they differ. Unknown on either side is never a mismatch —
+    /// the Compare strip must not tint what it could not read.
+    pub mismatch: bool,
     pub drift: String,
     pub last_clone: String,
 }
@@ -405,17 +409,13 @@ impl DashboardState {
             };
         }
         let source_id = self.clone_source_id();
-        let source_build = source_id.and_then(|id| environment_build(&self.snapshots, id));
-        let builds: Vec<_> = self
-            .environments
-            .iter()
-            .filter_map(|environment| environment_build(&self.snapshots, &environment.id))
-            .collect();
-        let build_mismatch = if let Some(source) = source_build {
-            builds.iter().any(|build| build != &source)
-        } else {
-            builds.windows(2).any(|pair| pair[0] != pair[1])
-        };
+        let reference = self.reference_build();
+        let build_mismatch = reference.as_ref().is_some_and(|reference| {
+            self.environments.iter().any(|environment| {
+                environment_build(&self.snapshots, &environment.id)
+                    .is_some_and(|build| &build != reference)
+            })
+        });
         let plugin_mismatch = self.environments.iter().any(|environment| {
             source_id != Some(environment.id.as_str())
                 && self
@@ -429,6 +429,19 @@ impl DashboardState {
             visible: true,
             has_mismatch,
         }
+    }
+
+    /// The build the Compare strip measures every Environment against: the
+    /// clone source's, or — when there is no clone source or its build is
+    /// unknown — the first known build in Environment order.
+    fn reference_build(&self) -> Option<String> {
+        self.clone_source_id()
+            .and_then(|id| environment_build(&self.snapshots, id))
+            .or_else(|| {
+                self.environments
+                    .iter()
+                    .find_map(|environment| environment_build(&self.snapshots, &environment.id))
+            })
     }
 
     fn clone_source_id(&self) -> Option<&str> {
@@ -538,14 +551,22 @@ impl DashboardState {
     }
 
     pub fn compare_rows(&self) -> Vec<CompareRow> {
+        let reference = self.reference_build();
         self.environments
             .iter()
-            .map(|environment| CompareRow {
-                id: environment.id.clone(),
-                label: environment.label.clone(),
-                build: environment_build(&self.snapshots, &environment.id),
-                drift: self.signal_summary(&environment.id, "drift"),
-                last_clone: self.signal_summary(&environment.id, "last_clone"),
+            .map(|environment| {
+                let build = environment_build(&self.snapshots, &environment.id);
+                CompareRow {
+                    id: environment.id.clone(),
+                    label: environment.label.clone(),
+                    mismatch: matches!(
+                        (&build, &reference),
+                        (Some(build), Some(reference)) if build != reference
+                    ),
+                    build,
+                    drift: self.signal_summary(&environment.id, "drift"),
+                    last_clone: self.signal_summary(&environment.id, "last_clone"),
+                }
             })
             .collect()
     }
@@ -1393,5 +1414,81 @@ mod tests {
         state.apply(&ServerMessage::ShuttingDown);
         assert_eq!(state.sidebar().len(), 2);
         assert_eq!(state.selected_id(), Some("prod"));
+    }
+
+    /// Three Environments with the clone source (`prod`) deliberately *not*
+    /// first, so the test tells the clone-source reference build apart from
+    /// the first-known-build fallback.
+    fn three_environments(builds: [Option<&str>; 3]) -> DashboardState {
+        let mut state = DashboardState::new();
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: ["dev", "prod", "test"]
+                .into_iter()
+                .map(|id| env(id, id, EnvironmentHealth::Healthy, Reachability::Reachable))
+                .collect(),
+        });
+        for (id, build) in ["dev", "prod", "test"].into_iter().zip(builds) {
+            let mut snapshots = vec![snap(
+                "drift",
+                "healthy",
+                if id == "prod" {
+                    r#"{"role":"source"}"#
+                } else {
+                    r#"{"mismatches":0,"build_matches":true}"#
+                },
+            )];
+            if let Some(build) = build {
+                snapshots.push(snap(
+                    "availability",
+                    "healthy",
+                    &format!(r#"{{"build":"{build}"}}"#),
+                ));
+            }
+            state.apply(&ServerMessage::SignalSnapshotsUpdated {
+                environment_id: id.into(),
+                snapshots,
+            });
+        }
+        state
+    }
+
+    fn tinted(state: &DashboardState) -> Vec<String> {
+        state
+            .compare_rows()
+            .into_iter()
+            .filter(|row| row.mismatch)
+            .map(|row| row.id)
+            .collect()
+    }
+
+    #[test]
+    fn compare_rows_tint_the_drifted_environment_not_the_selected_one() {
+        let mut state = three_environments([Some("b"), Some("a"), Some("a")]);
+        assert_eq!(tinted(&state), ["dev"]);
+        state.select("dev");
+        assert_eq!(tinted(&state), ["dev"]);
+    }
+
+    #[test]
+    fn compare_rows_do_not_tint_an_unknown_build() {
+        let state = three_environments([None, Some("a"), Some("a")]);
+        let rows = state.compare_rows();
+        assert_eq!(rows[0].id, "dev");
+        assert!(rows[0].build.is_none());
+        assert!(!rows[0].mismatch);
+        assert!(tinted(&state).is_empty());
+    }
+
+    #[test]
+    fn compare_rows_do_not_tint_when_the_reference_build_is_unknown() {
+        let state = three_environments([None, None, None]);
+        assert!(tinted(&state).is_empty());
+    }
+
+    #[test]
+    fn compare_strip_and_rows_agree_on_mismatch() {
+        let state = three_environments([Some("b"), Some("a"), Some("a")]);
+        assert!(state.compare_strip().has_mismatch);
+        assert!(!tinted(&state).is_empty());
     }
 }

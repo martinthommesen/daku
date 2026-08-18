@@ -239,7 +239,6 @@ impl Daku {
             .flex_col()
             .overflow_y_scroll()
             .when_some(selected, |element, environment| {
-                let selected_id = environment.id.clone();
                 element
                     .child(
                         v_flex()
@@ -308,12 +307,7 @@ impl Daku {
                         ))
                     })
                     .when(strip.visible, |element| {
-                        element.child(compare_strip(
-                            strip.has_mismatch,
-                            &selected_id,
-                            &rows,
-                            cx,
-                        ))
+                        element.child(compare_strip(strip.has_mismatch, &rows, cx))
                     })
             })
             .when(self.state.selected().is_none(), |element| {
@@ -594,16 +588,7 @@ fn drill_in_region(signal_id: &str, content: DrillIn, cx: &App) -> impl IntoElem
 /// gpui-component's `Table` needs a delegate `Entity`, which `render_detail`
 /// (a `&App` render with no entity context) cannot build, so the strip is a
 /// bordered grid with a `Separator` under the header row.
-fn compare_strip(
-    has_mismatch: bool,
-    selected_id: &str,
-    rows: &[CompareRow],
-    cx: &App,
-) -> impl IntoElement {
-    let selected_build = rows
-        .iter()
-        .find(|row| row.id == selected_id)
-        .and_then(|row| row.build.clone());
+fn compare_strip(has_mismatch: bool, rows: &[CompareRow], cx: &App) -> impl IntoElement {
     v_flex()
         .mx(px(22.0))
         .mb(px(16.0))
@@ -618,10 +603,6 @@ fn compare_strip(
         )
         .child(Separator::horizontal().color(cx.theme().border))
         .children(rows.iter().map(|row| {
-            let mismatch = matches!(
-                (&row.build, &selected_build),
-                (Some(build), Some(selected)) if build != selected
-            );
             compare_row_cells([
                 row.label.clone(),
                 row.build.clone().unwrap_or_else(|| "\u{2014}".to_owned()),
@@ -629,7 +610,7 @@ fn compare_strip(
                 row.last_clone.clone(),
             ])
             .text_sm()
-            .text_color(if mismatch {
+            .text_color(if row.mismatch {
                 cx.theme().warning
             } else {
                 cx.theme().muted_foreground
