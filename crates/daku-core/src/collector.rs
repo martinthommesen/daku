@@ -236,6 +236,12 @@ impl CollectorLoop {
     }
 
     pub fn tick(&self) -> anyhow::Result<()> {
+        self.tick_timed().0
+    }
+
+    /// Runs one tick and reports how long it took, so the caller can sleep the
+    /// remainder of the interval instead of a full interval on top of it.
+    fn tick_timed(&self) -> (anyhow::Result<()>, Duration) {
         let started = Instant::now();
         let mut errors: Vec<anyhow::Error> = std::thread::scope(|scope| {
             let handles: Vec<_> = self
@@ -262,10 +268,11 @@ impl CollectorLoop {
                 self.interval.as_secs_f64()
             );
         }
-        match errors.into_iter().next() {
+        let result = match errors.into_iter().next() {
             Some(error) => Err(error),
             None => Ok(()),
-        }
+        };
+        (result, elapsed)
     }
 
     pub fn run(&self, shutdown: &AtomicBool, clock: &dyn Clock, after: &dyn Fn()) {
@@ -273,14 +280,16 @@ impl CollectorLoop {
         // until the first tick completes.
         after();
         while !shutdown.load(Ordering::Acquire) {
-            if let Err(error) = self.tick() {
+            let (result, elapsed) = self.tick_timed();
+            if let Err(error) = result {
                 eprintln!("daku collector tick failed: {error}");
             }
             after();
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
-            clock.sleep(self.interval);
+            // An overrunning tick sleeps zero and ticks again immediately.
+            clock.sleep(self.interval.saturating_sub(elapsed));
         }
     }
 }
@@ -509,6 +518,7 @@ mod tests {
         Clock, HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
     };
     use crate::test_support::{TempDb, prod};
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -618,6 +628,52 @@ mod tests {
         });
         assert_eq!(calls.load(Ordering::Acquire), 2);
     }
+    /// Records what `run` asked to sleep for, and stops the loop.
+    struct StopRecordingSleep<'a>(&'a AtomicBool, Mutex<Vec<Duration>>);
+
+    impl Clock for StopRecordingSleep<'_> {
+        fn now(&self) -> std::time::SystemTime {
+            std::time::SystemTime::now()
+        }
+        fn sleep(&self, duration: Duration) {
+            self.1.lock().expect("sleeps").push(duration);
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn run_sleeps_the_remainder_of_the_interval() {
+        let interval = Duration::from_secs(10);
+        let shutdown = AtomicBool::new(false);
+        let clock = StopRecordingSleep(&shutdown, Mutex::new(Vec::new()));
+        let mut loop_ = CollectorLoop::new(interval);
+        loop_.register(SleepingCollector(
+            Duration::from_millis(200),
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        loop_.run(&shutdown, &clock, &|| {});
+        let sleeps = clock.1.lock().expect("sleeps").clone();
+        assert_eq!(sleeps.len(), 1);
+        assert!(
+            sleeps[0] < interval && sleeps[0] > interval - Duration::from_secs(1),
+            "expected just under the interval, got {:?}",
+            sleeps[0]
+        );
+    }
+
+    #[test]
+    fn run_does_not_sleep_after_an_overrunning_tick() {
+        let shutdown = AtomicBool::new(false);
+        let clock = StopRecordingSleep(&shutdown, Mutex::new(Vec::new()));
+        let mut loop_ = CollectorLoop::new(Duration::from_millis(1));
+        loop_.register(SleepingCollector(
+            Duration::from_millis(50),
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        loop_.run(&shutdown, &clock, &|| {});
+        assert_eq!(*clock.1.lock().expect("sleeps"), [Duration::ZERO]);
+    }
+
     #[test]
     fn collector_loop_tick_isolates_failures() {
         struct Failing;
