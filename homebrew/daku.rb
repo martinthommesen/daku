@@ -2,10 +2,13 @@
 
 # Draft Homebrew cask. Installs the channel-homebrew DMG so Sparkle is a
 # compile-time no-op and `brew upgrade` owns updates.
-# Build that artifact with: DAKU_CHANNEL=homebrew ./scripts/bundle.sh --unsigned
+# Build that artifact signed and notarised with:
+#   DAKU_CHANNEL=homebrew bun run release --signing-identity "…"
+# which prints the sha256 below. version and sha256 always move together —
+# see docs/packaging.md Appendix A item 7.
 cask "daku" do
   version "0.1.0"
-  sha256 :no_check
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
   url "https://github.com/martinthommesen/daku/releases/download/v#{version}/Daku-#{version}-homebrew.dmg"
   name "Daku"

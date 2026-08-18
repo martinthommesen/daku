@@ -69,6 +69,14 @@ skips embedding Sparkle, writes `dist/Daku-x.y.z-homebrew.dmg`). Runtime
 Draft: [`homebrew/daku.rb`](../homebrew/daku.rb). `auto_updates false`.
 Publish only the `Daku-x.y.z-homebrew.dmg` artifact — never the Sparkle DMG.
 
+```sh
+DAKU_CHANNEL=homebrew bun run release --signing-identity "Developer ID Application: …"
+```
+
+prints `Cask sha256: <digest>`; put that digest and the matching `version`
+into the cask before publishing (Appendix A item 7). `--unsigned` is for
+local builds only, never for the published cask.
+
 ## Appendix A — Operator checklist (human-only)
 
 No secret values in issues, chat, or the repo.
@@ -84,6 +92,12 @@ No secret values in issues, chat, or the repo.
    `Daku-x.y.z.zip`.
 6. Test a notarised open on a second Mac; publish the cask with Sparkle
    disabled.
+7. Cask integrity: sign and notarise `Daku-x.y.z-homebrew.dmg` exactly like
+   the Sparkle DMG (never publish an `--unsigned` build), take the digest
+   from the `Cask sha256:` line printed by
+   `DAKU_CHANNEL=homebrew bun run release`, and update `homebrew/daku.rb`'s
+   `version` and `sha256` **together** in the same commit. A version bump
+   without a fresh digest is the failure to catch in review.
 
 Do not run notarisation or publish an appcast without the credentials
 above. Unsigned local bundles are fine without them.

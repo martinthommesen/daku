@@ -17,7 +17,9 @@ Usage:
   bun run release [options]
 
 Does not upload. Attach dist/Daku-<version>.dmg, dist/Daku-<version>.zip
-(the Sparkle enclosure) and dist/appcast.xml to a GitHub Release. Notarisation needs a Developer ID + notary profile — see
+(the Sparkle enclosure) and dist/appcast.xml to a GitHub Release; on
+DAKU_CHANNEL=homebrew there is no appcast and the DMG is the only asset.
+Notarisation needs a Developer ID + notary profile — see
 docs/packaging.md Appendix A. Missing credentials: use --unsigned or --adhoc.
 
 Options:
@@ -119,6 +121,24 @@ const appBundle = join(projectRoot, "dist", `${appName}.app`);
 await access(appBundle);
 await access(outputPath);
 
+// Sparkle only verifies an update if the bundle carries the public half of the
+// appcast signing key. Without it the update channel is unverifiable, so the
+// release stops here rather than at the Operator's Mac. The cask has no
+// Sparkle (ADR-0006), so the key is irrelevant there.
+if (!homebrewChannel) {
+  const plist = join(appBundle, "Contents", "Info.plist");
+  const publicKey = await $`plutil -extract SUPublicEDKey raw ${plist}`
+    .quiet()
+    .nothrow();
+  if (publicKey.exitCode !== 0) {
+    throw new Error(
+      "The built app has no SUPublicEDKey, so Sparkle updates would be " +
+        "unverifiable. Generate a keypair (docs/packaging.md Appendix A " +
+        "item 4) and add the public key to resources/Info.plist.",
+    );
+  }
+}
+
 if (!unsigned && !adhoc && !skipNotarize && configuredSigningIdentity) {
   console.log("\n==> Submitting the DMG for Apple notarization");
   const resultText =
@@ -171,28 +191,52 @@ await rm(symbolsDirectory, { force: true, recursive: true });
 
 const updatesDirectory = join(projectRoot, "dist", "updates");
 await rm(updatesDirectory, { force: true, recursive: true });
+// A stale appcast from the previous release must not survive a run that does
+// not regenerate one — it would otherwise be uploaded against new bytes.
+await rm(join(projectRoot, "dist", "appcast.xml"), { force: true });
 await mkdir(updatesDirectory, { recursive: true });
 await $`ditto ${zipPath} ${join(updatesDirectory, zipName)}`;
 
-const downloadUrlPrefix =
-  process.env.DAKU_DOWNLOAD_URL_PREFIX ?? defaultDownloadUrlPrefix;
-try {
-  console.log("\n==> Generating the Sparkle appcast");
-  await generateAppcast(updatesDirectory, downloadUrlPrefix);
-  await $`ditto ${join(updatesDirectory, "appcast.xml")} ${join(projectRoot, "dist", "appcast.xml")}`;
-} catch (error) {
-  if (process.env.SPARKLE_PRIVATE_KEY || process.env.SPARKLE_BIN) {
-    throw error;
-  }
-  console.warn(
-    `Appcast skipped (Sparkle private key missing): ${error instanceof Error ? error.message : error}`,
+if (homebrewChannel) {
+  console.log(
+    "\n==> Skipping the Sparkle appcast (homebrew channel; brew owns updates)",
   );
+} else {
+  console.log("\n==> Generating the Sparkle appcast");
+  const downloadUrlPrefix =
+    process.env.DAKU_DOWNLOAD_URL_PREFIX ?? defaultDownloadUrlPrefix;
+  try {
+    await generateAppcast(updatesDirectory, downloadUrlPrefix);
+  } catch (error) {
+    // A Sparkle release without a signed appcast is not a release.
+    throw new Error(
+      "Appcast generation failed, so this build cannot be released on the " +
+        "Sparkle channel. Provide the Sparkle tools (SPARKLE_BIN) and the " +
+        "signing key (SPARKLE_PRIVATE_KEY or the login keychain) — see " +
+        "docs/packaging.md. Build the cask artifact with DAKU_CHANNEL=homebrew " +
+        `if you want a release without an appcast. Cause: ${error instanceof Error ? error.message : error}`,
+    );
+  }
+  await $`ditto ${join(updatesDirectory, "appcast.xml")} ${join(projectRoot, "dist", "appcast.xml")}`;
 }
 
 console.log(`\nApp ready: ${appBundle}`);
 console.log(`DMG ready: ${outputPath}`);
 console.log(`ZIP ready: ${zipPath}`);
 console.log(`Symbols ready: ${symbolsZip}`);
-console.log(
-  "Upload the DMG, the ZIP (Sparkle enclosure) and appcast.xml to a GitHub Release when notarised.",
-);
+if (homebrewChannel) {
+  const digest = (await $`shasum -a 256 ${outputPath}`.quiet().text()).split(
+    /\s+/,
+  )[0];
+  console.log(`\nCask sha256: ${digest}`);
+  console.log(
+    `Update homebrew/daku.rb: version "${version}", sha256 "${digest}"`,
+  );
+  console.log(
+    "Upload the DMG to a GitHub Release when notarised, then publish the cask.",
+  );
+} else {
+  console.log(
+    "Upload the DMG, the ZIP (Sparkle enclosure) and appcast.xml to a GitHub Release when notarised.",
+  );
+}
