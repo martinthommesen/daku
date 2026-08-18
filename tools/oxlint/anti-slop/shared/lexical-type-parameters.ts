@@ -17,6 +17,8 @@ function collectInferTypeParameterNames(
 	names: Set<string>,
 ): void {
 	if (node.type === "TSInferType") names.add(node.typeParameter.name.name);
+	// SAFETY: every ESTree node is a plain object whose child slots are named by
+	// the visitor keys; the walk re-checks each slot with `isNode` before using it.
 	const record = node as unknown as Readonly<Record<string, unknown>>;
 	for (const key of visitorKeys[node.type] ?? []) {
 		const value = record[key];

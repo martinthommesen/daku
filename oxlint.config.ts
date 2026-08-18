@@ -13,13 +13,29 @@ export default defineConfig({
     ".pi/**",
     ".roo/**",
     ".windsurf/**",
-    "tools/oxlint/anti-slop/**",
     "node_modules/**",
     "target/**",
     "dist/**",
   ],
   jsPlugins: [
     { name: "anti-slop", specifier: "./tools/oxlint/anti-slop/index.ts" },
+  ],
+  // The plugin walks untyped ESTree nodes, so the rules about runtime `typeof`
+  // and untyped dictionaries cannot hold in the two files that do the walking.
+  overrides: [
+    {
+      files: ["tools/oxlint/anti-slop/rules/no-runtime-typeof.ts"],
+      rules: { "anti-slop/no-runtime-typeof": "off" },
+    },
+    {
+      files: ["tools/oxlint/anti-slop/shared/lexical-type-parameters.ts"],
+      rules: {
+        "anti-slop/no-chained-type-assertions": "off",
+        "anti-slop/no-runtime-typeof": "off",
+        "anti-slop/no-unknown-parameters": "off",
+        "anti-slop/no-unsafe-dictionary-type": "off",
+      },
+    },
   ],
   rules: {
     "anti-slop/no-chained-type-assertions": "error",

@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["bun"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["scripts/**/*.ts", "tools/**/*.ts", "db/**/*.ts", "*.config.ts"],
+  "exclude": ["node_modules", "target", "dist", ".daku-cache"]
+}

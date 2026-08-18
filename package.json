@@ -7,13 +7,15 @@
     "release": "bun ./scripts/release.ts",
     "db:generate": "drizzle-kit generate",
     "lint": "oxlint -c oxlint.config.ts .",
-    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --no-fail-fast && oxlint -c oxlint.config.ts ."
+    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --no-fail-fast && oxlint -c oxlint.config.ts . && tsc --noEmit",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@oxlint/plugins": "1.78.0",
     "@types/bun": "1.3.14",
     "drizzle-kit": "^0.31.10",
     "drizzle-orm": "^0.45.2",
-    "oxlint": "1.78.0"
+    "oxlint": "1.78.0",
+    "typescript": "^7.0.2"
   }
 }

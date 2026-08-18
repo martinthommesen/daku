@@ -26,4 +26,4 @@ The `mattpocock-skills:*` skills are the canonical, mandatory skills for this pr
 
 ### Verification gate
 
-There is no CI. Before committing to `main`, run `bun run check` (fmt check + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` + oxlint) and require exit 0. The gate includes `cargo clippy -- -D warnings`; do not add `#[allow]` to pass it without a comment saying why. Plans under `plans/` use it as a done criterion.
+There is no CI. Before committing to `main`, run `bun run check` (fmt check + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` + oxlint + `tsc --noEmit`) and require exit 0. The gate includes `cargo clippy -- -D warnings`; do not add `#[allow]` to pass it without a comment saying why. `tsc --noEmit` type-checks every `.ts` file listed in `tsconfig.json`'s `include`; a new `.ts` file outside it is silently unchecked. Plans under `plans/` use it as a done criterion.
