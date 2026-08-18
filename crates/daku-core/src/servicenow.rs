@@ -1001,7 +1001,8 @@ mod tests {
             ScriptedTransport::new(vec![token_with_expiry(MIN_TOKEN_TTL_SECS + 1), ok_table()]);
         let credentials = MemoryCredentialStore::default();
         credentials.insert("prod", r#"{"client_id":"id","client_secret":"secret"}"#);
-        let client = ServiceNowClient::new(transport, RecordingClock::default());
+        let clock = Arc::new(AdvancingClock::new());
+        let client = ServiceNowClient::new(transport, clock.clone());
         client
             .request(
                 &oauth_env(),
@@ -1015,6 +1016,16 @@ mod tests {
             client.cached_access_token("prod").as_deref(),
             Some("tok"),
             "a just-above-the-floor grant must not be born expired"
+        );
+        // The server said 61 s; the skew makes it 31 s. Step past the skewed
+        // expiry but not the server's, so only the margin can expire it.
+        clock.advance(Duration::from_secs(
+            MIN_TOKEN_TTL_SECS + 1 - TOKEN_TTL_SKEW_SECS + 1,
+        ));
+        assert_eq!(
+            client.cached_access_token("prod"),
+            None,
+            "the skew margin must retire the token before the server does"
         );
     }
 

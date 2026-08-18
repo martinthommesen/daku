@@ -676,6 +676,15 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
     if value.get("skipped").is_some() {
         return String::new();
     }
+    // `persist_signal_down` writes `{reachability, detail}` for any failed
+    // probe — no counts at all — so the counting arms would invent a "0
+    // overdue · 0 error". Availability's own unreachable payload carries
+    // `error` (and a real `rtt_ms`), never `detail`, so it stays summarised.
+    if value.get("reachability").and_then(|item| item.as_str()) == Some("unreachable")
+        && value.get("detail").is_some()
+    {
+        return String::new();
+    }
     match signal_id {
         "availability" => match (
             value.get("rtt_ms").and_then(|item| item.as_u64()),
@@ -993,10 +1002,9 @@ mod tests {
             "",
         ),
         ("availability_unreachable", "142 ms", "HTTP 429"),
-        // The counting summary reads a key a `down` payload does not carry, so
-        // the card pairs "0 HTTP fail" with the real reason. The status is
-        // `down`, and the detail says why; see the report for plan 065.
-        ("down_probe_failed", "0 HTTP fail", "HTTP 429"),
+        // A failed probe carries no counts, so there is no summary to render:
+        // the card falls back to its status word and the detail says why.
+        ("down_probe_failed", "", "HTTP 429"),
         ("drift_compare", "3 plugins differ", ""),
         ("drift_source", "source of truth", ""),
         ("jobs_counts", "2 overdue \u{b7} 0 error", ""),
@@ -1398,6 +1406,22 @@ mod tests {
         assert_eq!(
             summarize_payload("drift", r#"{"skipped":"need_two_environments"}"#),
             ""
+        );
+    }
+
+    #[test]
+    fn summarize_payload_is_empty_for_a_failed_probe() {
+        let down = r#"{"reachability":"unreachable","detail":"HTTP 429"}"#;
+        assert_eq!(summarize_payload("jobs", down), "");
+        assert_eq!(summarize_payload("mid_ecc", down), "");
+        // Availability's unreachable snapshot carries real numbers, not a
+        // `detail`, so the guard above must leave it alone.
+        assert_eq!(
+            summarize_payload(
+                "availability",
+                r#"{"reachability":"unreachable","rtt_ms":142,"build":null,"error":"HTTP 429"}"#
+            ),
+            "142 ms"
         );
     }
 

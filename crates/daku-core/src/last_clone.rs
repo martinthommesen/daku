@@ -802,13 +802,16 @@ mod tests {
         );
         assert_eq!(payload(&store, "dev")["unknown"], "older_than_page");
         // A total equal to the raw row count is a complete page, not a
-        // truncated one — even though the deduplicated list is shorter.
+        // truncated one. `dev` has no row in this fixture, so "never cloned"
+        // is only reachable while the boundary stays strictly greater-than.
         let (_db, store) = collect_last_clone_with_total(
             200,
-            include_str!("../tests/fixtures/last_clone/two_targets.json"),
-            Some(3),
+            include_str!("../tests/fixtures/last_clone/completed.json"),
+            Some(1),
         );
-        assert_eq!(payload(&store, "dev")["completed"], "2026-01-02 03:00:00");
+        let dev = payload(&store, "dev");
+        assert!(dev.get("unknown").is_none());
+        assert!(dev["completed"].is_null());
     }
 
     #[test]
