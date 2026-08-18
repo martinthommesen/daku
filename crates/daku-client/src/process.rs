@@ -466,8 +466,13 @@ fn monitor_daemon(
         if !inner.running.load(Ordering::Acquire) {
             return;
         }
-        let process_exited = match &mut *inner.target.lock() {
-            DaemonTarget::Local(process) => process.has_exited(),
+        let needs_restart = match &mut *inner.target.lock() {
+            // A live child with a dead socket is unrecoverable from the UI's
+            // side: `listen_dashboard` only ever gets a new client from
+            // `replace_local_daemon`, so respawn rather than sit disconnected.
+            DaemonTarget::Local(process) => {
+                process.has_exited() || process.client().is_disconnected()
+            }
             DaemonTarget::Restarting(_) => true,
             DaemonTarget::Remote(_) => return,
         };
@@ -477,7 +482,10 @@ fn monitor_daemon(
         let observed_stamp = ExecutableStamp::read(executable).ok();
         let executable_changed =
             watch_for_rebuilds && observed_stamp.is_some_and(|observed| observed != active_stamp);
-        if !process_exited && !executable_changed {
+        if !needs_restart && !executable_changed {
+            // Same as `monitor_remote`: a healthy poll clears the backoff so a
+            // later failure starts from the minimum, not an inherited delay.
+            backoff = RESTART_BACKOFF_MIN;
             continue;
         }
         let _restart = inner.restart.lock();

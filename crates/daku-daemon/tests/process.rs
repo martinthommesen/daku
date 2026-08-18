@@ -156,9 +156,46 @@ fn daemon_refuses_to_start_with_an_empty_token() {
     std::fs::remove_dir_all(&home).unwrap();
 }
 
+/// Supervisor tests all spawn a child of this process and identify it by pid,
+/// so they must not overlap with each other.
+#[cfg(unix)]
+fn serialize_supervisor_tests() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Other tests in this file spawn daemons from the same process, so match on
+/// the supervisor's own `--parent-pid <us>` argument rather than the binary
+/// name. The trailing space anchors the pid against a longer one, and the
+/// pattern drops the leading dashes so pgrep does not read it as an option.
+#[cfg(unix)]
+fn supervised_daemon_pids() -> Vec<u32> {
+    let self_pid = std::process::id().to_string();
+    let listed = Command::new("pgrep")
+        .args(["-P", &self_pid, "-f", &format!("parent-pid {self_pid} ")])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(|line| line.trim().parse().unwrap())
+        .collect()
+}
+
+#[cfg(unix)]
+fn only_supervised_daemon_pid() -> u32 {
+    let pids = supervised_daemon_pids();
+    assert_eq!(
+        pids.len(),
+        1,
+        "expected one supervised daemon, got {pids:?}"
+    );
+    pids[0]
+}
+
 #[cfg(unix)]
 #[test]
 fn supervisor_spawns_and_reaps_the_daemon() {
+    let _serialized = serialize_supervisor_tests();
     let _home = ensure_process_home();
     let supervisor = daku_client::DaemonSupervisor::spawn(Path::new(DAEMON), false).unwrap();
     let client = supervisor.client();
@@ -167,24 +204,7 @@ fn supervisor_spawns_and_reaps_the_daemon() {
         ResponsePayload::Ack
     ));
 
-    // Other tests in this file spawn daemons from the same process, so match on
-    // the supervisor's own `--parent-pid <us>` argument rather than the binary
-    // name. The trailing space anchors the pid against a longer one, and the
-    // pattern drops the leading dashes so pgrep does not read it as an option.
-    let self_pid = std::process::id().to_string();
-    let listed = Command::new("pgrep")
-        .args(["-P", &self_pid, "-f", &format!("parent-pid {self_pid} ")])
-        .output()
-        .unwrap();
-    let found = String::from_utf8_lossy(&listed.stdout);
-    let mut pids = found.lines();
-    let pid: u32 = pids
-        .next()
-        .expect("no daemon child found")
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(pids.next(), None, "more than one supervised daemon");
+    let pid = only_supervised_daemon_pid();
     assert!(pid_alive(pid));
 
     drop(client);
@@ -193,6 +213,83 @@ fn supervisor_spawns_and_reaps_the_daemon() {
         wait_until(Duration::from_secs(5), || !pid_alive(pid)),
         "daemon {pid} outlived its supervisor"
     );
+}
+
+/// The daemon is thread-per-connection: a broken connection thread returns
+/// while the process keeps running, so the supervisor has to watch the socket
+/// and not only the child's exit status.
+#[cfg(unix)]
+#[test]
+fn supervisor_replaces_a_daemon_whose_socket_dropped() {
+    let _serialized = serialize_supervisor_tests();
+    let _home = ensure_process_home();
+    let supervisor = daku_client::DaemonSupervisor::spawn(Path::new(DAEMON), false).unwrap();
+    let clients = supervisor.subscribe_clients();
+    let first = clients.recv_timeout(READY_TIMEOUT).unwrap();
+    let pid = only_supervised_daemon_pid();
+
+    // Stop the child first, then close the connection from the client side: the
+    // daemon never processes the shutdown, so it stays alive with a dead socket
+    // — precisely the state `has_exited()` cannot see.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+    first.shutdown();
+    assert!(
+        wait_until(Duration::from_secs(5), || first.is_disconnected()),
+        "the client never noticed its socket closing"
+    );
+    assert!(pid_alive(pid), "the stalled daemon exited on its own");
+
+    let replacement = clients
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the supervisor never replaced the disconnected client");
+    assert!(!replacement.is_disconnected());
+    assert!(matches!(
+        replacement.request(DaemonCommand::Ping).unwrap(),
+        ResponsePayload::Ack
+    ));
+    assert!(
+        wait_until(Duration::from_secs(5), || !pid_alive(pid)),
+        "the stalled daemon {pid} was left running"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn supervisor_records_an_error_when_the_daemon_cannot_be_respawned() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _serialized = serialize_supervisor_tests();
+    let _home = ensure_process_home();
+    let directory = sandbox_home();
+    let executable = directory.join("daku-daemon-copy");
+    std::fs::copy(DAEMON, &executable).unwrap();
+
+    let supervisor = daku_client::DaemonSupervisor::spawn(&executable, false).unwrap();
+    // Unspawnable, then ask the daemon to exit: the respawn must fail.
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600)).unwrap();
+    supervisor.client().shutdown();
+    assert!(
+        wait_until(Duration::from_secs(20), || supervisor
+            .last_error()
+            .is_some()),
+        "a failed respawn was never reported"
+    );
+
+    // The monitor must keep retrying rather than unwind on the first failure.
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(30), || supervisor
+            .last_error()
+            .is_none()),
+        "the supervisor stopped retrying after a failed respawn"
+    );
+    assert!(matches!(
+        supervisor.client().request(DaemonCommand::Ping).unwrap(),
+        ResponsePayload::Ack
+    ));
+
+    drop(supervisor);
+    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[cfg(unix)]
