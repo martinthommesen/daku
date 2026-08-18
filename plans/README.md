@@ -299,9 +299,21 @@ otherwise.
   canonical payloads into `crates/daku-core/tests/fixtures/payloads.json` (re-bless with
   `DAKU_BLESS_PAYLOADS=1 cargo test -p daku-core payload`), and `src/dashboard_state.rs` pins the
   rendered summary/detail per case; `fixture_events()` (`DAKU_UI_FIXTURE=1`) is built from the same
-  cases, so the fixture UI's literal numbers changed. Finding left open: a `down` payload
-  (`persist_signal_down`, no counts) still summarizes as a confident zero ("0 HTTP fail") — one
-  guard next to the `skipped` guard in `summarize_value` would fix it.
+  cases, so the fixture UI's literal numbers changed. Its open finding — a `down` payload
+  (`persist_signal_down`, no counts) summarizing as a confident zero on four Signals — was fixed
+  by the post-landing review (`9ae700e`): `summarize_value` blanks the summary for the
+  `reachability: unreachable` + `detail` shape, so the card headlines the status word `down`.
+- **Post-landing review** (four read-only lenses over `2bdeaba..main`, each finding then
+  adversarially re-verified): 11 claims, 4 confirmed and fixed in `9ae700e` — the fabricated-zero
+  headline above; the second half of `last_clone_uses_total_count_when_present` (057) and
+  `servicenow_http_oauth_expiry_keeps_a_skew_margin` (054) were vacuous (mutation-checked, now
+  load-bearing); `docs/spec/v1.md`'s research row now points at `docs/research/README.md`
+  instead of listing notes by hand. Refuted (recorded so nobody re-raises them): the release
+  script's channel-independent ZIP/dSYM names and the `DAKU_CHANNEL` docs row predate the batch;
+  `subscribe_dashboard_replays_the_cache_and_registers_atomically` pins the invariant, not the
+  lock order, by design; the unreachable `(Some(_), None)` compare-row case, the dropped
+  `spawn_collector_loop` JoinHandle, the test-only global panic hook, and the MID/ECC row
+  columns are all as their plans prescribe.
 
 ### Findings considered and rejected
 
