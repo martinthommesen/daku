@@ -687,6 +687,7 @@ fn detail_from_payload(payload_json: &str) -> String {
             "need_two_environments" => "needs two Environments".to_owned(),
             "no_clone_source" => "no clone source configured".to_owned(),
             "clone_source_cannot_list_clones" => "clone source cannot list clones".to_owned(),
+            "clone_source_unreachable" => "clone source unreachable".to_owned(),
             other => other.to_owned(),
         };
     }
@@ -1083,6 +1084,10 @@ mod tests {
         assert_eq!(
             detail_from_payload(r#"{"skipped":"need_two_environments"}"#),
             "needs two Environments"
+        );
+        assert_eq!(
+            detail_from_payload(r#"{"skipped":"clone_source_unreachable"}"#),
+            "clone source unreachable"
         );
     }
 

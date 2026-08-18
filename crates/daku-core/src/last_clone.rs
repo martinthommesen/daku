@@ -143,15 +143,13 @@ impl SignalCollector for LastCloneCollector {
         else {
             // Without a clone source the card would sit on "Waiting" forever
             // (and its Skeleton would animate forever); say why instead.
-            for environment in &self.environments {
-                persistence::persist_signal_skipped(
-                    &connection,
-                    &environment.id,
-                    LAST_CLONE_SIGNAL_ID,
-                    observed_at,
-                    "no_clone_source",
-                )?;
-            }
+            skip_targets(
+                &connection,
+                &self.environments,
+                None,
+                observed_at,
+                "no_clone_source",
+            )?;
             return Ok(());
         };
         let response = match self.client.request(
@@ -162,23 +160,39 @@ impl SignalCollector for LastCloneCollector {
             None,
         ) {
             Ok(response) if response.status == 200 || response.status == 403 => response,
+            // The source's own `down` snapshot lands first, then every target
+            // learns why it has no answer instead of waiting forever.
             Ok(response) => {
-                return persist_last_clone_unreachable(
+                persist_last_clone_unreachable(
                     &connection,
                     &source.id,
                     &format!("HTTP {}", response.status),
                     observed_at,
-                )
-                .map_err(anyhow::Error::from);
+                )?;
+                skip_targets(
+                    &connection,
+                    &self.environments,
+                    Some(source.id.as_str()),
+                    observed_at,
+                    "clone_source_unreachable",
+                )?;
+                return Ok(());
             }
             Err(error) => {
-                return persist_last_clone_unreachable(
+                persist_last_clone_unreachable(
                     &connection,
                     &source.id,
                     &error.to_string(),
                     observed_at,
-                )
-                .map_err(anyhow::Error::from);
+                )?;
+                skip_targets(
+                    &connection,
+                    &self.environments,
+                    Some(source.id.as_str()),
+                    observed_at,
+                    "clone_source_unreachable",
+                )?;
+                return Ok(());
             }
         };
         let rows = parse_last_clones(response.status, &response.body);
@@ -186,19 +200,13 @@ impl SignalCollector for LastCloneCollector {
         // 403: the source cannot list clones, so nothing is known about the
         // targets — record that rather than claiming "never" or waiting forever.
         let Some(rows) = rows else {
-            for environment in self
-                .environments
-                .iter()
-                .filter(|environment| environment.id != source.id)
-            {
-                persistence::persist_signal_skipped(
-                    &connection,
-                    &environment.id,
-                    LAST_CLONE_SIGNAL_ID,
-                    observed_at,
-                    "clone_source_cannot_list_clones",
-                )?;
-            }
+            skip_targets(
+                &connection,
+                &self.environments,
+                Some(source.id.as_str()),
+                observed_at,
+                "clone_source_cannot_list_clones",
+            )?;
             return Ok(());
         };
         for environment in self
@@ -213,6 +221,30 @@ impl SignalCollector for LastCloneCollector {
         }
         Ok(())
     }
+}
+
+/// Records on every clone target that last-clone has no answer this tick and
+/// why, so the card says something instead of animating "Waiting" forever.
+fn skip_targets(
+    connection: &Connection,
+    environments: &[EnvironmentConfig],
+    source_id: Option<&str>,
+    observed_at: i64,
+    reason: &str,
+) -> io::Result<()> {
+    for environment in environments
+        .iter()
+        .filter(|environment| Some(environment.id.as_str()) != source_id)
+    {
+        persistence::persist_signal_skipped(
+            connection,
+            &environment.id,
+            LAST_CLONE_SIGNAL_ID,
+            observed_at,
+            reason,
+        )?;
+    }
+    Ok(())
 }
 
 fn persist_clone_source(
@@ -533,5 +565,67 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["reachability"], "unreachable");
         assert!(payload.get("supported").is_none());
+    }
+
+    fn skipped_reason(store: &StateStore, environment_id: &str) -> String {
+        let connection = store.open().unwrap();
+        let row =
+            persistence::load_signal_snapshot(&connection, environment_id, LAST_CLONE_SIGNAL_ID)
+                .unwrap()
+                .expect("skipped snapshot");
+        assert_eq!(row.state, "skipped");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        payload["skipped"].as_str().expect("reason").to_owned()
+    }
+
+    #[test]
+    fn last_clone_signal_probe_failure_skips_every_target() {
+        let (_db, store) = collect_last_clone(500, r#"{"error":{"message":"boom"}}"#);
+        for id in ["test", "dev"] {
+            assert_eq!(skipped_reason(&store, id), "clone_source_unreachable");
+        }
+        // The source's own snapshot must survive the target loop.
+        let connection = store.open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, "prod", LAST_CLONE_SIGNAL_ID)
+            .unwrap()
+            .expect("snapshot");
+        assert_eq!(row.state, "down");
+    }
+
+    struct FailingTransport;
+
+    impl HttpTransport for FailingTransport {
+        fn execute(&self, _request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+            Err(anyhow::anyhow!("connection refused"))
+        }
+    }
+
+    #[test]
+    fn last_clone_signal_transport_error_skips_every_target() {
+        let db = TempDb::new("last-clone-transport-error");
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        for id in ["prod", "test"] {
+            credentials.insert(id, r#"{"username":"reader","password":"secret"}"#);
+        }
+        LastCloneCollector::new(
+            vec![
+                env("prod", "acme-prod", true),
+                env("test", "acme-test", false),
+            ],
+            credentials,
+            ServiceNowClient::new(FailingTransport, SystemClock),
+            db.store(),
+        )
+        .collect()
+        .unwrap();
+        let store = db.store();
+        assert_eq!(skipped_reason(&store, "test"), "clone_source_unreachable");
+        let connection = store.open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, "prod", LAST_CLONE_SIGNAL_ID)
+            .unwrap()
+            .expect("snapshot");
+        assert_eq!(row.state, "down");
+        // Pins the transport arm rather than a credential lookup failure.
+        assert!(row.payload_json.contains("connection refused"));
     }
 }
