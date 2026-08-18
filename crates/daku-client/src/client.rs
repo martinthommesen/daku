@@ -97,10 +97,15 @@ impl DaemonClient {
 
     pub fn subscribe_dashboard(&self) -> Receiver<ServerMessage> {
         let (events, receiver) = unbounded();
-        for message in self.inner.dashboard_cache.lock().values() {
+        // Same lock order as the reader thread (cache, then dashboard) so the
+        // two can never deadlock, and held across both the replay drain and the
+        // registration so a message processed in between cannot slip past a
+        // subscriber that is about to exist.
+        let cache = self.inner.dashboard_cache.lock();
+        let mut dashboard = self.inner.dashboard.lock();
+        for message in cache.values() {
             let _ = events.send(message.clone());
         }
-        let mut dashboard = self.inner.dashboard.lock();
         // The reader thread flips `disconnected` and then clears this list
         // exactly once; a sender registered after that would never be dropped
         // and `recv()` would block forever instead of letting the caller move
@@ -312,6 +317,46 @@ mod tests {
         let receiver = client.subscribe_dashboard();
         assert!(receiver.recv().is_err());
         assert!(client.inner.dashboard.lock().is_empty());
+    }
+
+    /// Pins the invariant — replay is complete and registration happens in the
+    /// same critical section — not the race window itself, which is not
+    /// deterministically reproducible without instrumenting the reader thread.
+    #[test]
+    fn subscribe_dashboard_replays_the_cache_and_registers_atomically() {
+        let (outgoing, _rx) = unbounded();
+        let client = DaemonClient {
+            inner: Arc::new(ClientInner {
+                outgoing,
+                pending: Mutex::new(HashMap::new()),
+                dashboard: Mutex::new(Vec::new()),
+                dashboard_cache: Mutex::new(BTreeMap::new()),
+                disconnected: AtomicBool::new(false),
+            }),
+        };
+        for message in [
+            ServerMessage::SignalSnapshotsUpdated {
+                environment_id: "prod".into(),
+                snapshots: Vec::new(),
+            },
+            ServerMessage::EnvironmentsUpdated {
+                environments: Vec::new(),
+            },
+        ] {
+            let key = message.dashboard_cache_key().expect("cache key");
+            client.inner.dashboard_cache.lock().insert(key, message);
+        }
+
+        let receiver = client.subscribe_dashboard();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ServerMessage::EnvironmentsUpdated { .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ServerMessage::SignalSnapshotsUpdated { .. })
+        ));
+        assert_eq!(client.inner.dashboard.lock().len(), 1);
     }
 
     #[test]
