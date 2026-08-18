@@ -1,0 +1,54 @@
+{
+  "result": [
+    {
+      "state": "Completed",
+      "completed": "2026-01-15 12:00:00",
+      "target": "acme-test"
+    },
+    {
+      "state": "Completed",
+      "completed": "2026-01-14 12:00:00",
+      "target": "acme-test"
+    },
+    {
+      "state": "Completed",
+      "completed": "2026-01-13 12:00:00",
+      "target": "acme-test"
+    },
+    {
+      "state": "Completed",
+      "completed": "2026-01-12 12:00:00",
+      "target": "acme-test"
+    },
+    {
+      "state": "Completed",
+      "completed": "2026-01-11 12:00:00",
+      "target": "acme-test"
+    },
+    {
+      "state": "Completed",
+      "completed": "2026-01-10 12:00:00",
+      "target": "acme-test"
+    },
+    {
+      "state": "Completed",
+      "completed": "2026-01-09 12:00:00",
+      "target": "acme-test"
+    },
+    {
+      "state": "Completed",
+      "completed": "2026-01-08 12:00:00",
+      "target": "acme-test"
+    },
+    {
+      "state": "Completed",
+      "completed": "2026-01-07 12:00:00",
+      "target": "acme-test"
+    },
+    {
+      "state": "Completed",
+      "completed": "2026-01-06 12:00:00",
+      "target": "acme-test"
+    }
+  ]
+}

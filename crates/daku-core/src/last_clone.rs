@@ -15,7 +15,17 @@ use crate::persistence::{self, StateStore};
 use crate::servicenow::ServiceNowClient;
 
 pub const LAST_CLONE_SIGNAL_ID: &str = "last_clone";
-pub const CLONE_INSTANCE_PATH: &str = "/api/now/table/clone_instance?sysparm_query=state=Completed^ORDERBYDESCcompleted&sysparm_fields=state,completed,target&sysparm_limit=10";
+/// Rows read per tick, across all targets. A full page means older clones
+/// exist that this tick never saw — see `parse_last_clones`.
+pub const CLONE_PAGE_LIMIT: usize = 10;
+
+/// Built from `CLONE_PAGE_LIMIT` so the limit and the truncation check can
+/// never disagree.
+pub fn clone_instance_path() -> String {
+    format!(
+        "/api/now/table/clone_instance?sysparm_query=state=Completed^ORDERBYDESCcompleted&sysparm_fields=state,completed,target&sysparm_limit={CLONE_PAGE_LIMIT}"
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloneRow {
@@ -23,10 +33,14 @@ pub struct CloneRow {
     pub completed: String,
 }
 
-/// Newest Completed clone per target, in response order (already newest-first).
+/// Newest Completed clone per target, in response order (already newest-first),
+/// with the **raw** row count the response carried (before deduplication) —
+/// the caller compares that against the page limit to tell "no clone" from
+/// "not in the page I read".
 /// `None` = the source cannot answer (non-200 or unreadable body) — nothing is
-/// then known about any target. `Some(vec![])` = no clone has ever completed.
-pub fn parse_last_clones(status: u16, body: &str) -> Option<Vec<CloneRow>> {
+/// then known about any target. `Some((vec![], _))` = no clone has ever
+/// completed.
+pub fn parse_last_clones(status: u16, body: &str) -> Option<(Vec<CloneRow>, usize)> {
     if status != 200 {
         return None;
     }
@@ -51,7 +65,7 @@ pub fn parse_last_clones(status: u16, body: &str) -> Option<Vec<CloneRow>> {
             });
         }
     }
-    Some(newest)
+    Some((newest, rows.len()))
 }
 
 /// `clone_instance.target` is an instance name; tolerate a full hostname on
@@ -183,7 +197,7 @@ impl SignalCollector for LastCloneCollector {
             source,
             self.credentials.as_ref(),
             "GET",
-            CLONE_INSTANCE_PATH,
+            &clone_instance_path(),
             None,
         ) {
             Ok(response) if response.status == 200 || response.status == 403 => response,
@@ -222,11 +236,11 @@ impl SignalCollector for LastCloneCollector {
                 return Ok(());
             }
         };
-        let rows = parse_last_clones(response.status, &response.body);
-        persist_clone_source(&connection, &source.id, rows.is_some(), observed_at)?;
+        let parsed = parse_last_clones(response.status, &response.body);
+        persist_clone_source(&connection, &source.id, parsed.is_some(), observed_at)?;
         // 403: the source cannot list clones, so nothing is known about the
         // targets — record that rather than claiming "never" or waiting forever.
-        let Some(rows) = rows else {
+        let Some((rows, raw_rows)) = parsed else {
             skip_targets(
                 &connection,
                 &self.environments,
@@ -236,6 +250,13 @@ impl SignalCollector for LastCloneCollector {
             )?;
             return Ok(());
         };
+        // Same truncation test as `drift.rs`: a full page, or a total the
+        // source reports as larger than what came back.
+        let truncated = raw_rows >= CLONE_PAGE_LIMIT
+            || response
+                .header("X-Total-Count")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|count| count > raw_rows as u64);
         for environment in self
             .environments
             .iter()
@@ -244,7 +265,14 @@ impl SignalCollector for LastCloneCollector {
             let row = rows
                 .iter()
                 .find(|row| target_matches(&row.target, environment));
-            persist_clone_target(&connection, &environment.id, row, &source.id, observed_at)?;
+            persist_clone_target(
+                &connection,
+                &environment.id,
+                row,
+                &source.id,
+                truncated,
+                observed_at,
+            )?;
         }
         Ok(())
     }
@@ -296,6 +324,7 @@ fn persist_clone_target(
     environment_id: &str,
     row: Option<&CloneRow>,
     source_id: &str,
+    truncated: bool,
     observed_at: i64,
 ) -> io::Result<()> {
     let payload = match row {
@@ -308,6 +337,11 @@ fn persist_clone_target(
                 payload["age_days"] = age.into();
             }
             payload
+        }
+        // The page was full, so this target may simply be older than the rows
+        // read. Saying "never" would be a confident wrong answer.
+        None if truncated => {
+            serde_json::json!({ "supported": true, "completed": null, "unknown": "older_than_page" })
         }
         None => serde_json::json!({ "supported": true, "completed": null }),
     };
@@ -358,7 +392,8 @@ mod tests {
             200,
             include_str!("../tests/fixtures/last_clone/completed.json"),
         )
-        .expect("supported");
+        .expect("supported")
+        .0;
         assert_eq!(
             rows,
             vec![CloneRow {
@@ -379,7 +414,8 @@ mod tests {
     #[test]
     fn last_clone_signal_empty_is_supported_with_no_rows() {
         let rows = parse_last_clones(200, include_str!("../tests/fixtures/last_clone/empty.json"))
-            .expect("supported");
+            .expect("supported")
+            .0;
         assert!(rows.is_empty());
     }
 
@@ -389,7 +425,8 @@ mod tests {
             200,
             include_str!("../tests/fixtures/last_clone/two_targets.json"),
         )
-        .expect("supported");
+        .expect("supported")
+        .0;
         assert_eq!(
             rows,
             vec![
@@ -432,6 +469,7 @@ mod tests {
     struct LastCloneTransport {
         status: u16,
         body: &'static str,
+        total_count: Option<u64>,
     }
 
     impl HttpTransport for LastCloneTransport {
@@ -456,9 +494,13 @@ mod tests {
                 "last_clone must query the clone source only: {}",
                 request.url
             );
+            let mut headers = vec![("content-type".into(), "application/json".into())];
+            if let Some(total) = self.total_count {
+                headers.push(("X-Total-Count".into(), total.to_string()));
+            }
             Ok(HttpResponse {
                 status: self.status,
-                headers: vec![("content-type".into(), "application/json".into())],
+                headers,
                 body: self.body.into(),
             })
         }
@@ -476,6 +518,14 @@ mod tests {
     }
 
     fn collect_last_clone(status: u16, body: &'static str) -> (TempDb, StateStore) {
+        collect_last_clone_with_total(status, body, None)
+    }
+
+    fn collect_last_clone_with_total(
+        status: u16,
+        body: &'static str,
+        total_count: Option<u64>,
+    ) -> (TempDb, StateStore) {
         let db = TempDb::new("last-clone");
         let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
@@ -489,7 +539,14 @@ mod tests {
                 env("dev", "acme-dev", false),
             ],
             credentials,
-            ServiceNowClient::new(LastCloneTransport { status, body }, SystemClock),
+            ServiceNowClient::new(
+                LastCloneTransport {
+                    status,
+                    body,
+                    total_count,
+                },
+                SystemClock,
+            ),
             store,
         );
         collector.collect().unwrap();
@@ -567,6 +624,7 @@ mod tests {
                 LastCloneTransport {
                     status: 200,
                     body: "{}",
+                    total_count: None,
                 },
                 SystemClock,
             ),
@@ -709,5 +767,58 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
             assert_eq!(payload["skipped"], reason);
         }
+    }
+
+    #[test]
+    fn last_clone_full_page_marks_an_unmatched_target_unknown() {
+        let (_db, store) = collect_last_clone(
+            200,
+            include_str!("../tests/fixtures/last_clone/full_page.json"),
+        );
+        assert_eq!(payload(&store, "test")["completed"], "2026-01-15 12:00:00");
+        let dev = payload(&store, "dev");
+        assert_eq!(dev["unknown"], "older_than_page");
+        assert!(dev["completed"].is_null());
+    }
+
+    #[test]
+    fn last_clone_short_page_still_says_never_cloned() {
+        let (_db, store) = collect_last_clone(
+            200,
+            include_str!("../tests/fixtures/last_clone/completed.json"),
+        );
+        let dev = payload(&store, "dev");
+        assert_eq!(dev["supported"], true);
+        assert!(dev["completed"].is_null());
+        assert!(dev.get("unknown").is_none());
+    }
+
+    #[test]
+    fn last_clone_uses_total_count_when_present() {
+        let (_db, store) = collect_last_clone_with_total(
+            200,
+            include_str!("../tests/fixtures/last_clone/completed.json"),
+            Some(42),
+        );
+        assert_eq!(payload(&store, "dev")["unknown"], "older_than_page");
+        // A total equal to the raw row count is a complete page, not a
+        // truncated one — even though the deduplicated list is shorter.
+        let (_db, store) = collect_last_clone_with_total(
+            200,
+            include_str!("../tests/fixtures/last_clone/two_targets.json"),
+            Some(3),
+        );
+        assert_eq!(payload(&store, "dev")["completed"], "2026-01-02 03:00:00");
+    }
+
+    #[test]
+    fn parse_last_clones_reports_the_raw_row_count() {
+        let (rows, raw) = parse_last_clones(
+            200,
+            include_str!("../tests/fixtures/last_clone/two_targets.json"),
+        )
+        .expect("supported");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(raw, 3);
     }
 }

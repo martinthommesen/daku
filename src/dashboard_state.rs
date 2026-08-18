@@ -716,6 +716,13 @@ fn summarize_payload(signal_id: &str, payload_json: &str) -> String {
                     1 => "1 day ago".into(),
                     days => format!("{days} days ago"),
                 }
+            } else if value.get("unknown").and_then(|item| item.as_str()) == Some("older_than_page")
+            {
+                // Must precede the null-`completed` branch: this payload
+                // carries a null `completed` too. The 10 mirrors
+                // daku-core's CLONE_PAGE_LIMIT (the client does not depend on
+                // that crate).
+                "not in the last 10 clones".into()
             } else if value
                 .get("completed")
                 .is_some_and(serde_json::Value::is_null)
@@ -1185,6 +1192,13 @@ mod tests {
         assert_eq!(
             summarize_payload("last_clone", r#"{"supported":true,"completed":null}"#),
             "no clone found"
+        );
+        assert_eq!(
+            summarize_payload(
+                "last_clone",
+                r#"{"supported":true,"completed":null,"unknown":"older_than_page"}"#
+            ),
+            "not in the last 10 clones"
         );
     }
 
