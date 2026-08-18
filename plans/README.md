@@ -187,28 +187,28 @@ otherwise.
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
-| [047](047-unobserved-environment-is-not-healthy.md) | An Environment daku has never probed must not render as healthy and reachable ([#72](https://github.com/martinthommesen/daku/issues/72)) | P1 | S | — | TODO |
-| [048](048-last-clone-persists-every-target-on-failure.md) | Last-clone records why it has no answer when the clone-source probe fails ([#73](https://github.com/martinthommesen/daku/issues/73)) | P1 | S | — | TODO |
-| [050](050-compare-strip-one-reference-build.md) | The Compare strip tints against the same build it calls a mismatch, and the rule becomes testable ([#75](https://github.com/martinthommesen/daku/issues/75)) | P1 | S | — | TODO |
-| [051](051-local-daemon-reconnect-and-supervisor-test.md) | The supervisor recovers a local daemon whose socket dropped, and the restart loop finally has a test ([#76](https://github.com/martinthommesen/daku/issues/76)) | P1 | S–M | — | TODO |
+| [047](047-unobserved-environment-is-not-healthy.md) | An Environment daku has never probed must not render as healthy and reachable ([#72](https://github.com/martinthommesen/daku/issues/72)) | P1 | S | — | DONE |
+| [048](048-last-clone-persists-every-target-on-failure.md) | Last-clone records why it has no answer when the clone-source probe fails ([#73](https://github.com/martinthommesen/daku/issues/73)) | P1 | S | — | DONE |
+| [050](050-compare-strip-one-reference-build.md) | The Compare strip tints against the same build it calls a mismatch, and the rule becomes testable ([#75](https://github.com/martinthommesen/daku/issues/75)) | P1 | S | — | DONE |
+| [051](051-local-daemon-reconnect-and-supervisor-test.md) | The supervisor recovers a local daemon whose socket dropped, and the restart loop finally has a test ([#76](https://github.com/martinthommesen/daku/issues/76)) | P1 | S–M | — | DONE |
 | [049](049-drift-build-tri-state-skip-reason-and-asleep-gate.md) | Drift stops guessing — unknown builds are unknown, the skip reason is true, and asleep Environments are not probed ([#74](https://github.com/martinthommesen/daku/issues/74)) | P2 | S–M | 048 | TODO |
-| [052](052-release-integrity-cask-checksum-and-appcast.md) | Neither distribution channel ships bytes nobody verified ([#77](https://github.com/martinthommesen/daku/issues/77)) | P2 | S | — | TODO |
+| [052](052-release-integrity-cask-checksum-and-appcast.md) | Neither distribution channel ships bytes nobody verified ([#77](https://github.com/martinthommesen/daku/issues/77)) | P2 | S | — | DONE |
 | [053](053-client-state-hygiene.md) | Prune removed Environments, close the subscribe gap, mute the detail when disconnected ([#78](https://github.com/martinthommesen/daku/issues/78)) | P2 | S | 047 | TODO |
-| [054](054-poll-cadence-and-oauth-ttl-floor.md) | The poll interval means the poll interval, and an OAuth grant is never born expired ([#79](https://github.com/martinthommesen/daku/issues/79)) | P2 | S | — | TODO |
-| [055](055-panic-isolation-for-shared-collectors.md) | A panic in a shared collector cannot silently end polling ([#80](https://github.com/martinthommesen/daku/issues/80)) | P2 | S | — | TODO |
+| [054](054-poll-cadence-and-oauth-ttl-floor.md) | The poll interval means the poll interval, and an OAuth grant is never born expired ([#79](https://github.com/martinthommesen/daku/issues/79)) | P2 | S | — | DONE |
+| [055](055-panic-isolation-for-shared-collectors.md) | A panic in a shared collector cannot silently end polling ([#80](https://github.com/martinthommesen/daku/issues/80)) | P2 | S | — | DONE |
 | [056](056-parse-signal-payloads-once.md) | Parse each Signal payload once when it arrives, not once per element per frame ([#81](https://github.com/martinthommesen/daku/issues/81)) | P2 | M | 050 | TODO |
 | [057](057-last-clone-truncation-vs-never-cloned.md) | "No clone in the page I read" stops looking like "never cloned" ([#82](https://github.com/martinthommesen/daku/issues/82)) | P2 | S–M | 048 | TODO |
 | [058](058-drift-truncation-count-order-and-surface.md) | Drift knows when it only saw part of the inventory, and says so ([#83](https://github.com/martinthommesen/daku/issues/83)) | P3 | M | 049 | TODO |
 | [059](059-test-hygiene-sandbox-home-and-429-mapping.md) | Tests clean up after themselves, stop racing on the environment, and pin what a rate-limited Environment looks like ([#84](https://github.com/martinthommesen/daku/issues/84)) | P3 | S–M | soft 051 | TODO |
-| [060](060-docs-reconciliation.md) | The docs stop asserting things that are no longer true ([#85](https://github.com/martinthommesen/daku/issues/85)) | P3 | S | — | TODO |
-| [061](061-gpui-component-bump-recipe.md) | The documented recipe for bumping the UI toolkit actually works ([#86](https://github.com/martinthommesen/daku/issues/86)) | P3 | S | — | TODO |
-| [062](062-delete-fps-counter-and-i18n.md) | Delete the FPS counter that renders the word "FPS", and the i18n framework serving four English strings ([#87](https://github.com/martinthommesen/daku/issues/87)) | P3 | S | — | TODO |
+| [060](060-docs-reconciliation.md) | The docs stop asserting things that are no longer true ([#85](https://github.com/martinthommesen/daku/issues/85)) | P3 | S | — | DONE |
+| [061](061-gpui-component-bump-recipe.md) | The documented recipe for bumping the UI toolkit actually works ([#86](https://github.com/martinthommesen/daku/issues/86)) | P3 | S | — | REJECTED |
+| [062](062-delete-fps-counter-and-i18n.md) | Delete the FPS counter that renders the word "FPS", and the i18n framework serving four English strings ([#87](https://github.com/martinthommesen/daku/issues/87)) | P3 | S | — | DONE |
 | [063](063-typescript-typecheck-in-the-gate.md) | The TypeScript in this repo is type-checked, and the lint plugin is linted ([#88](https://github.com/martinthommesen/daku/issues/88)) | P3 | S | 052 | TODO |
-| [064](064-client-side-instance-url-check.md) | The desktop validates the URL it hands to macOS, instead of trusting the daemon ([#89](https://github.com/martinthommesen/daku/issues/89)) | P3 | S | — | TODO |
+| [064](064-client-side-instance-url-check.md) | The desktop validates the URL it hands to macOS, instead of trusting the daemon ([#89](https://github.com/martinthommesen/daku/issues/89)) | P3 | S | — | DONE |
 | [065](065-payload-key-contract-test.md) | The payload keys the daemon writes and the desktop reads are pinned to each other ([#90](https://github.com/martinthommesen/daku/issues/90)) | P3 | M | 048, 049, 057 | TODO |
-| [066](066-mid-ecc-drill-in-rows.md) | The MID/ECC Drill-in shows which MID is down, from data daku already fetches ([#91](https://github.com/martinthommesen/daku/issues/91)) | P2 | S | — | TODO |
+| [066](066-mid-ecc-drill-in-rows.md) | The MID/ECC Drill-in shows which MID is down, from data daku already fetches ([#91](https://github.com/martinthommesen/daku/issues/91)) | P2 | S | — | DONE |
 | [067](067-reload-command-spike.md) | **Spike** — how the Operator reloads config and forces a poll without relaunching ([#92](https://github.com/martinthommesen/daku/issues/92)) | P3 | M | 051 | TODO |
-| [068](068-daemon-setup-subcommand-spike.md) | **Spike** — should `daku-daemon` fix what `doctor` already diagnoses ([#93](https://github.com/martinthommesen/daku/issues/93)) | P3 | M | — | TODO |
+| [068](068-daemon-setup-subcommand-spike.md) | **Spike** — should `daku-daemon` fix what `doctor` already diagnoses ([#93](https://github.com/martinthommesen/daku/issues/93)) | P3 | M | — | DONE |
 
 ### Dependency notes
 
@@ -232,6 +232,32 @@ otherwise.
   003/007/026/027/031/046. If a corrected command *fails* rather than returning a
   different number, that is an incompletely-landed plan — 060 says to report it,
   not to edit the expectation.
+
+### Landing notes (2026-08-18)
+
+- **061 REJECTED** — Step 1 disproved the premise: `cargo update -p gpui-component --precise <sha>`
+  *does* move the locked commit of the rev-pinned git dependency (Cargo.lock goes to
+  `?rev=<old>#<new>`; `cargo metadata` resolves the new checkout). The documented recipe works;
+  README.md, Cargo.toml and ADR-0008 were left untouched. Two doc-hygiene observations for a future
+  pass: the second `cargo update -p gpui-component-assets` line is a redundant no-op (all four
+  longbridge crates share one source id), and the first command also moves every zed crate until
+  step 3 re-pins `gpui` — a maintainer who stops after command 1 has an unpinned zed.
+- **055** landed with a smaller change than Step 1 described: moving drift/last-clone into
+  `register_group` would have run them concurrently with the per-Environment groups, breaking the
+  group-then-shared ordering 049 depends on. Instead the shared collectors run in their own joined
+  `thread::scope` after the groups join, so a panic becomes a tick error rather than killing the
+  collector thread. `run_sequential(&self.shared)` and `register` therefore still exist.
+- **062** also removed `locales` from `scripts/dev.ts`'s watched directories (out of the plan's
+  Scope; `bun run dev` would otherwise throw ENOENT). `rust-i18n` remains in Cargo.lock as a
+  transitive dependency of gpui-component — that done criterion was written wrong.
+- **051** tests deviate from the plan's wording: a `kill`ed child makes `has_exited()` true, so the
+  socket-drop test SIGSTOPs the daemon and closes the client side instead; the respawn-failure test
+  chmods a copy of the daemon binary after startup. Supervisor tests are serialised by a file-local
+  mutex (`serialize_supervisor_tests()`).
+- **052**: `resources/Info.plist` still has no `SUPublicEDKey`, so a Sparkle-channel release is
+  blocked until the Operator generates a keypair (docs/packaging.md Appendix A item 4) — by design.
+- **068** recommends option C (`daku-daemon doctor --fix`) plus two one-line README fixes for the
+  `security add-generic-password` example (`-w` last, add `-U`); see docs/research/operator-setup.md.
 
 ### Findings considered and rejected
 
