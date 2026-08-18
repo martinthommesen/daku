@@ -193,19 +193,19 @@ otherwise.
 | [051](051-local-daemon-reconnect-and-supervisor-test.md) | The supervisor recovers a local daemon whose socket dropped, and the restart loop finally has a test ([#76](https://github.com/martinthommesen/daku/issues/76)) | P1 | S–M | — | DONE |
 | [049](049-drift-build-tri-state-skip-reason-and-asleep-gate.md) | Drift stops guessing — unknown builds are unknown, the skip reason is true, and asleep Environments are not probed ([#74](https://github.com/martinthommesen/daku/issues/74)) | P2 | S–M | 048 | DONE |
 | [052](052-release-integrity-cask-checksum-and-appcast.md) | Neither distribution channel ships bytes nobody verified ([#77](https://github.com/martinthommesen/daku/issues/77)) | P2 | S | — | DONE |
-| [053](053-client-state-hygiene.md) | Prune removed Environments, close the subscribe gap, mute the detail when disconnected ([#78](https://github.com/martinthommesen/daku/issues/78)) | P2 | S | 047 | TODO |
+| [053](053-client-state-hygiene.md) | Prune removed Environments, close the subscribe gap, mute the detail when disconnected ([#78](https://github.com/martinthommesen/daku/issues/78)) | P2 | S | 047 | DONE |
 | [054](054-poll-cadence-and-oauth-ttl-floor.md) | The poll interval means the poll interval, and an OAuth grant is never born expired ([#79](https://github.com/martinthommesen/daku/issues/79)) | P2 | S | — | DONE |
 | [055](055-panic-isolation-for-shared-collectors.md) | A panic in a shared collector cannot silently end polling ([#80](https://github.com/martinthommesen/daku/issues/80)) | P2 | S | — | DONE |
 | [056](056-parse-signal-payloads-once.md) | Parse each Signal payload once when it arrives, not once per element per frame ([#81](https://github.com/martinthommesen/daku/issues/81)) | P2 | M | 050 | DONE |
 | [057](057-last-clone-truncation-vs-never-cloned.md) | "No clone in the page I read" stops looking like "never cloned" ([#82](https://github.com/martinthommesen/daku/issues/82)) | P2 | S–M | 048 | DONE |
-| [058](058-drift-truncation-count-order-and-surface.md) | Drift knows when it only saw part of the inventory, and says so ([#83](https://github.com/martinthommesen/daku/issues/83)) | P3 | M | 049 | TODO |
-| [059](059-test-hygiene-sandbox-home-and-429-mapping.md) | Tests clean up after themselves, stop racing on the environment, and pin what a rate-limited Environment looks like ([#84](https://github.com/martinthommesen/daku/issues/84)) | P3 | S–M | soft 051 | TODO |
+| [058](058-drift-truncation-count-order-and-surface.md) | Drift knows when it only saw part of the inventory, and says so ([#83](https://github.com/martinthommesen/daku/issues/83)) | P3 | M | 049 | DONE |
+| [059](059-test-hygiene-sandbox-home-and-429-mapping.md) | Tests clean up after themselves, stop racing on the environment, and pin what a rate-limited Environment looks like ([#84](https://github.com/martinthommesen/daku/issues/84)) | P3 | S–M | soft 051 | DONE |
 | [060](060-docs-reconciliation.md) | The docs stop asserting things that are no longer true ([#85](https://github.com/martinthommesen/daku/issues/85)) | P3 | S | — | DONE |
 | [061](061-gpui-component-bump-recipe.md) | The documented recipe for bumping the UI toolkit actually works ([#86](https://github.com/martinthommesen/daku/issues/86)) | P3 | S | — | REJECTED |
 | [062](062-delete-fps-counter-and-i18n.md) | Delete the FPS counter that renders the word "FPS", and the i18n framework serving four English strings ([#87](https://github.com/martinthommesen/daku/issues/87)) | P3 | S | — | DONE |
 | [063](063-typescript-typecheck-in-the-gate.md) | The TypeScript in this repo is type-checked, and the lint plugin is linted ([#88](https://github.com/martinthommesen/daku/issues/88)) | P3 | S | 052 | DONE |
 | [064](064-client-side-instance-url-check.md) | The desktop validates the URL it hands to macOS, instead of trusting the daemon ([#89](https://github.com/martinthommesen/daku/issues/89)) | P3 | S | — | DONE |
-| [065](065-payload-key-contract-test.md) | The payload keys the daemon writes and the desktop reads are pinned to each other ([#90](https://github.com/martinthommesen/daku/issues/90)) | P3 | M | 048, 049, 057 | TODO |
+| [065](065-payload-key-contract-test.md) | The payload keys the daemon writes and the desktop reads are pinned to each other ([#90](https://github.com/martinthommesen/daku/issues/90)) | P3 | M | 048, 049, 057 | DONE |
 | [066](066-mid-ecc-drill-in-rows.md) | The MID/ECC Drill-in shows which MID is down, from data daku already fetches ([#91](https://github.com/martinthommesen/daku/issues/91)) | P2 | S | — | DONE |
 | [067](067-reload-command-spike.md) | **Spike** — how the Operator reloads config and forces a poll without relaunching ([#92](https://github.com/martinthommesen/daku/issues/92)) | P3 | M | 051 | DONE |
 | [068](068-daemon-setup-subcommand-spike.md) | **Spike** — should `daku-daemon` fix what `doctor` already diagnoses ([#93](https://github.com/martinthommesen/daku/issues/93)) | P3 | M | — | DONE |
@@ -281,6 +281,27 @@ otherwise.
 - **067** recommends option A — restart the local daemon via the existing `DaemonClient::shutdown`
   + supervisor respawn (~0.5 s measured), no protocol change; the build plan must add a
   local-vs-remote predicate on `DaemonSupervisor` first. See docs/research/reload-command.md.
+
+- **053**: `SignalCard.muted` is one-valued (`!connected`); `SidebarRow.muted` stays two-valued
+  (`!connected || never observed`). A third reason to mute is the trigger to replace both bools with
+  an enum. The subscribe test pins the invariant (replay + registration in one critical section),
+  not the race window itself.
+- **058**: `detail_from_value`/`detail_from_payload` now take `signal_id` first; the
+  "partial inventory" caveat is gated on the drift Signal id. Two distinct flags reach the client
+  and must not be merged: `truncated` (inventory page capped) and `mismatch_list_truncated` (plan
+  043's 50-row drill-in bound). Step 1 (Operator `sysparm_count` probe) was **not run** — the
+  trigger is unverified; if a count is near 1000, real pagination replaces this stopgap.
+- **059**: `crates/daku-daemon/tests/process.rs` still contains one `set_var("HOME")` (in
+  `supervisor_home`, under the file-wide `serialize_tests()` lock) — the parent's `daemon_log_stdio()`
+  reads ambient HOME, so sandboxing without it needs a `spawn_configured` signature change (out of
+  scope). `test_support::TempFile` is `pub(crate)`; daku-client got its own `TempSettings` guard.
+- **065** took option B: `crates/daku-core/src/payload_contract.rs` (test-only) regenerates 27
+  canonical payloads into `crates/daku-core/tests/fixtures/payloads.json` (re-bless with
+  `DAKU_BLESS_PAYLOADS=1 cargo test -p daku-core payload`), and `src/dashboard_state.rs` pins the
+  rendered summary/detail per case; `fixture_events()` (`DAKU_UI_FIXTURE=1`) is built from the same
+  cases, so the fixture UI's literal numbers changed. Finding left open: a `down` payload
+  (`persist_signal_down`, no counts) still summarizes as a confident zero ("0 HTTP fail") — one
+  guard next to the `skipped` guard in `summarize_value` would fix it.
 
 ### Findings considered and rejected
 
