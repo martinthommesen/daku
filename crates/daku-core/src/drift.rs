@@ -20,9 +20,14 @@ use crate::servicenow::ServiceNowClient;
 
 pub const DRIFT_SIGNAL_ID: &str = "drift";
 pub const PLUGIN_PAGE_LIMIT: usize = 1000;
-pub const SYS_PLUGINS_PATH: &str =
-    "/api/now/table/sys_plugins?sysparm_fields=id,version,active&sysparm_limit=1000";
-pub const SYS_STORE_APP_PATH: &str = "/api/now/table/sys_store_app?sysparm_fields=scope,id,version,latest_version,active&sysparm_limit=1000";
+/// Both paths order the page so that a capped page is the *same* slice on
+/// every Environment — two capped-but-aligned pages diff meaningfully, two
+/// capped-and-arbitrary ones do not. `sys_plugins.id` is populated and unique;
+/// `sys_store_app.id` is not (that is why `plugin_record` falls back to
+/// `scope`), so order that table by `sys_id`, which is non-null and unique on
+/// every table and need not appear in `sysparm_fields`.
+pub const SYS_PLUGINS_PATH: &str = "/api/now/table/sys_plugins?sysparm_fields=id,version,active&sysparm_query=ORDERBYid&sysparm_limit=1000";
+pub const SYS_STORE_APP_PATH: &str = "/api/now/table/sys_store_app?sysparm_fields=scope,id,version,latest_version,active&sysparm_query=ORDERBYsys_id&sysparm_limit=1000";
 
 /// Plugin/store-app inventories change on the order of days; refetch this
 /// often. Builds are still compared every tick via the availability snapshot.
@@ -291,12 +296,14 @@ fn fetch_plugin_page(
     if response.status != 200 {
         anyhow::bail!("HTTP {}", response.status);
     }
-    let records = parse_plugin_records(response.body.as_bytes())?;
+    // Count the rows the instance returned, not the ones that survived
+    // filtering: a full page containing unusable rows is still a full page.
+    let (records, raw_rows) = parse_plugin_records(response.body.as_bytes())?;
     let total = response
         .header("X-Total-Count")
         .and_then(|value| value.parse::<u64>().ok());
-    let truncated = records.len() >= PLUGIN_PAGE_LIMIT
-        || total.is_some_and(|count| count > records.len() as u64);
+    let truncated =
+        raw_rows >= PLUGIN_PAGE_LIMIT || total.is_some_and(|count| count > raw_rows as u64);
     Ok((records, truncated))
 }
 
@@ -344,13 +351,14 @@ fn reuse_availability_build(
         .map(str::to_owned)
 }
 
-fn parse_plugin_records(body: &[u8]) -> anyhow::Result<Vec<PluginRecord>> {
+/// Returns the usable records and the raw row count the instance returned.
+fn parse_plugin_records(body: &[u8]) -> anyhow::Result<(Vec<PluginRecord>, usize)> {
     let value: serde_json::Value = serde_json::from_slice(body)?;
     let rows = value
         .get("result")
         .and_then(|result| result.as_array())
         .ok_or_else(|| anyhow!("plugin response missing result array"))?;
-    Ok(rows.iter().filter_map(plugin_record).collect())
+    Ok((rows.iter().filter_map(plugin_record).collect(), rows.len()))
 }
 
 fn plugin_record(row: &serde_json::Value) -> Option<PluginRecord> {
@@ -648,6 +656,11 @@ mod tests {
                     "sys_plugins must cap at 1000: {}",
                     request.url
                 );
+                assert!(
+                    request.url.contains("ORDERBY"),
+                    "sys_plugins page must be ordered: {}",
+                    request.url
+                );
                 if source {
                     self.source_plugins
                 } else {
@@ -657,6 +670,11 @@ mod tests {
                 assert!(
                     request.url.contains("sysparm_limit=1000"),
                     "sys_store_app must cap at 1000: {}",
+                    request.url
+                );
+                assert!(
+                    request.url.contains("ORDERBY"),
+                    "sys_store_app page must be ordered: {}",
                     request.url
                 );
                 self.store_apps
@@ -923,6 +941,75 @@ mod tests {
             .expect("snapshot");
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["truncated"], true);
+    }
+
+    /// A full `sys_plugins` page where three rows carry no usable id — those
+    /// are dropped by `plugin_record`, so only the raw row count still sees a
+    /// full page. No `X-Total-Count`: the raw count must carry this alone.
+    struct FullPageTransport;
+
+    impl HttpTransport for FullPageTransport {
+        fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+            let body = if request.url.contains("/api/now/table/sys_plugins") {
+                let rows: Vec<serde_json::Value> = (0..PLUGIN_PAGE_LIMIT)
+                    .map(|index| {
+                        let id = if index < 3 {
+                            String::new()
+                        } else {
+                            format!("com.example.plugin_{index}")
+                        };
+                        serde_json::json!({ "id": id, "version": "1.0.0", "active": "true" })
+                    })
+                    .collect();
+                serde_json::json!({ "result": rows }).to_string()
+            } else if request.url.contains("/api/now/table/sys_store_app") {
+                include_str!("../tests/fixtures/drift/store_apps_empty.json").to_owned()
+            } else if request.url.contains("glide.war") {
+                include_str!("../tests/fixtures/availability/ok.json").to_owned()
+            } else {
+                panic!("unexpected drift URL: {}", request.url);
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body,
+            })
+        }
+    }
+
+    #[test]
+    fn drift_truncation_counts_unusable_rows() {
+        let db = TempDb::new("drift-fullpage");
+        let store = db.store();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
+        credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
+        let collector = DriftCollector::new(
+            vec![
+                env("prod", "acme-prod", true),
+                env("test", "acme-test", false),
+            ],
+            credentials,
+            ServiceNowClient::new(FullPageTransport, SystemClock),
+            store,
+            Duration::from_secs(120),
+        );
+        collector.collect().unwrap();
+        let connection = db.store().open().unwrap();
+        let row = persistence::load_signal_snapshot(&connection, "test", DRIFT_SIGNAL_ID)
+            .unwrap()
+            .expect("snapshot");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        assert_eq!(payload["truncated"], true);
+    }
+
+    #[test]
+    fn drift_requests_a_deterministic_order() {
+        assert!(SYS_PLUGINS_PATH.contains("ORDERBY"), "{SYS_PLUGINS_PATH}");
+        assert!(
+            SYS_STORE_APP_PATH.contains("ORDERBY"),
+            "{SYS_STORE_APP_PATH}"
+        );
     }
 
     struct NoGlideTransport;

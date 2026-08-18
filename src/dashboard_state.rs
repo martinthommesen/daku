@@ -558,7 +558,7 @@ impl DashboardState {
         else {
             return String::new();
         };
-        detail_from_value(&snapshot.payload)
+        detail_from_value(signal_id, &snapshot.payload)
     }
 
     /// Up to `limit` human lines ("id: 1.0.0 → 1.1.0", "id: missing here",
@@ -768,7 +768,7 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
     }
 }
 
-fn detail_from_value(value: &serde_json::Value) -> String {
+fn detail_from_value(signal_id: &str, value: &serde_json::Value) -> String {
     if let Some(reason) = value.get("skipped").and_then(|item| item.as_str()) {
         // The card's main line already reads "skipped"; do not repeat the word.
         return match reason {
@@ -781,6 +781,14 @@ fn detail_from_value(value: &serde_json::Value) -> String {
             "clone_source_asleep" => "clone source asleep".to_owned(),
             other => other.to_owned(),
         };
+    }
+    // Drift's `truncated` says the inventory page was capped, so the mismatch
+    // count is a floor. Distinct from `mismatch_list_truncated`, which bounds
+    // the drill-in list; keyed on the Signal so no other payload's `truncated`
+    // can pick this phrase up.
+    if signal_id == "drift" && value.get("truncated").and_then(|item| item.as_bool()) == Some(true)
+    {
+        return "partial inventory — plugin counts may be incomplete".to_owned();
     }
     ["error", "detail"]
         .iter()
@@ -798,8 +806,8 @@ fn summarize_payload(signal_id: &str, payload_json: &str) -> String {
 }
 
 #[cfg(test)]
-fn detail_from_payload(payload_json: &str) -> String {
-    detail_from_value(&parse_payload(payload_json))
+fn detail_from_payload(signal_id: &str, payload_json: &str) -> String {
+    detail_from_value(signal_id, &parse_payload(payload_json))
 }
 
 #[cfg(test)]
@@ -1262,36 +1270,63 @@ mod tests {
     fn card_detail_reads_error_and_detail() {
         assert_eq!(
             detail_from_payload(
+                "availability",
                 r#"{"reachability":"unreachable","error":"no credential for environment prod"}"#
             ),
             "no credential for environment prod"
         );
         assert_eq!(
-            detail_from_payload(r#"{"reachability":"unreachable","detail":"HTTP 429"}"#),
+            detail_from_payload(
+                "availability",
+                r#"{"reachability":"unreachable","detail":"HTTP 429"}"#
+            ),
             "HTTP 429"
         );
-        assert_eq!(detail_from_payload("{}"), "");
-        assert_eq!(detail_from_payload("not json"), "");
+        assert_eq!(detail_from_payload("availability", "{}"), "");
+        assert_eq!(detail_from_payload("availability", "not json"), "");
         // `error` is a count in the jobs payload, not a message.
-        assert_eq!(detail_from_payload(r#"{"overdue_ready":2,"error":1}"#), "");
+        assert_eq!(
+            detail_from_payload("jobs", r#"{"overdue_ready":2,"error":1}"#),
+            ""
+        );
     }
 
     #[test]
     fn card_detail_phrases_skipped() {
         assert_eq!(
-            detail_from_payload(r#"{"skipped":"asleep"}"#),
+            detail_from_payload("jobs", r#"{"skipped":"asleep"}"#),
             "Environment asleep"
         );
         assert_eq!(
-            detail_from_payload(r#"{"skipped":"need_two_environments"}"#),
+            detail_from_payload("drift", r#"{"skipped":"need_two_environments"}"#),
             "needs two Environments"
         );
         assert_eq!(
-            detail_from_payload(r#"{"skipped":"clone_source_unreachable"}"#),
+            detail_from_payload("last_clone", r#"{"skipped":"clone_source_unreachable"}"#),
             "clone source unreachable"
         );
         assert_eq!(
-            detail_from_payload(r#"{"skipped":"clone_source_asleep"}"#),
+            detail_from_payload("last_clone", r#"{"skipped":"clone_source_asleep"}"#),
+            "clone source asleep"
+        );
+    }
+
+    #[test]
+    fn card_detail_flags_a_partial_drift_inventory() {
+        assert_eq!(
+            detail_from_payload("drift", r#"{"mismatches":3,"truncated":true}"#),
+            "partial inventory — plugin counts may be incomplete"
+        );
+        assert_eq!(
+            detail_from_payload("drift", r#"{"mismatches":3,"truncated":false}"#),
+            ""
+        );
+        // A skipped drift probe read no inventory at all.
+        assert_eq!(
+            detail_from_payload(
+                "drift",
+                r#"{"skipped":"clone_source_asleep","truncated":true}"#
+            ),
             "clone source asleep"
         );
     }
