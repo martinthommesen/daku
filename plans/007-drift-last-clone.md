@@ -74,7 +74,9 @@ Post-clone drift and last-clone date are Signals #5–#6. Drift compares Environ
 
 ### Step 4: HTTP + register on loop
 
-**Verify**: `cargo test -p daku-core drift last_clone` → pass; `cargo check` exit 0; no private timers.
+**Verify**: `cargo test -p daku-core drift` → 14 passed;
+`cargo test -p daku-core last_clone` → 12 passed; `cargo check` exit 0; no
+private timers.
 
 ### Step 5: Example JSON field
 

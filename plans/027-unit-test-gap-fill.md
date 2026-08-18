@@ -167,7 +167,8 @@ Tests (model on `servicenow_http_oauth_cache_skips_second_token_fetch`, `:576`):
 6. `servicenow_http_oauth_secret_is_form_urlencoded`: credential blob `{"client_id":"id","client_secret":"a&b=c d+e%"}` with `[token_ok("t"), ok_table()]` → the token request body contains `client_secret=a%26b%3Dc%20d%2Be%25`.
 7. `urlencode_keeps_unreserved_and_escapes_the_rest`: `urlencode("AZaz09-_.~") == "AZaz09-_.~"`, `urlencode(" /?#") == "%20%2F%3F%23"`.
 
-**Verify**: `cargo test -p daku-core servicenow_http urlencode` → all pass (existing 7 + 7 new).
+**Verify**: `cargo test -p daku-core servicenow_http` → 16 passed;
+`cargo test -p daku-core urlencode` → 2 passed.
 
 ### Step 3: `load_environments` negatives (`crates/daku-core/src/config.rs` and `collector.rs` `mod tests`)
 
@@ -179,7 +180,8 @@ Helper in `config.rs` tests: `fn write_temp(name: &str, body: &str) -> PathBuf` 
 4. `load_environments_sorts_by_sort_order_and_keeps_duplicate_ids`: two entries with `sort_order` 2 then 1 → returned order 1, 2; two entries sharing `"id":"prod"` → `Ok` with `len() == 2` (**pins current behaviour**; note it in the report as a candidate for validation).
 5. In `collector.rs` tests: `start_default_loop_returns_none_for_missing_and_empty_config`: `start_default_loop(&nonexistent_path, StateStore::daemon(temp db path), &DaemonSettings::default(), Arc::new(AtomicBool::new(false)))` → `None`; with a file containing `[]` → `None`. (No thread is spawned in either case — verify by reading `collector.rs:155-178`.)
 
-**Verify**: `cargo test -p daku-core load_environments start_default_loop` → 5 passed.
+**Verify**: `cargo test -p daku-core load_environments` → 8 passed;
+`cargo test -p daku-core start_default_loop` → 1 passed.
 
 ### Step 4: Real tests for client persistence (`crates/daku-client/src/persistence.rs`)
 
@@ -223,9 +225,11 @@ Delete `desktop_settings_paths_are_build_specific`. Add tests (temp dir per test
 ## Done criteria
 
 - [ ] `cargo test -p daku dashboard_state` → ≥15 passed
-- [ ] `cargo test -p daku-core servicenow_http urlencode` → ≥14 passed
-- [ ] `cargo test -p daku-core load_environments start_default_loop` → 5 passed
-- [ ] `cargo test -p daku-client app_settings` → 4 passed; `load_or_create_app_settings_at` exists and `load_or_create_app_settings` is a one-line wrapper
+- [ ] `cargo test -p daku-core servicenow_http` → 16 passed
+- [ ] `cargo test -p daku-core urlencode` → 2 passed
+- [ ] `cargo test -p daku-core load_environments` → 8 passed
+- [ ] `cargo test -p daku-core start_default_loop` → 1 passed
+- [ ] `cargo test -p daku-client app_settings` → 1 passed — only `missing_app_settings_are_written_with_a_token` matches this filter. For all three Step 4 tests use `cargo test -p daku-client persistence` → 3 passed (`missing_app_settings_are_written_with_a_token`, `an_empty_token_is_minted_and_rewritten`, `a_persisted_token_survives_legacy_keys_without_a_rewrite`); `load_or_create_app_settings_at` exists and `load_or_create_app_settings` is a one-line wrapper
 - [ ] `grep -n 'if !library.exists() { return; }' src/updater.rs` → no matches (or the test no longer exists)
 - [ ] `bun run check` exits 0
 - [ ] `git status` shows only in-scope files modified

@@ -100,7 +100,8 @@ Existing tests to model after: `process.rs:622-643` (`browser_origins_are_exact_
 
 | Purpose | Command | Expected on success |
 |---------|---------|---------------------|
-| Unit tests (process helpers) | `cargo test -p daku-client validate_ ensure_token` | pass |
+| Unit tests (process helpers) | `cargo test -p daku-client validate_` | pass |
+| Unit tests (token minting) | `cargo test -p daku-client ensure_token` | pass |
 | Black-box test | `cargo test -p daku-daemon --test process` | all pass |
 | Confirm hermetic | `ls -la <tempdir>/.daku` printed by the test | contains `settings.json`, `app.db`; **no** `environments.json` |
 | Gate | `bun run check` | exit 0 |
@@ -152,7 +153,8 @@ In `crates/daku-client/src/process.rs` `mod tests` add:
     }
 ```
 
-**Verify**: `cargo test -p daku-client exposure_validate ensure_token` → 2 passed.
+**Verify**: `cargo test -p daku-client exposure_validate` → 1 passed;
+`cargo test -p daku-client ensure_token` → 1 passed.
 
 ### Step 2: Dev-dependency
 
@@ -245,7 +247,8 @@ Tests:
 - [ ] `cargo test -p daku-daemon --test process` → ≥3 passed, three consecutive runs green
 - [ ] `grep -n 'CARGO_BIN_EXE_daku-daemon' crates/daku-daemon/tests/process.rs` → 1 match
 - [ ] `grep -n 'HOME' crates/daku-daemon/tests/process.rs` → every daemon spawn sets/inherits a sandbox `HOME`; `grep -n '\.daku' crates/daku-daemon/tests/process.rs` refers only to paths under the sandbox
-- [ ] `cargo test -p daku-client exposure_validate ensure_token` → 2 passed
+- [ ] `cargo test -p daku-client exposure_validate` → 1 passed
+- [ ] `cargo test -p daku-client ensure_token` → 1 passed
 - [ ] `bun run check` exits 0
 - [ ] `git status` shows only in-scope files modified
 - [ ] `plans/README.md` status row for 026 updated

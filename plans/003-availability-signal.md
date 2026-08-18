@@ -112,7 +112,10 @@ Register availability; loop interval from config (default 120). Test loop invoke
 
 ## Done criteria
 
-- [x] `cargo test -p daku-core classify_availability servicenow_http persist_availability_snapshot collector_loop` exit 0
+- [x] `cargo test -p daku-core classify_availability` exit 0 (5 passed)
+- [x] `cargo test -p daku-core servicenow_http` exit 0 (16 passed)
+- [x] `cargo test -p daku-core persist_availability_snapshot` exit 0 (1 passed)
+- [x] `cargo test -p daku-core collector_loop` exit 0 (5 passed)
 - [x] `cargo check -p daku-core -p daku-daemon` exit 0
 - [x] `rg -n 'Retry-After|retry_after' crates/daku-core` → ≥1 hit
 - [x] `rg -n 'client_credentials|oauth_token' crates/daku-core` → ≥1 hit

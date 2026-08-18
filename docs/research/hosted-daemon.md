@@ -7,8 +7,9 @@ first, shared later … a future shared host needs an explicit security pass"
 and "shared host deferred". This note writes down what that seam actually is
 today, what a hosted daemon would cost, and which option we take now.
 
-Verified against the tree at plan 042's branch point (`e6f45b4`); every claim
-carries a `file:line`.
+Verified against the tree at plan 042's branch point (`e6f45b4`). Most claims
+carry a `file:line` from that commit; the passages reconciled with `HEAD` under
+plan 060 cite symbol names instead, because line numbers rot.
 
 ## What exists
 
@@ -22,8 +23,6 @@ carries a `file:line`.
   daemon.
 - `crates/daku-client/src/process.rs:494` — `monitor_daemon` returns
   immediately for `Remote`: a remote daemon is never reconnected (plan 018).
-- `crates/daku-client/src/process.rs:411` — `is_remote()` has no caller
-  outside that file; the UI cannot tell the two modes apart.
 - `crates/daku-daemon/src/main.rs:93-96,113-135` — `--bind`,
   `--allow-non-loopback`, repeated `--allow-origin`.
 - `crates/daku-daemon/src/main.rs:83-90` — `ensure_bind_allowed` refuses a
@@ -41,12 +40,9 @@ carries a `file:line`.
   `allowed_origins: ["http://localhost:3001"]` (a waku web-client leftover),
   token minted once (`:54-65`); `bind_address()` becomes `0.0.0.0:<port>`
   when `enabled` (`:87-96`).
-- `crates/daku-client/src/persistence.rs:39,48,128,138` — the block is
-  persisted as `daemon_exposure` in `~/.daku/app.json`. Its only reader is
-  `src/daemon.rs:35`; no UI writes it, and `reconfigure`
-  (`crates/daku-client/src/process.rs:421`) has no caller.
-- `src/daemon.rs:41-61` — `local_hostname()`, written to "show a useful LAN
-  URL" in Settings; no caller anywhere.
+- `crates/daku-client/src/persistence.rs` — the block is persisted as
+  `daemon_exposure` in `~/.daku/app.json` (`AppSettings.daemon_exposure`). Its
+  only reader is `src/daemon.rs`; no UI writes it.
 
 Verified manually while writing this note: `daku-daemon --bind 127.0.0.1:0`
 prints its JSON ready line, a `/v1` handshake with the right token receives
@@ -56,11 +52,9 @@ prints its JSON ready line, a `/v1` handshake with the right token receives
 ## Options
 
 **(A) Local-only — delete the desktop exposure plumbing, keep env attach.**
-Delete `DaemonExposureSettings` and `AppSettings.daemon_exposure`
-(`crates/daku-client/src/process.rs:35-126`,
-`crates/daku-client/src/persistence.rs:39`), `spawn_configured`/`reconfigure`
-/`is_remote` (`crates/daku-client/src/process.rs:334,411,421`), and
-`local_hostname` (`src/daemon.rs:41-61`). Keep the daemon's `--bind`,
+Delete `DaemonExposureSettings`, `AppSettings.daemon_exposure` and
+`spawn_configured` (`crates/daku-client/src/process.rs`,
+`crates/daku-client/src/persistence.rs`). Keep the daemon's `--bind`,
 `--allow-non-loopback` and `--allow-origin` — that is the envelope any hosted
 step needs, and it is already tested
 (`crates/daku-daemon/src/main.rs:173-176`). Keep the `DAKU_DAEMON_ADDRESS`
@@ -90,10 +84,18 @@ Required before any non-loopback bind is supported (i.e. before (B)):
   crosses `ws://` in clear text.
 - Token provisioning and rotation: today the token is an env var read once
   (`crates/daku-daemon/src/main.rs` via `DAEMON_TOKEN_ENV`,
-  `crates/daku-protocol/src/protocol.rs:10`), and an empty token is accepted
-  (`crates/daku-core/src/server.rs:473-475`) — closes when plan 012 lands.
+  `crates/daku-protocol/src/protocol.rs`). **The empty-token half is closed**
+  (plan 012): `require_token` in `crates/daku-daemon/src/main.rs` refuses a
+  missing or whitespace-only `DAKU_DAEMON_TOKEN`, and
+  `DaemonExposureSettings::validate` in `crates/daku-client/src/process.rs`
+  refuses one again before spawning. `token_matches`
+  (`crates/daku-core/src/server.rs`) still compares constant-time without its
+  own empty check; no caller can reach it with an empty expected token.
+  Provisioning and rotation remain open.
 - `UpdateSettings` authorisation: any authenticated client rewrites
-  `~/.daku/settings.json` (`crates/daku-core/src/hollow_backend.rs:32-35`).
+  `~/.daku/settings.json` (`SettingsBackend` in
+  `crates/daku-core/src/settings_backend.rs`, wired at
+  `crates/daku-daemon/src/main.rs`).
 - Request-thread cap: connections are capped at 64
   (`crates/daku-core/src/server.rs:27,232`) but `dispatch_request` spawns an
   unbounded thread per request (`crates/daku-core/src/server.rs:390-399`).
@@ -114,15 +116,15 @@ Required before any non-loopback bind is supported (i.e. before (B)):
   (`crates/daku-core/src/collector.rs:194`,
   `crates/daku-core/src/server.rs:214-222`); `Hub::subscribe` replays the
   inherited waku journal, not dashboard state
-  (`crates/daku-core/src/server.rs:142-158`), so a reconnecting remote client
-  sees nothing until the next tick — closes when plan 014 lands.
+  (`crates/daku-core/src/server.rs`) — **closed** by plan 014: `Hub::subscribe`
+  now replays the retained dashboard messages to a new subscriber before
+  registering it, so a reconnecting client no longer waits for the next tick.
 
 ## Recommendation
 
 Take **(A) now, keeping the `DAKU_DAEMON_ADDRESS` attach path**. The desktop
-exposure block is unreachable configuration — no UI reads or writes it, its
-default origin is waku residue, and `local_hostname` has no caller — so it is
-cost with no user. The daemon-side `--bind`/`--allow-non-loopback`
+exposure block is unreachable configuration — no UI reads or writes it and its
+default origin is waku residue — so it is cost with no user. The daemon-side `--bind`/`--allow-non-loopback`
 /`--allow-origin` flags stay: they are the tested envelope (B) would build on,
 and they cost nothing while `enabled` is unreachable. (B) is the documented
 next step, to be planned only when a second machine is actually wanted, and it
@@ -131,17 +133,21 @@ need this answer to delete safely.
 
 ## Follow-up plan stubs
 
-- **Under (A) — "Delete the desktop daemon-exposure plumbing" (S)**, folded
-  into plan 020's settings cleanup. In scope:
-  `crates/daku-client/src/process.rs` (`DaemonExposureSettings`,
-  `parse_allowed_origins`, `allowed_origins_text`,
-  `with_allowed_origins_text`, `ensure_token`, `bind_address`,
-  `DaemonProcess::spawn_configured`, `DaemonSupervisor::spawn_configured`,
-  `reconfigure`, `is_remote`, the `exposure` field on `SupervisorInner`),
-  `crates/daku-client/src/persistence.rs` (`AppSettings.daemon_exposure` and
-  its migration read at `:128,138`), `src/daemon.rs` (`local_hostname`, the
-  `spawn_configured` call site → `DaemonSupervisor::spawn`). Out of scope:
-  `crates/daku-daemon/src/main.rs` flags and `crates/daku-core/src/server.rs`.
+- **Under (A) — "Delete the desktop daemon-exposure plumbing" (S)**, **half
+  landed**. Plans 018/020/032 deleted the three callerless helpers this note
+  originally listed — the LAN-URL helper in `src/daemon.rs` and the supervisor's
+  re-configure and remote-mode predicates in
+  `crates/daku-client/src/process.rs`; none of them exists at `HEAD`. The rest
+  is **still live** and still needs its own plan and a smoke run, because
+  `spawn_configured` has a caller on the app-launch path: `DaemonExposureSettings`, `parse_allowed_origins`,
+  `allowed_origins_text`, `with_allowed_origins_text`, `ensure_token`,
+  `bind_address`, `DaemonProcess::spawn_configured` and
+  `DaemonSupervisor::spawn_configured` in
+  `crates/daku-client/src/process.rs`; `AppSettings.daemon_exposure` and its
+  migration read in `crates/daku-client/src/persistence.rs`; the
+  `spawn_configured` call site in `src/daemon.rs` (→ `DaemonSupervisor::spawn`).
+  Out of scope: `crates/daku-daemon/src/main.rs` flags and
+  `crates/daku-core/src/server.rs`.
 - **Under (B), when wanted — "Remote daemon support" (L)**: plan 018
   (reconnect) first, then a `CredentialStore` implementation behind a daemon
   flag, then the security-pass checklist as its done criteria.

@@ -316,7 +316,9 @@ For each of jobs, syslog, outbound, mid_ecc, availability:
 - `last_clone.rs`: `persist_last_clone_unreachable` → `persistence::persist_signal_down(.., LAST_CLONE_SIGNAL_ID, ..)`. Update the two tests that assert `"healthy"` for the unreachable case (`last_clone_signal_probe_failure_is_healthy_unreachable` → rename `…_is_down_unreachable`, expect `"down"`); the 403 "unsupported" case stays `Healthy` with `{supported:false}`. Add a `health_rollup` test `health_rollup_last_clone_down_does_not_vote` (already covered by `health_rollup_last_clone_never_votes_degraded` — extend it with a `Down` vote).
 - Use `collector::unix_now()` in both instead of the inline `SystemTime` expression.
 
-**Verify**: `cargo test -p daku-core drift_signal last_clone_signal health_rollup` → all pass.
+**Verify**: `cargo test -p daku-core drift_signal` → 9 passed;
+`cargo test -p daku-core last_clone_signal` → 8 passed;
+`cargo test -p daku-core health_rollup` → 11 passed.
 
 ### Step 6: Gate + proof
 

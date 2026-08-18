@@ -50,7 +50,9 @@ As plan 044. One commit: `Add Signal card selection, drill-in region, and Servic
 
 ### Step 1: Model
 `select_card(signal_id)` toggles `selected_card` (clicking the selected card closes the region); `select(env)` keeps `selected_card`. `signal_url(signal_id) -> Option<String>` builds `instance_url` + path (percent-encoded), `None` without a selected Environment. `drill_in(signal_id) -> DrillIn` where `enum DrillIn { Rows { headers: Vec<&'static str>, rows: Vec<Vec<String>>, truncated: bool }, Trend(Vec<f64>), Text(String), Empty }`: drift → Rows(id / this / other) from `mismatch_list` (all rows, ≤50; `truncated` from `mismatch_list_truncated`); last_clone → Rows(completed / age / source) or Text("clone source"); jobs/syslog → Trend(samples); availability/mid_ecc/outbound → Text(card_detail or summary). Tests: toggle semantics, `signal_url` encoding, drift rows from the fixture, trend from fixture samples.
-**Verify**: `cargo test -p daku drill_in signal_url select_card` → all pass.
+**Verify**: `cargo test -p daku drill_in` → 2 passed;
+`cargo test -p daku signal_url` → 1 passed;
+`cargo test -p daku select_card` → 1 passed.
 
 ### Step 2: Render
 Card: `.id(signal_id).cursor_pointer().on_click(cx.listener(..select_card..))`, selected → `border_color(accent)`; add a small "Open ↗" ghost `Button`/`Link` in the card title row (stops propagation, `cx.open_url`). Under the card grid, when `selected_card.is_some()`: a bordered region titled `signal_label` with the `DrillIn` content (Rows → `Table` or striped `v_flex`; Trend → tall sparkline; Text → paragraph; truncated → "… and N more" from `mismatches`).
