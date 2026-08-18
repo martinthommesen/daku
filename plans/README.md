@@ -191,23 +191,23 @@ otherwise.
 | [048](048-last-clone-persists-every-target-on-failure.md) | Last-clone records why it has no answer when the clone-source probe fails ([#73](https://github.com/martinthommesen/daku/issues/73)) | P1 | S | — | DONE |
 | [050](050-compare-strip-one-reference-build.md) | The Compare strip tints against the same build it calls a mismatch, and the rule becomes testable ([#75](https://github.com/martinthommesen/daku/issues/75)) | P1 | S | — | DONE |
 | [051](051-local-daemon-reconnect-and-supervisor-test.md) | The supervisor recovers a local daemon whose socket dropped, and the restart loop finally has a test ([#76](https://github.com/martinthommesen/daku/issues/76)) | P1 | S–M | — | DONE |
-| [049](049-drift-build-tri-state-skip-reason-and-asleep-gate.md) | Drift stops guessing — unknown builds are unknown, the skip reason is true, and asleep Environments are not probed ([#74](https://github.com/martinthommesen/daku/issues/74)) | P2 | S–M | 048 | TODO |
+| [049](049-drift-build-tri-state-skip-reason-and-asleep-gate.md) | Drift stops guessing — unknown builds are unknown, the skip reason is true, and asleep Environments are not probed ([#74](https://github.com/martinthommesen/daku/issues/74)) | P2 | S–M | 048 | DONE |
 | [052](052-release-integrity-cask-checksum-and-appcast.md) | Neither distribution channel ships bytes nobody verified ([#77](https://github.com/martinthommesen/daku/issues/77)) | P2 | S | — | DONE |
 | [053](053-client-state-hygiene.md) | Prune removed Environments, close the subscribe gap, mute the detail when disconnected ([#78](https://github.com/martinthommesen/daku/issues/78)) | P2 | S | 047 | TODO |
 | [054](054-poll-cadence-and-oauth-ttl-floor.md) | The poll interval means the poll interval, and an OAuth grant is never born expired ([#79](https://github.com/martinthommesen/daku/issues/79)) | P2 | S | — | DONE |
 | [055](055-panic-isolation-for-shared-collectors.md) | A panic in a shared collector cannot silently end polling ([#80](https://github.com/martinthommesen/daku/issues/80)) | P2 | S | — | DONE |
-| [056](056-parse-signal-payloads-once.md) | Parse each Signal payload once when it arrives, not once per element per frame ([#81](https://github.com/martinthommesen/daku/issues/81)) | P2 | M | 050 | TODO |
-| [057](057-last-clone-truncation-vs-never-cloned.md) | "No clone in the page I read" stops looking like "never cloned" ([#82](https://github.com/martinthommesen/daku/issues/82)) | P2 | S–M | 048 | TODO |
+| [056](056-parse-signal-payloads-once.md) | Parse each Signal payload once when it arrives, not once per element per frame ([#81](https://github.com/martinthommesen/daku/issues/81)) | P2 | M | 050 | DONE |
+| [057](057-last-clone-truncation-vs-never-cloned.md) | "No clone in the page I read" stops looking like "never cloned" ([#82](https://github.com/martinthommesen/daku/issues/82)) | P2 | S–M | 048 | DONE |
 | [058](058-drift-truncation-count-order-and-surface.md) | Drift knows when it only saw part of the inventory, and says so ([#83](https://github.com/martinthommesen/daku/issues/83)) | P3 | M | 049 | TODO |
 | [059](059-test-hygiene-sandbox-home-and-429-mapping.md) | Tests clean up after themselves, stop racing on the environment, and pin what a rate-limited Environment looks like ([#84](https://github.com/martinthommesen/daku/issues/84)) | P3 | S–M | soft 051 | TODO |
 | [060](060-docs-reconciliation.md) | The docs stop asserting things that are no longer true ([#85](https://github.com/martinthommesen/daku/issues/85)) | P3 | S | — | DONE |
 | [061](061-gpui-component-bump-recipe.md) | The documented recipe for bumping the UI toolkit actually works ([#86](https://github.com/martinthommesen/daku/issues/86)) | P3 | S | — | REJECTED |
 | [062](062-delete-fps-counter-and-i18n.md) | Delete the FPS counter that renders the word "FPS", and the i18n framework serving four English strings ([#87](https://github.com/martinthommesen/daku/issues/87)) | P3 | S | — | DONE |
-| [063](063-typescript-typecheck-in-the-gate.md) | The TypeScript in this repo is type-checked, and the lint plugin is linted ([#88](https://github.com/martinthommesen/daku/issues/88)) | P3 | S | 052 | TODO |
+| [063](063-typescript-typecheck-in-the-gate.md) | The TypeScript in this repo is type-checked, and the lint plugin is linted ([#88](https://github.com/martinthommesen/daku/issues/88)) | P3 | S | 052 | DONE |
 | [064](064-client-side-instance-url-check.md) | The desktop validates the URL it hands to macOS, instead of trusting the daemon ([#89](https://github.com/martinthommesen/daku/issues/89)) | P3 | S | — | DONE |
 | [065](065-payload-key-contract-test.md) | The payload keys the daemon writes and the desktop reads are pinned to each other ([#90](https://github.com/martinthommesen/daku/issues/90)) | P3 | M | 048, 049, 057 | TODO |
 | [066](066-mid-ecc-drill-in-rows.md) | The MID/ECC Drill-in shows which MID is down, from data daku already fetches ([#91](https://github.com/martinthommesen/daku/issues/91)) | P2 | S | — | DONE |
-| [067](067-reload-command-spike.md) | **Spike** — how the Operator reloads config and forces a poll without relaunching ([#92](https://github.com/martinthommesen/daku/issues/92)) | P3 | M | 051 | TODO |
+| [067](067-reload-command-spike.md) | **Spike** — how the Operator reloads config and forces a poll without relaunching ([#92](https://github.com/martinthommesen/daku/issues/92)) | P3 | M | 051 | DONE |
 | [068](068-daemon-setup-subcommand-spike.md) | **Spike** — should `daku-daemon` fix what `doctor` already diagnoses ([#93](https://github.com/martinthommesen/daku/issues/93)) | P3 | M | — | DONE |
 
 ### Dependency notes
@@ -258,6 +258,29 @@ otherwise.
   blocked until the Operator generates a keypair (docs/packaging.md Appendix A item 4) — by design.
 - **068** recommends option C (`daku-daemon doctor --fix`) plus two one-line README fixes for the
   `security add-generic-password` example (`-w` last, add `-U`); see docs/research/operator-setup.md.
+
+- **049**: non-source Environments now get `clone_source_asleep` / `clone_source_unreachable`
+  (with client phrase arms) instead of the bare reachability string the plan described — writing
+  `asleep` on an awake target's card would recreate the plan's own defect 2. Wire contract change:
+  `drift.build_matches` is `true` / `false` / `null` (`null` = at least one build unreadable, never
+  agreement); drift skip reasons now include `no_clone_source`.
+- **057**: `CLONE_INSTANCE_PATH` (const) became `clone_instance_path()` built from
+  `pub const CLONE_PAGE_LIMIT = 10`; the client's "not in the last 10 clones" phrase hardcodes the 10
+  with a comment. Step 1 (Operator probe of the `state=Completed` filter against a live instance) was
+  **not run** — the `clone_instance` shape stays `[unverified]` in docs/research/servicenow-signals.md.
+  One-request-per-target is recorded as a recommendation, not implemented.
+- **056**: `summarize_payload` gained a one-line `Value::Null → ""` guard so a payload that fails to
+  parse keeps producing "" (the plan's STOP branch, resolved locally); a bare `"null"` payload now
+  summarizes to "" instead of "0 …" strings — no collector writes one.
+- **063**: `tsc --noEmit` (TypeScript 7.0.2, pinned exactly) is now the last leg of `bun run check`;
+  the first run found one real bug — `scripts/appcast.ts` called `.stdin()` on a `ShellPromise`
+  (a getter, not a method), so the signed-appcast path had never executed. Fixed with a shell
+  redirect; `generate_appcast --ed-key-file -` accepting stdin is inherited and still unverified —
+  exercise one signed release with Sparkle installed. Two anti-slop plugin files carry scoped
+  per-file rule disables (commented) instead of the old blanket ignore.
+- **067** recommends option A — restart the local daemon via the existing `DaemonClient::shutdown`
+  + supervisor respawn (~0.5 s measured), no protocol change; the build plan must add a
+  local-vs-remote predicate on `DaemonSupervisor` first. See docs/research/reload-command.md.
 
 ### Findings considered and rejected
 
