@@ -3,6 +3,14 @@
 //! Every daemon spawned here runs with `HOME` pointed at a fresh temp
 //! directory, so the child never sees the operator's `~/.daku` (settings, DB,
 //! `environments.json`) and never reaches the Keychain or the network.
+//!
+//! **Every test in this file takes `serialize_tests()` as its first statement.**
+//! The supervisor spawns its child with the *inherited* environment, so the
+//! sandbox has to be this process's own `HOME` for the length of those tests —
+//! and `set_var` is only sound while no sibling thread is reading the
+//! environment (`spawn_daemon` reads `PATH` on every call). Serializing the
+//! binary is what removes that race; libtest still starts a thread per test,
+//! but each blocks on the lock before touching anything.
 
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::{Path, PathBuf};
@@ -16,32 +24,78 @@ use daku_protocol::{Command as DaemonCommand, DaemonReady, PROTOCOL_VERSION, Res
 const DAEMON: &str = env!("CARGO_BIN_EXE_daku-daemon");
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Fresh empty `HOME` so the daemon never sees the operator's `~/.daku`.
-fn sandbox_home() -> PathBuf {
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let home = std::env::temp_dir().join(format!(
-        "daku-home-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&home).unwrap();
+/// Serializes the whole binary — see the module docs. Supervisor tests also
+/// identify their child by pid via pgrep, so they must not overlap either.
+fn serialize_tests() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Fresh empty `HOME` so the daemon never sees the operator's `~/.daku`;
+/// removed on drop, so a failing assertion litters nothing.
+struct SandboxHome(PathBuf);
+
+impl SandboxHome {
+    fn new() -> Self {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "daku-home-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        Self(home)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for SandboxHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A sandbox that is also *this* process's `HOME`, because the supervisor
+/// spawns its child with the inherited environment and derives its own daemon
+/// log path from `HOME`. Sound only while `serialize_tests()` is held: no other
+/// thread in this binary is reading the environment.
+#[cfg(unix)]
+fn supervisor_home() -> SandboxHome {
+    let home = SandboxHome::new();
+    unsafe { std::env::set_var("HOME", home.path()) };
     home
 }
 
-/// The supervisor spawns its child with the *inherited* environment, so `HOME`
-/// has to be set for this whole test binary. Only the supervisor test relies on
-/// it; every other test spawns with `env_clear()`.
-fn ensure_process_home() -> PathBuf {
-    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    HOME.get_or_init(|| {
-        let home = sandbox_home();
-        unsafe { std::env::set_var("HOME", &home) };
-        home
-    })
-    .clone()
+/// A spawned daemon that is killed and reaped on drop, so a panicking
+/// assertion cannot leave a live daemon rewriting its `SandboxHome` after the
+/// sandbox was removed. Derefs to `Child`: `kill`, `wait`, `id` all still work.
+struct Daemon(Child);
+
+impl std::ops::Deref for Daemon {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
 }
 
-fn spawn_daemon(home: &Path, token: Option<&str>, extra: &[&str]) -> Child {
+impl std::ops::DerefMut for Daemon {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_daemon(home: &Path, token: Option<&str>, extra: &[&str]) -> Daemon {
     let mut command = Command::new(DAEMON);
     command
         .env_clear()
@@ -56,7 +110,7 @@ fn spawn_daemon(home: &Path, token: Option<&str>, extra: &[&str]) -> Child {
     if let Some(token) = token {
         command.env("DAKU_DAEMON_TOKEN", token);
     }
-    command.spawn().unwrap()
+    Daemon(command.spawn().unwrap())
 }
 
 fn read_ready(child: &mut Child) -> DaemonReady {
@@ -101,8 +155,9 @@ fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn daemon_prints_one_ready_line_and_serves() {
-    let home = sandbox_home();
-    let mut child = spawn_daemon(&home, Some("test-token"), &[]);
+    let _serialized = serialize_tests();
+    let home = SandboxHome::new();
+    let mut child = spawn_daemon(home.path(), Some("test-token"), &[]);
     let ready = read_ready(&mut child);
 
     assert_eq!(ready.protocol_version, PROTOCOL_VERSION);
@@ -122,19 +177,19 @@ fn daemon_prints_one_ready_line_and_serves() {
     child.wait().unwrap();
     let stderr = read_stderr(&mut child);
 
-    assert!(home.join(".daku/app.db").exists());
-    assert!(!home.join(".daku/environments.json").exists());
+    assert!(home.path().join(".daku/app.db").exists());
+    assert!(!home.path().join(".daku/environments.json").exists());
     assert!(
         stderr.contains("daku collector idle: missing"),
         "expected an idle collector, got stderr: {stderr}"
     );
-    std::fs::remove_dir_all(&home).unwrap();
 }
 
 #[test]
 fn daemon_refuses_to_start_without_token() {
-    let home = sandbox_home();
-    let mut child = spawn_daemon(&home, None, &[]);
+    let _serialized = serialize_tests();
+    let home = SandboxHome::new();
+    let mut child = spawn_daemon(home.path(), None, &[]);
     let status = child.wait().unwrap();
     let stderr = read_stderr(&mut child);
     assert!(!status.success());
@@ -142,26 +197,17 @@ fn daemon_refuses_to_start_without_token() {
         stderr.contains("DAKU_DAEMON_TOKEN is missing"),
         "unexpected stderr: {stderr}"
     );
-    std::fs::remove_dir_all(&home).unwrap();
 }
 
 #[test]
 fn daemon_refuses_to_start_with_an_empty_token() {
-    let home = sandbox_home();
-    let mut child = spawn_daemon(&home, Some(""), &[]);
+    let _serialized = serialize_tests();
+    let home = SandboxHome::new();
+    let mut child = spawn_daemon(home.path(), Some(""), &[]);
     let status = child.wait().unwrap();
     let stderr = read_stderr(&mut child);
     assert!(!status.success());
     assert!(stderr.contains("is empty"), "unexpected stderr: {stderr}");
-    std::fs::remove_dir_all(&home).unwrap();
-}
-
-/// Supervisor tests all spawn a child of this process and identify it by pid,
-/// so they must not overlap with each other.
-#[cfg(unix)]
-fn serialize_supervisor_tests() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Other tests in this file spawn daemons from the same process, so match on
@@ -195,8 +241,8 @@ fn only_supervised_daemon_pid() -> u32 {
 #[cfg(unix)]
 #[test]
 fn supervisor_spawns_and_reaps_the_daemon() {
-    let _serialized = serialize_supervisor_tests();
-    let _home = ensure_process_home();
+    let _serialized = serialize_tests();
+    let _home = supervisor_home();
     let supervisor = daku_client::DaemonSupervisor::spawn(Path::new(DAEMON), false).unwrap();
     let client = supervisor.client();
     assert!(matches!(
@@ -221,8 +267,8 @@ fn supervisor_spawns_and_reaps_the_daemon() {
 #[cfg(unix)]
 #[test]
 fn supervisor_replaces_a_daemon_whose_socket_dropped() {
-    let _serialized = serialize_supervisor_tests();
-    let _home = ensure_process_home();
+    let _serialized = serialize_tests();
+    let _home = supervisor_home();
     let supervisor = daku_client::DaemonSupervisor::spawn(Path::new(DAEMON), false).unwrap();
     let clients = supervisor.subscribe_clients();
     let first = clients.recv_timeout(READY_TIMEOUT).unwrap();
@@ -258,10 +304,10 @@ fn supervisor_replaces_a_daemon_whose_socket_dropped() {
 fn supervisor_records_an_error_when_the_daemon_cannot_be_respawned() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let _serialized = serialize_supervisor_tests();
-    let _home = ensure_process_home();
-    let directory = sandbox_home();
-    let executable = directory.join("daku-daemon-copy");
+    let _serialized = serialize_tests();
+    let _home = supervisor_home();
+    let directory = SandboxHome::new();
+    let executable = directory.path().join("daku-daemon-copy");
     std::fs::copy(DAEMON, &executable).unwrap();
 
     let supervisor = daku_client::DaemonSupervisor::spawn(&executable, false).unwrap();
@@ -289,16 +335,16 @@ fn supervisor_records_an_error_when_the_daemon_cannot_be_respawned() {
     ));
 
     drop(supervisor);
-    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[cfg(unix)]
 #[test]
 fn daemon_exits_when_parent_pid_dies() {
-    let home = sandbox_home();
+    let _serialized = serialize_tests();
+    let home = SandboxHome::new();
     let mut parent = Command::new("sleep").arg("30").spawn().unwrap();
     let mut child = spawn_daemon(
-        &home,
+        home.path(),
         Some("test-token"),
         &["--parent-pid", &parent.id().to_string()],
     );
@@ -313,5 +359,4 @@ fn daemon_exits_when_parent_pid_dies() {
         )),
         "daemon outlived its parent"
     );
-    std::fs::remove_dir_all(&home).unwrap();
 }
