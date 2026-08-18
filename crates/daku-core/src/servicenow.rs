@@ -585,6 +585,41 @@ mod tests {
         );
     }
 
+    /// The retry budget is finite: a rate limit that outlasts it is handed to
+    /// the caller as a 429, which `classify_availability_response` reads as
+    /// unreachable. It is never an `Err` and never an endless retry loop.
+    #[test]
+    fn servicenow_http_gives_up_after_the_429_budget_and_returns_the_429() {
+        let rate_limited = || HttpResponse {
+            status: 429,
+            headers: vec![("Retry-After".into(), "1".into())],
+            body: r#"{"error":{"message":"Rate limit exceeded"}}"#.into(),
+        };
+        let transport = ScriptedTransport::new(
+            (0..=MAX_429_RETRIES)
+                .map(|_| rate_limited())
+                .collect::<Vec<_>>(),
+        );
+        let clock = Arc::new(RecordingClock::default());
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("dev", r#"{"username":"reader","password":"secret"}"#);
+        let client = ServiceNowClient::new(transport, clock.clone());
+        let response = client
+            .request(
+                &basic_env(),
+                &credentials,
+                "GET",
+                "/api/now/table/sys_properties",
+                None,
+            )
+            .unwrap();
+        assert_eq!(response.status, 429);
+        assert_eq!(
+            clock.sleeps.lock().expect("sleeps").len(),
+            usize::from(MAX_429_RETRIES)
+        );
+    }
+
     #[test]
     fn servicenow_http_retries_on_429_http_date() {
         let transport = ScriptedTransport::new(vec![

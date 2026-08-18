@@ -996,6 +996,64 @@ mod tests {
         assert_eq!(payload["skipped"], "asleep");
     }
 
+    /// A rate limit that outlasts the retry budget is the failure an Operator
+    /// polling several Environments is most likely to hit: the Environment
+    /// reads down/unreachable and every gated Signal skips instead of probing.
+    #[test]
+    fn a_sustained_429_marks_the_environment_unreachable_and_skips_gated_signals() {
+        struct RateLimited;
+        impl HttpTransport for RateLimited {
+            fn execute(&self, _request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+                Ok(HttpResponse {
+                    status: 429,
+                    headers: vec![("Retry-After".into(), "1".into())],
+                    body: r#"{"error":{"message":"Rate limit exceeded"}}"#.into(),
+                })
+            }
+        }
+        /// Retries must not cost `bun run check` real seconds.
+        struct NoSleepClock;
+        impl Clock for NoSleepClock {
+            fn now(&self) -> std::time::SystemTime {
+                std::time::SystemTime::now()
+            }
+            fn sleep(&self, _: Duration) {}
+        }
+
+        let db = TempDb::new("rate-limited");
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
+        AvailabilityCollector::new(
+            vec![prod()],
+            credentials,
+            ServiceNowClient::new(RateLimited, NoSleepClock),
+            db.store(),
+        )
+        .collect()
+        .unwrap();
+
+        let connection = db.store().open().unwrap();
+        let availability =
+            persistence::load_signal_snapshot(&connection, "prod", AVAILABILITY_SIGNAL_ID)
+                .unwrap()
+                .expect("availability snapshot");
+        assert_eq!(availability.state, "down");
+        let payload: serde_json::Value = serde_json::from_str(&availability.payload_json).unwrap();
+        assert_eq!(payload["reachability"], "unreachable");
+        assert_eq!(payload["error"], "HTTP 429");
+
+        // Behaviour::Panic: a gated Signal must not probe a rate-limited Environment.
+        fake_collector(db.store(), Behaviour::Panic, false)
+            .collect()
+            .unwrap();
+        let gated = persistence::load_signal_snapshot(&connection, "prod", "fake")
+            .unwrap()
+            .expect("gated snapshot");
+        assert_eq!(gated.state, "skipped");
+        let payload: serde_json::Value = serde_json::from_str(&gated.payload_json).unwrap();
+        assert_eq!(payload["skipped"], "unreachable");
+    }
+
     #[test]
     fn per_environment_collector_prunes_only_when_keeps_samples() {
         let stale = |store: &StateStore| {
