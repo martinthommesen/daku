@@ -18,6 +18,13 @@ const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Longest we will trust an OAuth grant regardless of what the server says.
 const MAX_TOKEN_TTL_SECS: u64 = 24 * 60 * 60;
+/// Shortest OAuth grant we will act on. A server reporting a near-zero
+/// `expires_in` would otherwise write a cache entry that is already expired,
+/// turning every request into a fresh token POST plus a Keychain read.
+const MIN_TOKEN_TTL_SECS: u64 = 60;
+/// Subtracted from the advertised lifetime so a token that is seconds from
+/// expiry is refreshed rather than sent and rejected.
+const TOKEN_TTL_SKEW_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
@@ -192,7 +199,12 @@ impl ServiceNowClient {
         }
         let grant: AccessGrant =
             serde_json::from_str(&response.body).context("oauth token JSON")?;
-        let expires_in = grant.expires_in.unwrap_or(1800).min(MAX_TOKEN_TTL_SECS);
+        let expires_in = grant
+            .expires_in
+            .unwrap_or(1800)
+            .clamp(MIN_TOKEN_TTL_SECS, MAX_TOKEN_TTL_SECS)
+            .saturating_sub(TOKEN_TTL_SKEW_SECS)
+            .max(MIN_TOKEN_TTL_SECS / 2);
         let valid_until = self
             .clock
             .now()
@@ -900,6 +912,74 @@ mod tests {
                 .filter(|request| request.url.contains("oauth_token.do"))
                 .count(),
             1
+        );
+    }
+
+    fn token_with_expiry(expires_in: u64) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: format!(r#"{{"access_token":"tok","expires_in":{expires_in}}}"#),
+        }
+    }
+
+    /// Two requests against a client scripted with one token response; returns
+    /// how many times the token endpoint was hit.
+    fn token_fetches_over_two_requests(token: HttpResponse) -> usize {
+        let transport = Arc::new(ScriptedTransport::new(vec![token, ok_table(), ok_table()]));
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("prod", r#"{"client_id":"id","client_secret":"secret"}"#);
+        let client = ServiceNowClient::new(
+            SharedTransport(transport.clone()),
+            RecordingClock::default(),
+        );
+        let path = "/api/now/table/sys_properties";
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .request(&oauth_env(), &credentials, "GET", path, None)
+                    .unwrap()
+                    .status,
+                200
+            );
+        }
+        transport
+            .requests()
+            .iter()
+            .filter(|request| request.url.contains("oauth_token.do"))
+            .count()
+    }
+
+    #[test]
+    fn servicenow_http_oauth_tiny_expires_in_is_floored() {
+        assert_eq!(token_fetches_over_two_requests(token_with_expiry(0)), 1);
+    }
+
+    #[test]
+    fn servicenow_http_oauth_normal_expires_in_is_unchanged_in_spirit() {
+        assert_eq!(token_fetches_over_two_requests(token_with_expiry(1800)), 1);
+    }
+
+    #[test]
+    fn servicenow_http_oauth_expiry_keeps_a_skew_margin() {
+        let transport =
+            ScriptedTransport::new(vec![token_with_expiry(MIN_TOKEN_TTL_SECS + 1), ok_table()]);
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("prod", r#"{"client_id":"id","client_secret":"secret"}"#);
+        let client = ServiceNowClient::new(transport, RecordingClock::default());
+        client
+            .request(
+                &oauth_env(),
+                &credentials,
+                "GET",
+                "/api/now/table/sys_properties",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            client.cached_access_token("prod").as_deref(),
+            Some("tok"),
+            "a just-above-the-floor grant must not be born expired"
         );
     }
 
