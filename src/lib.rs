@@ -29,7 +29,7 @@ use crate::identity::{APP_ID, APP_NAME};
 
 actions!(
     daku,
-    [Quit, About, CloseWindow, CheckForUpdates, ToggleFpsCounter]
+    [Quit, About, CloseWindow, CheckForUpdates]
 );
 
 const DEFAULT_WINDOW_WIDTH: f32 = 1380.0;
@@ -85,7 +85,6 @@ pub fn run() {
             cx.bind_keys([
                 KeyBinding::new("secondary-q", Quit, None),
                 KeyBinding::new("secondary-w", CloseWindow, None),
-                KeyBinding::new("secondary-alt-shift-f", ToggleFpsCounter, None),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
 
@@ -153,7 +152,6 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
             name: tr!("menu.window").into(),
             disabled: false,
             items: vec![
-                MenuItem::action(tr!("menu.toggle_fps_counter"), ToggleFpsCounter),
                 MenuItem::action(tr!("menu.close_window"), CloseWindow),
             ],
         },

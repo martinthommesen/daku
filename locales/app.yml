@@ -8,7 +8,5 @@ menu.quit:
   en: Quit %{app}
 menu.window:
   en: Window
-menu.toggle_fps_counter:
-  en: Toggle FPS Counter
 menu.close_window:
   en: Close Window

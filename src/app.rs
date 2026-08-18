@@ -24,14 +24,13 @@ use crate::dashboard_state::{
     CompareRow, DashboardState, DrillIn, SignalCard, fixture_events, freshness, signal_label,
     ui_fixture_enabled,
 };
-use crate::{CloseWindow, ToggleFpsCounter};
+use crate::CloseWindow;
 
 const SIDEBAR_WIDTH: f32 = 220.0;
 
 pub struct Daku {
     state: DashboardState,
     _supervisor: Option<DaemonSupervisor>,
-    show_fps: bool,
     /// `Root` owns the window's root dispatch node, so the shell only receives
     /// menu- and keystroke-dispatched actions while this handle is focused.
     focus_handle: FocusHandle,
@@ -56,7 +55,6 @@ impl Daku {
             Self {
                 state,
                 _supervisor: supervisor,
-                show_fps: false,
                 focus_handle: focus_handle.clone(),
             }
         });
@@ -160,11 +158,6 @@ impl Render for Daku {
             .flex()
             .flex_col()
             .text_color(cx.theme().foreground)
-            .on_action(cx.listener(|this, _: &ToggleFpsCounter, window, cx| {
-                this.show_fps = !this.show_fps;
-                window.refresh();
-                cx.notify();
-            }))
             .on_action(cx.listener(|_, _: &CloseWindow, window, _cx| {
                 crate::platform::hide_window(window);
             }))
@@ -180,16 +173,6 @@ impl Render for Daku {
                     .child(sidebar)
                     .child(detail),
             )
-            .when(self.show_fps, |element| {
-                element.child(
-                    div()
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .text_size(px(11.0))
-                        .text_color(cx.theme().muted_foreground)
-                        .child("FPS"),
-                )
-            })
     }
 }
 
