@@ -154,14 +154,21 @@ replacement on `subscribe_clients` → wait for `EnvironmentsUpdated` on its
 
 Read the decomposition, not the total: the work itself is the 44 ms; the other
 ~470 ms is `monitor_daemon` sleeping `REBUILD_POLL_INTERVAL` (500 ms) before it
-notices `has_exited()`, and the outlier is one extra poll cycle. **Half a second
-for a click-initiated action is fine**, and the dominant term is removable later
-(§5) without touching the protocol. On a real instance the *first tick* is
+notices the daemon is gone. The ~1 s of extra delay in the outlier matches
+`SHUTDOWN_TIMEOUT` (1 s), not a second poll cycle: when the monitor catches
+`is_disconnected()` before the child has reaped, `DaemonProcess::stop` waits out
+its shutdown deadline before `replace_local_daemon` spawns the replacement.
+**Half a second for a click-initiated action is fine**, and the dominant term is
+reducible later (§5) without touching the protocol. On a real instance the *first tick* is
 slower than a fixture's, but the Operator sees last-known cards throughout —
 freshness returns at tick speed, not at restart speed.
 
-Machine: the development Mac, `cargo test` debug profile. Treat these as
-order-of-magnitude, not a benchmark.
+Two caveats on the 44 ms. The sandbox SQLite was near-empty, so the publish leg
+serialized almost nothing; on a real machine `publish_dashboard` emits
+`SignalSnapshotsUpdated` and `SignalSamplesUpdated` sized by what is stored
+(≤ ~2 880 sample points per Signal), so that leg grows. And the machine is the
+development Mac on `cargo test`'s debug profile. Order-of-magnitude, not a
+benchmark.
 
 ## 4. Open questions
 
@@ -204,9 +211,11 @@ None of these has been written; nothing below has landed.
   `PROTOCOL_VERSION` bump. Small.
 - **Cut the ~470 ms detection lag.** Have the desktop call
   `replace_local_daemon` directly (under `inner.restart`) instead of shutting
-  down and waiting for `monitor_daemon`'s 500 ms poll to notice. Optional; it
-  buys a 0.52 s → ~0.05 s action, and it is only worth doing if the half second
-  reads as sluggish in practice.
+  down and waiting for `monitor_daemon`'s 500 ms poll to notice. Optional, and
+  it does **not** get to 44 ms: the direct path still drops the old
+  `DaemonProcess`, so it pays whatever `DaemonProcess::stop` waits (up to
+  `SHUTDOWN_TIMEOUT`, 1 s) for the child to reap. Only worth doing if the half
+  second reads as sluggish in practice.
 - **Post-reload config feedback.** Surface `run_doctor`'s rows (already built,
   already used by `daku-daemon doctor`) after a reload so a malformed config
   says so (open question 4). Composes with `docs/research/operator-setup.md`,
