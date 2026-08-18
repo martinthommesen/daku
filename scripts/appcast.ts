@@ -71,7 +71,8 @@ export async function generateAppcast(
     updatesDir,
   ];
   if (privateKey) {
-    await $`${command}`.stdin(privateKey);
+    // Bun's shell has no `.stdin()` method; redirect from a Buffer instead.
+    await $`${command} < ${Buffer.from(privateKey)}`;
   } else {
     await $`${command}`;
   }
