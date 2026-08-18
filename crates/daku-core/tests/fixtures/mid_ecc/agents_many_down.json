@@ -1,0 +1,76 @@
+{
+  "result": [
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-00"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-01"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-02"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-03"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-04"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-05"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-06"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-07"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-08"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-09"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-10"
+    },
+    {
+      "status": "Down",
+      "validated": "true",
+      "version": "5.0.0",
+      "host_name": "mid-11"
+    }
+  ]
+}

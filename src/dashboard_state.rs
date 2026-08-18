@@ -314,6 +314,32 @@ impl DashboardState {
                         || list.len() > DRILL_IN_ROW_LIMIT,
                 }
             }
+            "mid_ecc" => {
+                let Some(list) = value
+                    .get("agents_unhealthy_list")
+                    .and_then(|item| item.as_array())
+                    .filter(|list| !list.is_empty())
+                else {
+                    return self.drill_in_text(signal_id);
+                };
+                DrillIn::Rows {
+                    headers: vec!["MID", "Status", "Version"],
+                    rows: list
+                        .iter()
+                        .take(DRILL_IN_ROW_LIMIT)
+                        .map(|entry| {
+                            vec![
+                                text(entry, "host_name"),
+                                text(entry, "status"),
+                                text(entry, "version"),
+                            ]
+                        })
+                        .collect(),
+                    truncated: value.get("agents_unhealthy_list_truncated")
+                        == Some(&serde_json::Value::Bool(true))
+                        || list.len() > DRILL_IN_ROW_LIMIT,
+                }
+            }
             "last_clone" => {
                 if value
                     .get("completed")
@@ -761,7 +787,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 snap(
                     "mid_ecc",
                     "healthy",
-                    r#"{"agents_total":3,"agents_unhealthy":0,"ecc_output_ready":12,"ecc_error":0}"#,
+                    r#"{"agents_total":3,"agents_unhealthy":0,"agents_unhealthy_list":[],"agents_unhealthy_list_truncated":false,"ecc_output_ready":12,"ecc_error":0}"#,
                 ),
                 snap("outbound", "degraded", r#"{"outbound_http_4xx_5xx_1h":4}"#),
                 snap("drift", "healthy", r#"{"role":"source"}"#),
@@ -779,8 +805,8 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 snap("syslog", "healthy", r#"{"error_count_1h":4}"#),
                 snap(
                     "mid_ecc",
-                    "healthy",
-                    r#"{"agents_total":2,"agents_unhealthy":0,"ecc_output_ready":3,"ecc_error":0}"#,
+                    "degraded",
+                    r#"{"agents_total":3,"agents_unhealthy":2,"agents_unhealthy_list":[{"host_name":"mid-a","status":"Down","version":"5.0.0"},{"host_name":"mid-b","status":"Up","version":null}],"agents_unhealthy_list_truncated":false,"ecc_output_ready":3,"ecc_error":0}"#,
                 ),
                 snap(
                     "outbound",
@@ -1006,6 +1032,32 @@ mod tests {
         assert_eq!(
             state.drill_in("drift"),
             DrillIn::Text("source of truth".into())
+        );
+    }
+
+    #[test]
+    fn drill_in_lists_unhealthy_mid_agents() {
+        let mut state = loaded();
+        state.select("test");
+        assert_eq!(
+            state.drill_in("mid_ecc"),
+            DrillIn::Rows {
+                headers: vec!["MID", "Status", "Version"],
+                rows: vec![
+                    vec!["mid-a".to_owned(), "Down".to_owned(), "5.0.0".to_owned()],
+                    vec!["mid-b".to_owned(), "Up".to_owned(), "\u{2014}".to_owned()],
+                ],
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drill_in_falls_back_to_text_when_every_mid_is_healthy() {
+        let state = loaded();
+        assert_eq!(
+            state.drill_in("mid_ecc"),
+            DrillIn::Text("3/3 up \u{b7} queue 12".into())
         );
     }
 
