@@ -86,13 +86,26 @@ pub fn freshness(last_observed_at: Option<i64>, now: i64) -> Freshness {
     }
 }
 
+/// A snapshot plus its payload parsed once, on arrival. Every accessor reads
+/// keys out of `payload`; re-parsing per accessor per frame is what this
+/// exists to avoid — a Waiting card animates a `Skeleton`, which repaints the
+/// whole shell continuously until the first poll lands.
+///
+/// Invariant: `payload` is derived from `dto.payload_json`, so only `apply`
+/// may construct a `Snapshot`. An unparseable payload becomes `Value::Null`.
+#[derive(Clone, Debug, PartialEq)]
+struct Snapshot {
+    dto: SignalSnapshotDto,
+    payload: serde_json::Value,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DashboardState {
     connected: bool,
     environments: Vec<EnvironmentSummary>,
     selected_id: Option<String>,
     selected_card: Option<&'static str>,
-    snapshots: HashMap<String, HashMap<String, SignalSnapshotDto>>,
+    snapshots: HashMap<String, HashMap<String, Snapshot>>,
     samples: HashMap<(String, String), Vec<SamplePoint>>,
 }
 
@@ -191,7 +204,17 @@ impl DashboardState {
                     environment_id.clone(),
                     snapshots
                         .iter()
-                        .map(|snapshot| (snapshot.signal_id.clone(), snapshot.clone()))
+                        .map(|snapshot| {
+                            let payload = serde_json::from_str(&snapshot.payload_json)
+                                .unwrap_or(serde_json::Value::Null);
+                            (
+                                snapshot.signal_id.clone(),
+                                Snapshot {
+                                    dto: snapshot.clone(),
+                                    payload,
+                                },
+                            )
+                        })
                         .collect(),
                 );
             }
@@ -276,14 +299,13 @@ impl DashboardState {
     }
 
     pub fn drill_in(&self, signal_id: &str) -> DrillIn {
-        let payload = self
+        let missing = serde_json::Value::Null;
+        let value = self
             .selected_id
             .as_deref()
             .and_then(|environment_id| self.snapshots.get(environment_id))
             .and_then(|map| map.get(signal_id))
-            .map(|snapshot| snapshot.payload_json.as_str())
-            .unwrap_or("");
-        let value = serde_json::from_str::<serde_json::Value>(payload).unwrap_or_default();
+            .map_or(&missing, |snapshot| &snapshot.payload);
         let text = |value: &serde_json::Value, key: &str| {
             value
                 .get(key)
@@ -351,9 +373,9 @@ impl DashboardState {
                 DrillIn::Rows {
                     headers: vec!["Completed", "Age", "Source"],
                     rows: vec![vec![
-                        text(&value, "completed"),
-                        summarize_payload(signal_id, payload),
-                        text(&value, "source_id"),
+                        text(value, "completed"),
+                        summarize_value(signal_id, value),
+                        text(value, "source_id"),
                     ]],
                     truncated: false,
                 }
@@ -426,7 +448,7 @@ impl DashboardState {
                 SignalCard {
                     signal_id,
                     status: snapshot
-                        .map(|snapshot| snapshot.state.clone())
+                        .map(|snapshot| snapshot.dto.state.clone())
                         .unwrap_or_else(|| WAITING.to_owned()),
                     sparkline,
                 }
@@ -455,7 +477,7 @@ impl DashboardState {
                     .snapshots
                     .get(&environment.id)
                     .and_then(|map| map.get("drift"))
-                    .is_some_and(|snapshot| drift_mismatch(&snapshot.payload_json))
+                    .is_some_and(|snapshot| drift_mismatch(&snapshot.payload))
         });
         let has_mismatch = build_mismatch || plugin_mismatch;
         CompareStrip {
@@ -488,11 +510,7 @@ impl DashboardState {
                 else {
                     return false;
                 };
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&snapshot.payload_json)
-                else {
-                    return false;
-                };
-                value.get("role").and_then(|item| item.as_str()) == Some("source")
+                snapshot.payload.get("role").and_then(|item| item.as_str()) == Some("source")
             })
             .map(|environment| environment.id.as_str())
     }
@@ -508,7 +526,7 @@ impl DashboardState {
         else {
             return String::new();
         };
-        summarize_payload(signal_id, &snapshot.payload_json)
+        summarize_value(signal_id, &snapshot.payload)
     }
 
     /// One-line diagnostic for the selected Environment's Signal: the daemon's
@@ -525,7 +543,7 @@ impl DashboardState {
         else {
             return String::new();
         };
-        detail_from_payload(&snapshot.payload_json)
+        detail_from_value(&snapshot.payload)
     }
 
     /// Up to `limit` human lines ("id: 1.0.0 → 1.1.0", "id: missing here",
@@ -543,9 +561,7 @@ impl DashboardState {
         else {
             return Vec::new();
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&snapshot.payload_json) else {
-            return Vec::new();
-        };
+        let value = &snapshot.payload;
         let Some(list) = value.get("mismatch_list").and_then(|item| item.as_array()) else {
             return Vec::new();
         };
@@ -608,28 +624,26 @@ impl DashboardState {
         self.snapshots
             .get(environment_id)
             .and_then(|map| map.get(signal_id))
-            .map(|snapshot| summarize_payload(signal_id, &snapshot.payload_json))
+            .map(|snapshot| summarize_value(signal_id, &snapshot.payload))
             .unwrap_or_default()
     }
 }
 
 fn environment_build(
-    snapshots: &HashMap<String, HashMap<String, SignalSnapshotDto>>,
+    snapshots: &HashMap<String, HashMap<String, Snapshot>>,
     environment_id: &str,
 ) -> Option<String> {
-    let payload = snapshots.get(environment_id)?.get("availability")?;
-    serde_json::from_str::<serde_json::Value>(&payload.payload_json)
-        .ok()?
+    snapshots
+        .get(environment_id)?
+        .get("availability")?
+        .payload
         .get("build")?
         .as_str()
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
 }
 
-fn drift_mismatch(payload_json: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) else {
-        return false;
-    };
+fn drift_mismatch(value: &serde_json::Value) -> bool {
     value.get("build_matches") == Some(&serde_json::Value::Bool(false))
         || value
             .get("mismatches")
@@ -637,10 +651,13 @@ fn drift_mismatch(payload_json: &str) -> bool {
             .is_some_and(|count| count > 0)
 }
 
-fn summarize_payload(signal_id: &str, payload_json: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) else {
+/// `Value::Null` stands in for a payload that did not parse, and an
+/// unreadable payload has nothing to summarize — without this guard the
+/// counting arms below would report a confident "0 overdue · 0 error".
+fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
+    if value.is_null() {
         return String::new();
-    };
+    }
     if value.get("skipped").is_some() {
         return String::new();
     }
@@ -736,10 +753,7 @@ fn summarize_payload(signal_id: &str, payload_json: &str) -> String {
     }
 }
 
-fn detail_from_payload(payload_json: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) else {
-        return String::new();
-    };
+fn detail_from_value(value: &serde_json::Value) -> String {
     if let Some(reason) = value.get("skipped").and_then(|item| item.as_str()) {
         // The card's main line already reads "skipped"; do not repeat the word.
         return match reason {
@@ -758,6 +772,24 @@ fn detail_from_payload(payload_json: &str) -> String {
         .find_map(|key| value.get(*key).and_then(|item| item.as_str()))
         .map(|text| text.chars().take(160).collect())
         .unwrap_or_default()
+}
+
+/// String-taking wrappers so the tests keep exercising these through the same
+/// call shape the wire uses (a payload JSON string), without a `from_str` on
+/// any render path.
+#[cfg(test)]
+fn summarize_payload(signal_id: &str, payload_json: &str) -> String {
+    summarize_value(signal_id, &parse_payload(payload_json))
+}
+
+#[cfg(test)]
+fn detail_from_payload(payload_json: &str) -> String {
+    detail_from_value(&parse_payload(payload_json))
+}
+
+#[cfg(test)]
+fn parse_payload(payload_json: &str) -> serde_json::Value {
+    serde_json::from_str(payload_json).unwrap_or(serde_json::Value::Null)
 }
 
 pub fn ui_fixture_enabled() -> bool {
@@ -1543,6 +1575,47 @@ mod tests {
             snapshots: vec![snap("jobs", "healthy", "not json")],
         });
         assert_eq!(state.card_summary("jobs"), "");
+    }
+
+    /// A payload that does not parse is stored as `Value::Null`, and every
+    /// accessor must land in the same empty branch it did when each of them
+    /// re-parsed the string and failed.
+    #[test]
+    fn unparseable_payload_still_renders_empty() {
+        let mut state = loaded();
+        state.select("test");
+        state.apply(&ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "test".into(),
+            snapshots: vec![
+                snap("jobs", "healthy", "not json"),
+                snap("drift", "healthy", "not json"),
+            ],
+        });
+        assert_eq!(state.card_summary("jobs"), "");
+        assert_eq!(state.card_detail("jobs"), "");
+        assert_eq!(state.drill_in("jobs"), DrillIn::Empty);
+        assert_eq!(state.drift_mismatch_lines(5), Vec::<String>::new());
+        assert!(!state.compare_strip().has_mismatch);
+    }
+
+    /// Pins idempotence, **not** the parse count — the number of parses is not
+    /// observable without instrumentation, and a test claiming to count them
+    /// would be a lie. What it does catch: an accessor that mutates or
+    /// consumes the cached payload it now reads.
+    #[test]
+    fn payload_is_parsed_once_per_apply() {
+        let state = loaded();
+        let before = state.snapshots.clone();
+        assert_eq!(
+            state.card_summary("availability"),
+            "142 ms · glide-zurich-patch3"
+        );
+        assert_eq!(
+            state.card_summary("availability"),
+            "142 ms · glide-zurich-patch3"
+        );
+        assert_eq!(state.drill_in("drift"), state.drill_in("drift"));
+        assert_eq!(state.snapshots, before);
     }
 
     #[test]

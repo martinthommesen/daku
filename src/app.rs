@@ -212,7 +212,6 @@ impl Daku {
     fn render_detail(&self, cards: Vec<gpui::AnyElement>, cx: &App) -> gpui::AnyElement {
         let selected = self.state.selected().cloned();
         let strip = self.state.compare_strip();
-        let rows = self.state.compare_rows();
         div()
             .id("detail")
             .flex_1()
@@ -289,8 +288,14 @@ impl Daku {
                             cx,
                         ))
                     })
+                    // The rows are built only when the strip is on screen; a
+                    // hidden strip must not cost a pass over every Environment.
                     .when(strip.visible, |element| {
-                        element.child(compare_strip(strip.has_mismatch, &rows, cx))
+                        element.child(compare_strip(
+                            strip.has_mismatch,
+                            &self.state.compare_rows(),
+                            cx,
+                        ))
                     })
             })
             .when(self.state.selected().is_none(), |element| {
@@ -375,7 +380,7 @@ impl Daku {
                     .rounded(cx.theme().radius)
                     .into_any_element()
             } else {
-                clipped_line(value.clone())
+                clipped_line(format!("value-{signal_id}").into(), value.clone())
                     .text_2xl()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(cx.theme().foreground)
@@ -383,7 +388,7 @@ impl Daku {
             })
             .when(!context.is_empty(), |element| {
                 element.child(
-                    clipped_line(context.clone())
+                    clipped_line(format!("context-{signal_id}").into(), context.clone())
                         .text_sm()
                         .text_color(cx.theme().muted_foreground),
                 )
@@ -415,11 +420,13 @@ impl Daku {
     }
 }
 
-/// One line that clips instead of wrapping; the full text is on hover.
-fn clipped_line(text: String) -> gpui::Stateful<gpui::Div> {
+/// One line that clips instead of wrapping; the full text is on hover. The id
+/// names the slot, not the text — an id that changes with the value resets
+/// hover and tooltip state on every poll.
+fn clipped_line(id: SharedString, text: String) -> gpui::Stateful<gpui::Div> {
     let tip = SharedString::from(text.clone());
     div()
-        .id(SharedString::from(format!("line-{text}")))
+        .id(id)
         .w_full()
         .overflow_hidden()
         .text_ellipsis()
