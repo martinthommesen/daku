@@ -25,7 +25,7 @@ The person running daku. In v1 this is the platform owner on their own machine; 
 _Avoid_: user, admin, viewer (those imply daku-side accounts we are not building in v1)
 
 **Environment health**:
-A rolled-up status for an Environment derived from its Signals: **healthy**, **degraded**, or **down**. v1 uses hard-coded defaults (not Operator-configured alert rules). v1.1 allows per-Environment threshold overrides (see **threshold override**).
+A rolled-up status for an Environment derived from its Signals: **healthy**, **degraded**, or **down**. Defaults are hard-coded; v1.1 allows per-Environment **threshold overrides**. Unreachable rolls `down`, asleep stays `healthy`, `last_clone` and `skipped` never vote.
 _Avoid_: severity, priority, alert state
 
 **Threshold override**:

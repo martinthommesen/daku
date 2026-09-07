@@ -2,7 +2,7 @@
 
 macOS operator console for ServiceNow Environments. Native GPUI client + Rust daemon (GPL-3.0-only).
 
-Product spec: [`docs/spec/v1.md`](docs/spec/v1.md). Domain vocabulary: [`CONTEXT.md`](CONTEXT.md).
+Product spec: [`docs/spec/v1.md`](docs/spec/v1.md) (v1.1 scope included). Domain vocabulary: [`CONTEXT.md`](CONTEXT.md). Signal reference: [`docs/signals.md`](docs/signals.md).
 
 ## One-time upstream pin
 
@@ -57,7 +57,7 @@ Copy [`environments.example.json`](environments.example.json) to `~/.daku/enviro
 
 Per-Environment tuning lives in the same file: a defaulted `thresholds` object overrides any degrade threshold for that Environment only (`jobs_overdue_degraded_at`, `jobs_error_degraded_at`, `syslog_error_degraded_at`, `outbound_failures_degraded_at`, `mid_unhealthy_degraded_at`, `ecc_error_degraded_at`, `ecc_output_ready_degraded_at`, `drift_mismatches_degraded_at`, `availability_rtt_degraded_ms` in ms or `null` to disable) — unknown keys are rejected so typos fail fast. `expected_drift` lists plugin ids / store-app scopes that are planned differences; drift shows "N differ · M expected" and only unexpected drift degrades. `daku-daemon doctor` prints the effective values per Environment.
 
-Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settings.json`, e.g. `{"poll_interval_secs": 60}` (default **120**, values below 30 are raised to 30; the daemon reads it at start — relaunch after editing `settings.json`). One shared `CollectorLoop` polls every Environment; Availability, jobs, syslog, MID/ECC, outbound, drift, and last-clone register onto it. After each tick the daemon broadcasts `EnvironmentsUpdated`, `SignalSnapshotsUpdated`, and `SignalSamplesUpdated` (jobs/syslog ≤24h) so the GPUI client never opens SQLite. The GPUI shell is sidebar + Environment detail; `DAKU_UI_FIXTURE=1` loads the same events as the dashboard_state tests (no ServiceNow).
+Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settings.json`, e.g. `{"poll_interval_secs": 60}` (default **120**, values below 30 are raised to 30; the daemon reads it at start — relaunch after editing `settings.json`). One shared `CollectorLoop` polls every Environment; Availability, jobs, syslog, MID/ECC, outbound, drift, and last-clone register onto it. After each tick the daemon broadcasts `EnvironmentsUpdated`, `SignalSnapshotsUpdated`, `SignalSamplesUpdated` (jobs/syslog ≤24h), `HealthEventsUpdated` (transitions + builds) and `SignalRollupsUpdated` (30 d hourly) so the GPUI client never opens SQLite. The GPUI shell is sidebar + Environment detail with health notifications, menu-bar dot, Dock badge, per-Environment mutes (header), ⌘R reload, ⌘1–9 switching and ⌘⇧C copy; `DAKU_UI_FIXTURE=1` loads the same events as the dashboard_state tests (no ServiceNow).
 
 ### Operator smoke (local)
 
