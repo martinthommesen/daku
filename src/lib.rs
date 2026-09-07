@@ -28,7 +28,8 @@ actions!(
         ReloadDaemon,
         CopySummary,
         ToggleNotifications,
-        AddEnvironment
+        AddEnvironment,
+        DetachSelectedEnvironment
     ]
 );
 
@@ -125,55 +126,83 @@ pub fn run() {
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
 
-            let window_bounds = WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+            open_daku_window(
                 cx,
-            ));
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        titlebar: Some(gpui_component::TitleBar::title_bar_options()),
-                        is_movable: true,
-                        app_owns_titlebar_drag: cfg!(target_os = "macos"),
-                        window_background: WindowBackgroundAppearance::Blurred,
-                        app_id: Some(APP_ID.to_owned()),
-                        window_bounds: Some(window_bounds),
-                        display_id: None,
-                        window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        crate::platform::configure_main_window_close_behavior(window, cx);
-                        window
-                            .observe_window_appearance(|window, cx| {
-                                gpui_component::Theme::sync_system_appearance(Some(window), cx);
-                            })
-                            .detach();
-                        let view =
-                            Daku::new(window, cx, daemon, settings.clone(), notify_clicks.clone());
-                        // Root paints an opaque `background`; clear it so the
-                        // window's blurred backdrop shows through `Daku`'s tint.
-                        cx.new(|cx| {
-                            gpui::Styled::bg(
-                                gpui_component::Root::new(view, window, cx),
-                                gpui::transparent_black(),
-                            )
-                        })
-                    },
-                )
-                .expect("failed to open daku window");
-
-            window
-                .update(cx, |_, window, cx| {
-                    crate::platform::enable_backdrop_blur(window);
-                    gpui_component::Theme::sync_system_appearance(Some(window), cx);
-                    cx.activate(true);
-                })
-                .ok();
+                daemon,
+                &settings,
+                notify_clicks.clone(),
+                None,
+                WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+                    cx,
+                )),
+            )
+            .expect("failed to open daku window");
 
             set_app_menus(cx, updater_available);
         });
+}
+
+/// Opens a daku window: the main sidebar+detail shell, or a detached
+/// single-Environment view (`108`) that pins one Environment, drops the
+/// sidebar, and destroys itself on close instead of hiding.
+pub(crate) fn open_daku_window(
+    cx: &mut App,
+    supervisor: Option<daku_client::DaemonSupervisor>,
+    settings: &crate::persistence::AppSettings,
+    notify_clicks: Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<String>>>>,
+    detached: Option<String>,
+    window_bounds: WindowBounds,
+) -> anyhow::Result<gpui::WindowHandle<gpui_component::Root>> {
+    let hide_on_close = detached.is_none();
+    let window = cx.open_window(
+        WindowOptions {
+            titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+            is_movable: true,
+            app_owns_titlebar_drag: cfg!(target_os = "macos"),
+            window_background: WindowBackgroundAppearance::Blurred,
+            app_id: Some(APP_ID.to_owned()),
+            window_bounds: Some(window_bounds),
+            display_id: None,
+            window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
+            ..Default::default()
+        },
+        move |window, cx| {
+            if hide_on_close {
+                crate::platform::configure_main_window_close_behavior(window, cx);
+            }
+            window
+                .observe_window_appearance(|window, cx| {
+                    gpui_component::Theme::sync_system_appearance(Some(window), cx);
+                })
+                .detach();
+            let view = Daku::new(
+                window,
+                cx,
+                supervisor,
+                settings.clone(),
+                notify_clicks,
+                detached,
+            );
+            // Root paints an opaque `background`; clear it so the
+            // window's blurred backdrop shows through `Daku`'s tint.
+            cx.new(|cx| {
+                gpui::Styled::bg(
+                    gpui_component::Root::new(view, window, cx),
+                    gpui::transparent_black(),
+                )
+            })
+        },
+    )?;
+    window
+        .update(cx, |_, window, cx| {
+            crate::platform::enable_backdrop_blur(window);
+            gpui_component::Theme::sync_system_appearance(Some(window), cx);
+            cx.activate(true);
+        })
+        .ok();
+    Ok(window)
 }
 
 pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
@@ -202,6 +231,7 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
             disabled: false,
             items: vec![
                 MenuItem::action("Close Window", CloseWindow),
+                MenuItem::action("Detach Selected Environment", DetachSelectedEnvironment),
                 MenuItem::separator(),
                 MenuItem::action("Reload Daemon", ReloadDaemon),
             ],

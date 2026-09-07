@@ -26,6 +26,7 @@ use gpui_component::{
 use crate::AddEnvironment;
 use crate::CloseWindow;
 use crate::CopySummary;
+use crate::DetachSelectedEnvironment;
 use crate::ReloadDaemon;
 use crate::SelectEnvironment;
 use crate::SelectEnvironmentSlot;
@@ -59,6 +60,9 @@ pub struct Daku {
     last_ambient: Option<(bool, Option<EnvironmentHealth>, usize)>,
     /// Add/edit Environment sheet (`106`); `None` hides it.
     env_sheet: Option<EnvSheet>,
+    /// Detached single-Environment window (`108`): sidebar dropped,
+    /// selection pinned, notifications owned by the main window.
+    detached: Option<String>,
     /// `Root` owns the window's root dispatch node, so the shell only receives
     /// menu- and keystroke-dispatched actions while this handle is focused.
     focus_handle: FocusHandle,
@@ -74,8 +78,10 @@ impl Daku {
         supervisor: Option<DaemonSupervisor>,
         settings: AppSettings,
         notify_clicks: Option<Arc<Mutex<mpsc::Receiver<String>>>>,
+        detached: Option<String>,
     ) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
+        let pinned = detached.clone();
         let entity = cx.new(|cx| {
             let mut state = DashboardState::new();
             state.apply_mutes(&settings.mutes, unix_now());
@@ -83,10 +89,17 @@ impl Daku {
                 state.set_connected(true);
                 state.apply_all(&fixture_events());
             } else if let Some(supervisor) = supervisor.as_ref() {
-                listen_dashboard(supervisor, cx);
+                listen_dashboard(supervisor, pinned.clone(), cx);
+            }
+            if let Some(pinned) = pinned.as_deref() {
+                state.select(pinned);
             }
             tick_freshness(cx);
-            if let Some(clicks) = notify_clicks {
+            // Detached windows never pump clicks or post: the main window
+            // owns notifications, so a second window cannot double-fire.
+            if detached.is_none()
+                && let Some(clicks) = notify_clicks
+            {
                 pump_notification_clicks(clicks, cx);
             }
             Self {
@@ -98,6 +111,7 @@ impl Daku {
                 notify_seen: HashSet::new(),
                 last_ambient: None,
                 env_sheet: None,
+                detached,
                 focus_handle: focus_handle.clone(),
             }
         });
@@ -134,7 +148,11 @@ impl Daku {
     /// Decides on one batch of published health events: records everything
     /// seen, posts at most the latest novel transition. Pre-boot history,
     /// replays, muted Environments and the global off switch stay silent.
+    /// Detached windows never post: the main window owns notifications.
     fn note_health_events(&mut self, env_id: &str, events: &[HealthEventDto]) {
+        if self.detached.is_some() {
+            return;
+        }
         let (record, fire) = select_notification(env_id, events, &self.notify_seen, self.boot_now);
         self.notify_seen.extend(record);
         let Some(event) = fire else { return };
@@ -165,6 +183,13 @@ impl Daku {
     /// `SelectEnvironment` action into this; notification and menu-bar clicks
     /// (079/081) will call it directly.
     fn select_environment(&mut self, env_id: &str, open_drift: bool, cx: &mut Context<Self>) {
+        // A detached window pins its Environment; card selection (view-local)
+        // still works, switching away does not.
+        if let Some(pinned) = self.detached.as_deref()
+            && pinned != env_id
+        {
+            return;
+        }
         self.state.select(env_id);
         if open_drift {
             self.state.open_card("drift");
@@ -173,6 +198,9 @@ impl Daku {
     }
 
     fn select_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
+        if self.detached.is_some() {
+            return;
+        }
         if let Some(id) = self
             .state
             .sidebar(unix_now())
@@ -542,7 +570,7 @@ fn pump_notification_clicks(clicks: Arc<Mutex<mpsc::Receiver<String>>>, cx: &mut
     .detach();
 }
 
-fn listen_dashboard(supervisor: &DaemonSupervisor, cx: &mut Context<Daku>) {
+fn listen_dashboard(supervisor: &DaemonSupervisor, pinned: Option<String>, cx: &mut Context<Daku>) {
     // DaemonSupervisor clients have already completed Hello.
     let supervisor = supervisor.clone();
     cx.spawn(async move |this, cx| {
@@ -573,6 +601,7 @@ fn listen_dashboard(supervisor: &DaemonSupervisor, cx: &mut Context<Daku>) {
                     .await
                 {
                     Ok(message) => {
+                        let pinned = pinned.clone();
                         let _ = this.update(cx, |this, cx| {
                             if let ServerMessage::HealthEventsUpdated {
                                 environment_id,
@@ -582,6 +611,12 @@ fn listen_dashboard(supervisor: &DaemonSupervisor, cx: &mut Context<Daku>) {
                                 this.note_health_events(environment_id, events);
                             }
                             this.state.apply(&message);
+                            // A detached window re-pins after every publish:
+                            // the dashboard auto-selects the first Environment
+                            // when the selection goes stale.
+                            if let Some(pinned) = pinned.as_deref() {
+                                this.state.select(pinned);
+                            }
                             cx.notify();
                         });
                     }
@@ -602,7 +637,13 @@ fn listen_dashboard(supervisor: &DaemonSupervisor, cx: &mut Context<Daku>) {
 impl Render for Daku {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reflect_ambient();
-        let sidebar = self.render_sidebar(cx);
+        // A detached window whose Environment was deleted shows a tombstone
+        // instead of silently following the dashboard's auto-reselect.
+        let removed = self
+            .detached
+            .as_deref()
+            .is_some_and(|pinned| !self.state.environments().iter().any(|env| env.id == pinned));
+        let sidebar = self.detached.is_none().then(|| self.render_sidebar(cx));
         // Cards and the Drill-in carry click listeners, so they are built here
         // (where `Context<Self>` is available) and handed to the `&App` detail
         // render.
@@ -624,12 +665,30 @@ impl Render for Daku {
         let mute_controls = self.mute_controls(cx);
         let compare = self.compare_strip(cx);
         let sheet = self.env_sheet_view(cx);
-        let detail = self.render_detail(cards, drill_in, mute_controls, compare, cx);
-        let title: SharedString = self
-            .state
-            .selected()
-            .map(|environment| environment.label.clone().into())
-            .unwrap_or_else(|| "daku".into());
+        let detail = if removed {
+            div()
+                .flex_1()
+                .p(px(22.0))
+                .text_color(cx.theme().muted_foreground)
+                .child("This Environment was removed.")
+                .into_any_element()
+        } else {
+            self.render_detail(cards, drill_in, mute_controls, compare, cx)
+        };
+        let title: SharedString = match &self.detached {
+            Some(pinned) => self
+                .state
+                .environments()
+                .iter()
+                .find(|env| &env.id == pinned)
+                .map(|env| env.label.clone().into())
+                .unwrap_or_else(|| pinned.clone().into()),
+            None => self
+                .state
+                .selected()
+                .map(|environment| environment.label.clone().into())
+                .unwrap_or_else(|| "daku".into()),
+        };
         div()
             .track_focus(&self.focus_handle)
             .size_full()
@@ -640,8 +699,14 @@ impl Render for Daku {
             .flex()
             .flex_col()
             .text_color(cx.theme().foreground)
-            .on_action(cx.listener(|_, _: &CloseWindow, window, _cx| {
-                crate::platform::hide_window(window);
+            .on_action(cx.listener(|this, _: &CloseWindow, window, _cx| {
+                // Detached windows destroy on close; the main window hides so
+                // the session (and its daemon child) survives ⌘W.
+                if this.detached.is_some() {
+                    window.remove_window();
+                } else {
+                    crate::platform::hide_window(window);
+                }
             }))
             .on_action(cx.listener(|this, _: &ReloadDaemon, _, cx| {
                 // Local-only: `DaemonSupervisor::reload` refuses remote daemons
@@ -670,6 +735,19 @@ impl Render for Daku {
             .on_action(cx.listener(|this, _: &AddEnvironment, window, cx| {
                 this.open_add_sheet(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &DetachSelectedEnvironment, _, cx| {
+                let Some(id) = this.state.selected_id().map(str::to_owned) else {
+                    return;
+                };
+                let supervisor = this.supervisor.clone();
+                let settings = this.settings.clone();
+                let bounds = gpui::WindowBounds::Windowed(gpui::Bounds::centered(
+                    None,
+                    gpui::size(gpui::px(1100.0), gpui::px(800.0)),
+                    cx,
+                ));
+                let _ = crate::open_daku_window(cx, supervisor, &settings, None, Some(id), bounds);
+            }))
             .child(
                 TitleBar::new()
                     .bg(gpui::transparent_black())
@@ -689,7 +767,7 @@ impl Render for Daku {
                     .flex_1()
                     .min_h_0()
                     .items_start()
-                    .child(sidebar)
+                    .children(sidebar)
                     .child(detail),
             )
             .children(sheet)
@@ -1091,6 +1169,9 @@ impl Daku {
     /// row click selects that Environment and opens its drift drill-in via
     /// the shared `SelectEnvironment` action.
     fn compare_strip(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.detached.is_some() {
+            return None;
+        }
         let strip = self.state.compare_strip();
         if !strip.visible {
             return None;
