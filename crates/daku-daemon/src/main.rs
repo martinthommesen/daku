@@ -67,7 +67,20 @@ fn main() -> anyhow::Result<()> {
     daku_core::serve(
         listener,
         auth,
-        Arc::new(daku_core::SettingsBackend::new(settings)),
+        Arc::new(CombinedBackend {
+            settings: daku_core::SettingsBackend::new(settings),
+            environments: daku_core::environments::EnvironmentsBackend::new(
+                daku_core::default_environments_path(),
+                Arc::new(daku_core::config::KeychainCredentialStore),
+                Arc::new(daku_core::servicenow::ServiceNowClient::new(
+                    daku_core::servicenow::UreqTransport::default(),
+                    daku_core::servicenow::SystemClock,
+                )),
+                // Credential writes arrive over the wire: only a loopback
+                // daemon may perform them (ADR-0004 amendment).
+                !arguments.allow_non_loopback,
+            ),
+        }),
         shutdown,
         daku_core::ServerOptions {
             allowed_origins: arguments.allowed_origins.into_iter().collect(),
@@ -75,6 +88,30 @@ fn main() -> anyhow::Result<()> {
         },
         dashboard_events,
     )
+}
+
+/// One wire backend: settings commands go to `SettingsBackend`,
+/// Environment management to `EnvironmentsBackend`.
+struct CombinedBackend {
+    settings: daku_core::SettingsBackend,
+    environments: daku_core::environments::EnvironmentsBackend,
+}
+
+impl daku_core::Backend for CombinedBackend {
+    fn handle(
+        &self,
+        command: daku_protocol::Command,
+    ) -> anyhow::Result<daku_protocol::ResponsePayload> {
+        use daku_protocol::Command;
+        match command {
+            Command::Ping | Command::GetSettings | Command::UpdateSettings { .. } => {
+                self.settings.handle(command)
+            }
+            Command::SaveEnvironment { .. }
+            | Command::DeleteEnvironment { .. }
+            | Command::TestEnvironment { .. } => self.environments.handle(command),
+        }
+    }
 }
 
 fn run_probe_availability() -> anyhow::Result<()> {

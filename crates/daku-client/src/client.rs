@@ -23,7 +23,9 @@ const READ_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 enum Outgoing {
-    Message(ClientMessage),
+    // Boxed: management commands carry whole Environment configs; moving
+    // 240+ bytes through the channel by value trips large-enum-variant.
+    Message(Box<ClientMessage>),
     Shutdown,
 }
 
@@ -130,7 +132,7 @@ impl DaemonClient {
         if self
             .inner
             .outgoing
-            .send(Outgoing::Message(message))
+            .send(Outgoing::Message(Box::new(message)))
             .is_err()
         {
             self.inner.pending.lock().remove(&request_id);

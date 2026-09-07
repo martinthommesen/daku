@@ -31,6 +31,11 @@ impl Backend for SettingsBackend {
                 self.settings.replace(settings)?;
                 Ok(ResponsePayload::Ack)
             }
+            Command::SaveEnvironment { .. }
+            | Command::DeleteEnvironment { .. }
+            | Command::TestEnvironment { .. } => {
+                anyhow::bail!("environment management is served by EnvironmentsBackend")
+            }
         }
     }
 }

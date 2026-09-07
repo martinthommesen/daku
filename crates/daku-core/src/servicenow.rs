@@ -770,6 +770,14 @@ mod tests {
             self.gets.fetch_add(1, Ordering::SeqCst);
             self.inner.get(environment_id)
         }
+
+        fn set(&self, environment_id: &str, secret: &str) -> anyhow::Result<()> {
+            self.inner.set(environment_id, secret)
+        }
+
+        fn delete(&self, environment_id: &str) -> anyhow::Result<()> {
+            self.inner.delete(environment_id)
+        }
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::environment::EnvironmentConfig;
 use crate::settings::DaemonSettings;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "DAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "DAKU_DAEMON_ADDRESS";
@@ -49,7 +50,31 @@ pub struct Request {
 pub enum Command {
     Ping,
     GetSettings,
-    UpdateSettings { settings: DaemonSettings },
+    UpdateSettings {
+        settings: DaemonSettings,
+    },
+    /// Validates and persists an Environment plus, optionally, its Credential.
+    /// New ids are added; known ids are updated. Ends with a client-side
+    /// reload (`070`), which re-reads the file this writes.
+    SaveEnvironment {
+        environment: EnvironmentConfig,
+        /// Exact Keychain blob (`{"client_id","client_secret"}` for OAuth,
+        /// `{"username","password"}` for basic). `None` leaves the stored
+        /// Credential untouched. Refused when the daemon allows non-loopback
+        /// binds. Never logged.
+        credential_json: Option<String>,
+    },
+    /// Removes an Environment from the file and deletes its Keychain item.
+    DeleteEnvironment {
+        id: String,
+    },
+    /// Dry-run availability probe for unsaved edits. Writes nothing.
+    TestEnvironment {
+        environment: EnvironmentConfig,
+        /// Ephemeral Credential for testing a new Environment before saving.
+        /// Falls back to the stored item when `None`.
+        credential_json: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -336,7 +361,16 @@ pub enum ResponseOutcome {
 )]
 pub enum ResponsePayload {
     Ack,
-    Settings { settings: DaemonSettings },
+    Settings {
+        settings: DaemonSettings,
+    },
+    EnvironmentTest {
+        reachability: Reachability,
+        state: SignalState,
+        build: Option<String>,
+        error: Option<String>,
+        rtt_ms: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -510,7 +544,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_daku_domain() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     #[test]

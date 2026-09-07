@@ -6,102 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, anyhow};
-use serde::Deserialize;
 
 use daku_protocol::identity::DATA_DIRECTORY_NAME;
 
 pub const KEYCHAIN_SERVICE: &str = "daku";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthMethod {
-    OauthClientCredentials,
-    Basic,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct EnvironmentConfig {
-    pub id: String,
-    pub label: String,
-    pub instance_url: String,
-    pub auth_method: AuthMethod,
-    pub sort_order: i64,
-    #[serde(default)]
-    pub clone_source: bool,
-    /// Per-Environment threshold overrides; missing keys fall back to the
-    /// defaults below. Unknown keys are rejected so typos fail fast.
-    #[serde(default)]
-    pub thresholds: Thresholds,
-    /// Plugin/app ids (or store-app scopes — the same `id` the drift
-    /// mismatch list carries) that are planned differences from the clone
-    /// source. Only unexpected drift votes toward degraded.
-    #[serde(default)]
-    pub expected_drift: Vec<String>,
-}
-
-/// Degrade thresholds per Environment. Defaults preserve the historical
-/// hard-coded behaviour exactly: one overdue job, one syslog error, one
-/// outbound failure, any unhealthy MID or ECC error, ECC output-ready ≥ 100,
-/// any plugin/build mismatch degrades. Availability RTT never degraded before
-/// (`None` = disabled); jobs error count never voted before (`u64::MAX`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Thresholds {
-    pub jobs_overdue_degraded_at: u64,
-    pub jobs_error_degraded_at: u64,
-    pub syslog_error_degraded_at: u64,
-    pub outbound_failures_degraded_at: u64,
-    pub mid_unhealthy_degraded_at: u64,
-    pub ecc_error_degraded_at: u64,
-    pub ecc_output_ready_degraded_at: u64,
-    pub drift_mismatches_degraded_at: u64,
-    pub availability_rtt_degraded_ms: Option<u64>,
-}
-
-impl Default for Thresholds {
-    fn default() -> Self {
-        Self {
-            jobs_overdue_degraded_at: 1,
-            jobs_error_degraded_at: u64::MAX,
-            syslog_error_degraded_at: 1,
-            outbound_failures_degraded_at: 1,
-            mid_unhealthy_degraded_at: 1,
-            ecc_error_degraded_at: 1,
-            ecc_output_ready_degraded_at: 100,
-            drift_mismatches_degraded_at: 1,
-            availability_rtt_degraded_ms: None,
-        }
-    }
-}
-
-impl Thresholds {
-    /// One-line effective values for `daku-daemon doctor`.
-    pub fn summary(&self) -> String {
-        let off = |value: u64| {
-            if value == u64::MAX {
-                "off".to_owned()
-            } else {
-                value.to_string()
-            }
-        };
-        let rtt = self
-            .availability_rtt_degraded_ms
-            .map(|ms| format!("{ms}ms"))
-            .unwrap_or_else(|| "off".to_owned());
-        format!(
-            "jobs≥{}/err≥{} syslog≥{} outbound≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{}",
-            self.jobs_overdue_degraded_at,
-            off(self.jobs_error_degraded_at),
-            self.syslog_error_degraded_at,
-            self.outbound_failures_degraded_at,
-            self.mid_unhealthy_degraded_at,
-            self.ecc_error_degraded_at,
-            self.ecc_output_ready_degraded_at,
-            self.drift_mismatches_degraded_at,
-            rtt,
-        )
-    }
-}
+pub use daku_protocol::{AuthMethod, EnvironmentConfig, Thresholds};
 
 pub fn default_environments_path() -> PathBuf {
     dirs::home_dir()
@@ -138,6 +48,12 @@ fn validate_instance_url(id: &str, url: &str) -> anyhow::Result<()> {
 /// Value is JSON: oauth → `{"client_id","client_secret"}`; basic → `{"username","password"}`.
 pub trait CredentialStore: Send + Sync {
     fn get(&self, environment_id: &str) -> anyhow::Result<Option<String>>;
+    /// Writes (creates or rotates) the secret blob. Only the daemon calls
+    /// this, and only for an explicit Operator save over the authenticated
+    /// loopback socket (ADR-0004 amendment, plan `080`).
+    fn set(&self, environment_id: &str, secret: &str) -> anyhow::Result<()>;
+    /// Deletes the secret blob. Missing items are not an error.
+    fn delete(&self, environment_id: &str) -> anyhow::Result<()>;
 }
 
 #[derive(Default)]
@@ -163,6 +79,19 @@ impl CredentialStore for MemoryCredentialStore {
             .get(environment_id)
             .cloned())
     }
+
+    fn set(&self, environment_id: &str, secret: &str) -> anyhow::Result<()> {
+        self.insert(environment_id, secret);
+        Ok(())
+    }
+
+    fn delete(&self, environment_id: &str) -> anyhow::Result<()> {
+        self.secrets
+            .lock()
+            .expect("credential map")
+            .remove(environment_id);
+        Ok(())
+    }
 }
 
 pub struct KeychainCredentialStore;
@@ -170,6 +99,14 @@ pub struct KeychainCredentialStore;
 impl CredentialStore for KeychainCredentialStore {
     fn get(&self, environment_id: &str) -> anyhow::Result<Option<String>> {
         keychain_get(environment_id)
+    }
+
+    fn set(&self, environment_id: &str, secret: &str) -> anyhow::Result<()> {
+        keychain_set(environment_id, secret)
+    }
+
+    fn delete(&self, environment_id: &str) -> anyhow::Result<()> {
+        keychain_delete(environment_id)
     }
 }
 
@@ -186,8 +123,41 @@ fn keychain_get(environment_id: &str) -> anyhow::Result<Option<String>> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn keychain_set(environment_id: &str, secret: &str) -> anyhow::Result<()> {
+    use security_framework::passwords::set_generic_password;
+
+    // Creates or rotates (`set_generic_password` updates on duplicate), so a
+    // re-save never fails on the existing item. The bytes travel process
+    // memory only — never argv, env, logs, or SQLite.
+    set_generic_password(KEYCHAIN_SERVICE, environment_id, secret.as_bytes())
+        .with_context(|| format!("keychain write for {environment_id}"))
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_delete(environment_id: &str) -> anyhow::Result<()> {
+    use security_framework::passwords::delete_generic_password;
+
+    match delete_generic_password(KEYCHAIN_SERVICE, environment_id) {
+        Ok(()) => Ok(()),
+        // Already gone is the desired end state.
+        Err(error) if error.code() == -25300 => Ok(()),
+        Err(error) => Err(anyhow!("keychain delete for {environment_id}: {error}")),
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn keychain_get(_environment_id: &str) -> anyhow::Result<Option<String>> {
+    Err(anyhow!("macOS Keychain is not available on this platform"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_set(_environment_id: &str, _secret: &str) -> anyhow::Result<()> {
+    Err(anyhow!("macOS Keychain is not available on this platform"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_delete(_environment_id: &str) -> anyhow::Result<()> {
     Err(anyhow!("macOS Keychain is not available on this platform"))
 }
 
@@ -354,6 +324,32 @@ mod tests {
         let environments = load_environments(file.path()).unwrap();
         assert_eq!(environments[0].thresholds, Thresholds::default());
         assert!(environments[0].expected_drift.is_empty());
+    }
+
+    /// Operator-run check for plan 080: an item created by this binary reads
+    /// back in the same binary. Ignored by default — it touches the real login
+    /// keychain (throwaway service name, deleted afterwards). Run with
+    /// `cargo test -p daku-core -- --ignored keychain`.
+    /// A first-run authorization dialog is the expected macOS behaviour; a
+    /// failure here re-plans 080 around client-side `security` prompting.
+    #[cfg(target_os = "macos")]
+    #[ignore]
+    #[test]
+    fn keychain_write_reads_back_in_same_binary() {
+        use security_framework::passwords::{
+            delete_generic_password, get_generic_password, set_generic_password,
+        };
+        let service = "daku-keychain-check-throwaway";
+        let account = "check-1";
+        let secret = b"{\"probe\": true}";
+        set_generic_password(service, account, secret).expect("keychain write");
+        let back = get_generic_password(service, account).expect("keychain read-back");
+        assert_eq!(back, secret, "same binary must read what it wrote");
+        delete_generic_password(service, account).expect("keychain cleanup");
+        assert!(
+            get_generic_password(service, account).is_err(),
+            "throwaway item must be gone"
+        );
     }
 
     /// The rules moved to `daku-protocol`; these are the strings `daku-daemon
