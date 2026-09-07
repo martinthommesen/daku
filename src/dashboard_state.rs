@@ -395,6 +395,13 @@ impl DashboardState {
         self.selected_id.as_deref()
     }
 
+    pub fn environment_label(&self, id: &str) -> Option<&str> {
+        self.environments
+            .iter()
+            .find(|environment| environment.id == id)
+            .map(|environment| environment.label.as_str())
+    }
+
     pub fn selected(&self) -> Option<&EnvironmentSummary> {
         let id = self.selected_id.as_deref()?;
         self.environments
@@ -965,6 +972,30 @@ impl DashboardState {
                 EnvironmentHealth::Degraded => 1,
                 EnvironmentHealth::Down => 2,
             })
+    }
+
+    /// Worst degraded/down line for one Environment: "{Signal label}:
+    /// {summary}". Drives notification bodies. `None` when nothing needs
+    /// attention (in particular on recovery — the caller then says so).
+    pub fn headline_for(&self, env_id: &str) -> Option<(EnvironmentHealth, String)> {
+        let environment = self.environments.iter().find(|env| env.id == env_id)?;
+        let snapshots = self.snapshots.get(env_id)?;
+        for signal_id in SIGNAL_IDS {
+            let snapshot = snapshots.get(signal_id)?;
+            if !matches!(snapshot.dto.state.as_str(), "degraded" | "down") {
+                continue;
+            }
+            let summary = summarize_value(signal_id, &snapshot.payload);
+            let detail = detail_from_value(signal_id, &snapshot.payload);
+            let body = if !summary.is_empty() { summary } else { detail };
+            let line = if body.is_empty() {
+                signal_label(signal_id).to_owned()
+            } else {
+                format!("{}: {body}", signal_label(signal_id))
+            };
+            return Some((environment.health, line));
+        }
+        None
     }
 
     /// One-line diagnostic for the selected Environment's Signal: the daemon's
@@ -2488,6 +2519,23 @@ mod tests {
         test.select("test");
         assert!(test.build_age().is_none(), "test carries no build events");
         assert!(DashboardState::new().build_age().is_none());
+    }
+
+    #[test]
+    fn headline_for_names_worst_signal_or_nothing() {
+        let state = loaded();
+        let (health, line) = state.headline_for("prod").expect("prod headline");
+        assert_eq!(health, EnvironmentHealth::Degraded);
+        assert!(line.starts_with("Scheduled jobs: "), "{line}");
+        assert!(state.headline_for("test").is_some());
+        assert!(state.headline_for("nope").is_none());
+        // Recovery: an all-healthy Environment has no headline.
+        let mut calm = loaded();
+        calm.apply(&ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "prod".into(),
+            snapshots: vec![snap("jobs", "healthy", r#"{"overdue_ready":0,"error":0}"#)],
+        });
+        assert!(calm.headline_for("prod").is_none());
     }
 
     #[test]

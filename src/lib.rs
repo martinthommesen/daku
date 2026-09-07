@@ -3,6 +3,7 @@
 mod app;
 pub mod daemon;
 mod dashboard_state;
+mod notifications;
 mod platform;
 mod updater;
 
@@ -24,7 +25,8 @@ actions!(
         CloseWindow,
         CheckForUpdates,
         ReloadDaemon,
-        CopySummary
+        CopySummary,
+        ToggleNotifications
     ]
 );
 
@@ -83,6 +85,9 @@ pub fn run() {
     // file is fatal here so a mute is never silently dropped.
     let settings = crate::persistence::load_or_create_app_settings()
         .unwrap_or_else(|error| panic!("failed to load daku app settings: {error:#}"));
+    // Notification click router (105): the delegate lives process-wide, the
+    // shell pumps the receiver for Environment ids.
+    let notify_clicks = crate::notifications::install_click_router();
 
     gpui_platform::application()
         .with_assets(gpui_component_assets::Assets)
@@ -143,7 +148,8 @@ pub fn run() {
                                 gpui_component::Theme::sync_system_appearance(Some(window), cx);
                             })
                             .detach();
-                        let view = Daku::new(window, cx, daemon, settings.clone());
+                        let view =
+                            Daku::new(window, cx, daemon, settings.clone(), notify_clicks.clone());
                         // Root paints an opaque `background`; clear it so the
                         // window's blurred backdrop shows through `Daku`'s tint.
                         cx.new(|cx| {
@@ -179,6 +185,10 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
                     items.push(MenuItem::action("Check for Updates…", CheckForUpdates));
                 }
                 items.push(MenuItem::action("Copy Environment Summary", CopySummary));
+                items.push(MenuItem::action(
+                    "Toggle Health Notifications",
+                    ToggleNotifications,
+                ));
                 items.push(MenuItem::separator());
                 items.push(MenuItem::action(format!("Quit {APP_NAME}"), Quit));
                 items

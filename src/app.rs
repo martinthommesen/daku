@@ -1,7 +1,10 @@
 //! Environments overview — sidebar + detail (variant C).
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, mpsc};
+
 use daku_client::DaemonSupervisor;
-use daku_protocol::{EnvironmentHealth, Reachability};
+use daku_protocol::{EnvironmentHealth, HealthEventDto, Reachability, ServerMessage};
 use gpui::{
     App, AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, FontWeight,
     IntoElement, PathBuilder, Pixels, Point, SharedString, Window, canvas, div, point, prelude::*,
@@ -25,10 +28,14 @@ use crate::CopySummary;
 use crate::ReloadDaemon;
 use crate::SelectEnvironment;
 use crate::SelectEnvironmentSlot;
+use crate::ToggleNotifications;
 use crate::dashboard_state::{
     DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase,
     fixture_events, format_health_event, freshness, is_trend_signal, mute_remaining_label,
     signal_label, ui_fixture_enabled,
+};
+use crate::notifications::{
+    notification_body, notification_title, post_health_notification, select_notification,
 };
 use crate::persistence::{AppSettings, save_app_settings};
 
@@ -40,6 +47,11 @@ pub struct Daku {
     settings: AppSettings,
     /// Copy-summary confirmation, cleared ~2 s after ⌘⇧C.
     copied_flash: bool,
+    /// Desktop boot time: health events observed before this record as seen
+    /// without firing, so launch/reconnect replays never storm.
+    boot_now: i64,
+    /// (Environment, observed_at, kind) triples already decided on.
+    notify_seen: HashSet<(String, i64, String)>,
     /// `Root` owns the window's root dispatch node, so the shell only receives
     /// menu- and keystroke-dispatched actions while this handle is focused.
     focus_handle: FocusHandle,
@@ -54,6 +66,7 @@ impl Daku {
         cx: &mut App,
         supervisor: Option<DaemonSupervisor>,
         settings: AppSettings,
+        notify_clicks: Option<Arc<Mutex<mpsc::Receiver<String>>>>,
     ) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
         let entity = cx.new(|cx| {
@@ -66,11 +79,16 @@ impl Daku {
                 listen_dashboard(supervisor, cx);
             }
             tick_freshness(cx);
+            if let Some(clicks) = notify_clicks {
+                pump_notification_clicks(clicks, cx);
+            }
             Self {
                 state,
                 supervisor,
                 settings,
                 copied_flash: false,
+                boot_now: unix_now(),
+                notify_seen: HashSet::new(),
                 focus_handle: focus_handle.clone(),
             }
         });
@@ -102,6 +120,35 @@ impl Daku {
         if let Err(error) = save_app_settings(&self.settings) {
             eprintln!("could not save daku app settings: {error:#}");
         }
+    }
+
+    /// Decides on one batch of published health events: records everything
+    /// seen, posts at most the latest novel transition. Pre-boot history,
+    /// replays, muted Environments and the global off switch stay silent.
+    fn note_health_events(&mut self, env_id: &str, events: &[HealthEventDto]) {
+        let (record, fire) = select_notification(env_id, events, &self.notify_seen, self.boot_now);
+        self.notify_seen.extend(record);
+        let Some(event) = fire else { return };
+        if !self.settings.notifications_enabled {
+            return;
+        }
+        if self.state.is_muted(env_id, unix_now()) {
+            return;
+        }
+        let label = self
+            .state
+            .environment_label(env_id)
+            .unwrap_or(env_id)
+            .to_owned();
+        let (health, headline) = match self.state.headline_for(env_id) {
+            Some((health, line)) => (health, Some(line)),
+            None => (event.to_health, None),
+        };
+        post_health_notification(
+            env_id,
+            &notification_title(&label),
+            &notification_body(health, headline.as_deref()),
+        );
     }
 
     /// The one "take me there" primitive: selects an Environment and
@@ -168,6 +215,40 @@ fn tick_freshness(cx: &mut Context<Daku>) {
     .detach();
 }
 
+/// Forwards notification clicks to the shared SelectEnvironment path: a
+/// click takes the Operator to that Environment without opening drift.
+fn pump_notification_clicks(clicks: Arc<Mutex<mpsc::Receiver<String>>>, cx: &mut Context<Daku>) {
+    cx.spawn(async move |this, cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            let ids: Vec<String> = clicks
+                .lock()
+                .expect("notification click channel")
+                .try_iter()
+                .collect();
+            if ids.is_empty() {
+                if this.update(cx, |_, _| {}).is_err() {
+                    break;
+                }
+                continue;
+            }
+            if this
+                .update(cx, |this, cx| {
+                    for id in &ids {
+                        this.select_environment(id, false, cx);
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
 fn listen_dashboard(supervisor: &DaemonSupervisor, cx: &mut Context<Daku>) {
     // DaemonSupervisor clients have already completed Hello.
     let supervisor = supervisor.clone();
@@ -200,6 +281,13 @@ fn listen_dashboard(supervisor: &DaemonSupervisor, cx: &mut Context<Daku>) {
                 {
                     Ok(message) => {
                         let _ = this.update(cx, |this, cx| {
+                            if let ServerMessage::HealthEventsUpdated {
+                                environment_id,
+                                events,
+                            } = &message
+                            {
+                                this.note_health_events(environment_id, events);
+                            }
                             this.state.apply(&message);
                             cx.notify();
                         });
@@ -277,6 +365,11 @@ impl Render for Daku {
             }))
             .on_action(cx.listener(|this, _: &CopySummary, _, cx| {
                 this.copy_summary(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleNotifications, _, cx| {
+                this.settings.notifications_enabled = !this.settings.notifications_enabled;
+                this.persist_settings();
+                cx.notify();
             }))
             .child(
                 TitleBar::new()

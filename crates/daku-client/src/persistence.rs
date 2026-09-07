@@ -13,8 +13,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::process::DaemonExposureSettings;
 
+fn default_notifications_on() -> bool {
+    true
+}
+
 /// Desktop-owned preferences (`app.json`). The daemon owns `settings.json`.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub daemon_exposure: DaemonExposureSettings,
@@ -22,6 +26,20 @@ pub struct AppSettings {
     /// surfaces (notifications, menu-bar dot, Dock badge) stay silent.
     /// Expired entries are pruned on read. The daemon keeps collecting.
     pub mutes: HashMap<String, i64>,
+    /// Master switch for health-change notifications. Mutes still apply
+    /// per-Environment when this is on.
+    #[serde(default = "default_notifications_on")]
+    pub notifications_enabled: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            daemon_exposure: DaemonExposureSettings::default(),
+            mutes: HashMap::new(),
+            notifications_enabled: true,
+        }
+    }
 }
 
 impl AppSettings {
@@ -236,6 +254,7 @@ mod tests {
         let settings = load_or_create_app_settings_at(path).unwrap();
         assert!(settings.mutes.is_empty());
         assert!(!settings.is_muted("prod", 1_700_000_000));
+        assert!(settings.notifications_enabled, "legacy files default to on");
     }
 
     #[test]

@@ -84,6 +84,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSString",
     "NSURL",
 ] }
+objc2-user-notifications = "0.3"
+block2 = "0.6"
 raw-window-handle = "0.6"
 
 [profile.release]
