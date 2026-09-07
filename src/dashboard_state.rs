@@ -434,6 +434,25 @@ impl DashboardState {
         self.trend_window
     }
 
+    /// Environments needing attention right now: observed, degraded or down,
+    /// and not Operator-muted. Drives the Dock badge count (`107`).
+    pub fn troubled_count(&self, now: i64) -> usize {
+        if !self.connected {
+            return 0;
+        }
+        self.environments
+            .iter()
+            .filter(|environment| environment.last_observed_at.is_some())
+            .filter(|environment| !self.is_muted(&environment.id, now))
+            .filter(|environment| {
+                matches!(
+                    environment.health,
+                    EnvironmentHealth::Degraded | EnvironmentHealth::Down
+                )
+            })
+            .count()
+    }
+
     pub fn set_trend_window(&mut self, window: TrendWindow) {
         self.trend_window = window;
     }
@@ -2545,6 +2564,18 @@ mod tests {
             snapshots: vec![snap("jobs", "healthy", r#"{"overdue_ready":0,"error":0}"#)],
         });
         assert!(calm.headline_for("prod").is_none());
+    }
+
+    #[test]
+    fn troubled_count_skips_healthy_muted_and_disconnected() {
+        let mut state = loaded();
+        // Fixture: prod degraded, test healthy.
+        assert_eq!(state.troubled_count(TEST_NOW), 1);
+        state.set_mute("prod", TEST_NOW + 3600);
+        assert_eq!(state.troubled_count(TEST_NOW), 0);
+        state.clear_mute("prod");
+        state.set_connected(false);
+        assert_eq!(state.troubled_count(TEST_NOW), 0);
     }
 
     #[test]

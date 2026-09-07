@@ -68,6 +68,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSVisualEffectView",
     "NSWindow",
     "NSWorkspace",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSDockTile",
+    "NSColor",
+    "NSAttributedString",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -83,6 +89,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSProcessInfo",
     "NSString",
     "NSURL",
+    "NSAttributedString",
+    "NSObject",
 ] }
 objc2-user-notifications = "0.3"
 block2 = "0.6"

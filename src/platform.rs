@@ -110,6 +110,92 @@ pub fn hide_window(window: &mut Window) {
     window.remove_window();
 }
 
+/// Always-on attention surfaces (`107`): a coloured dot in the menu bar and
+/// a troubled-Environment count on the Dock icon. Both derive from the
+/// existing worst-health roll-up with muted Environments excluded, cost no
+/// new data, and clear when disconnected.
+///
+/// Deliberately passive: no menu-bar dropdown and no Dock menu here. Both
+/// need an Objective-C target object that would collide with GPUI's own
+/// application delegate, so they are a separate, abandonable step.
+#[cfg(target_os = "macos")]
+pub fn reflect_ambient_health(
+    worst: Option<daku_protocol::EnvironmentHealth>,
+    troubled: usize,
+    connected: bool,
+) {
+    use std::cell::RefCell;
+
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, ProtocolObject};
+    use objc2::{AnyThread, MainThreadMarker};
+    use objc2_app_kit::{
+        NSApplication, NSColor, NSSquareStatusItemLength, NSStatusBar, NSStatusItem,
+    };
+    use objc2_foundation::{
+        NSAttributedString, NSAttributedStringKey, NSDictionary, NSMutableDictionary, NSString,
+    };
+
+    // NSStatusItem is main-thread-only: thread-local retention is honest, and
+    // GPUI drives renders on the main thread on macOS.
+    thread_local! {
+        static STATUS_ITEM: RefCell<Option<Retained<NSStatusItem>>> =
+            const { RefCell::new(None) };
+    }
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    STATUS_ITEM.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot =
+                Some(NSStatusBar::systemStatusBar().statusItemWithLength(NSSquareStatusItemLength));
+        }
+        let Some(item) = slot.as_deref() else {
+            return;
+        };
+        let color = match (connected, worst) {
+            (false, _) | (_, None) => NSColor::systemGrayColor(),
+            (_, Some(daku_protocol::EnvironmentHealth::Healthy)) => NSColor::systemGreenColor(),
+            (_, Some(daku_protocol::EnvironmentHealth::Degraded)) => NSColor::systemYellowColor(),
+            (_, Some(daku_protocol::EnvironmentHealth::Down)) => NSColor::systemRedColor(),
+        };
+        // A bare title cannot carry colour; one foreground-color attribute does.
+        let attrs: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> = unsafe {
+            let dict: Retained<NSMutableDictionary<NSAttributedStringKey, NSColor>> =
+                NSMutableDictionary::new();
+            dict.setObject_forKey(
+                &color,
+                ProtocolObject::from_ref(objc2_app_kit::NSForegroundColorAttributeName),
+            );
+            Retained::cast_unchecked(dict)
+        };
+        let dot = unsafe {
+            NSAttributedString::initWithString_attributes(
+                NSAttributedString::alloc(),
+                &NSString::from_str("\u{25cf}"),
+                Some(&attrs),
+            )
+        };
+        if let Some(button) = item.button(mtm) {
+            button.setAttributedTitle(&dot);
+        }
+        let badge = (connected && troubled > 0).then(|| NSString::from_str(&troubled.to_string()));
+        NSApplication::sharedApplication(mtm)
+            .dockTile()
+            .setBadgeLabel(badge.as_deref());
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn reflect_ambient_health(
+    _worst: Option<daku_protocol::EnvironmentHealth>,
+    _troubled: usize,
+    _connected: bool,
+) {
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::parse_boolean_setting;

@@ -54,6 +54,9 @@ pub struct Daku {
     boot_now: i64,
     /// (Environment, observed_at, kind) triples already decided on.
     notify_seen: HashSet<(String, i64, String)>,
+    /// Last ambient reflection (connected, worst, troubled): the menu-bar
+    /// dot and Dock badge update only on change, never per-frame.
+    last_ambient: Option<(bool, Option<EnvironmentHealth>, usize)>,
     /// Add/edit Environment sheet (`106`); `None` hides it.
     env_sheet: Option<EnvSheet>,
     /// `Root` owns the window's root dispatch node, so the shell only receives
@@ -93,6 +96,7 @@ impl Daku {
                 copied_flash: false,
                 boot_now: unix_now(),
                 notify_seen: HashSet::new(),
+                last_ambient: None,
                 env_sheet: None,
                 focus_handle: focus_handle.clone(),
             }
@@ -446,6 +450,23 @@ impl Daku {
         );
     }
 
+    /// Pushes worst-health + troubled-count to the menu-bar dot and Dock
+    /// badge when anything changed. Render-side and idempotent; the menus
+    /// themselves stay a separate step.
+    fn reflect_ambient(&mut self) {
+        let now = unix_now();
+        let ambient = (
+            self.state.connected(),
+            self.state.worst_health_excluding_muted(now),
+            self.state.troubled_count(now),
+        );
+        if self.last_ambient != Some(ambient) {
+            self.last_ambient = Some(ambient);
+            let (connected, worst, troubled) = ambient;
+            crate::platform::reflect_ambient_health(worst, troubled, connected);
+        }
+    }
+
     fn copy_summary(&mut self, cx: &mut Context<Self>) {
         let text = self.state.summary_text(unix_now());
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
@@ -580,6 +601,7 @@ fn listen_dashboard(supervisor: &DaemonSupervisor, cx: &mut Context<Daku>) {
 
 impl Render for Daku {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reflect_ambient();
         let sidebar = self.render_sidebar(cx);
         // Cards and the Drill-in carry click listeners, so they are built here
         // (where `Context<Self>` is available) and handed to the `&App` detail
