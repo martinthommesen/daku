@@ -427,7 +427,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::config::MemoryCredentialStore;
+    use crate::config::{MemoryCredentialStore, Thresholds};
 
     #[test]
     fn parse_aggregate_count_reads_stats_count_string() {
@@ -525,6 +525,8 @@ mod tests {
             auth_method: AuthMethod::Basic,
             sort_order: 0,
             clone_source: false,
+            thresholds: Thresholds::default(),
+            expected_drift: Vec::new(),
         }
     }
 
@@ -536,6 +538,8 @@ mod tests {
             auth_method: AuthMethod::OauthClientCredentials,
             sort_order: 0,
             clone_source: false,
+            thresholds: Thresholds::default(),
+            expected_drift: Vec::new(),
         }
     }
 

@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use daku_protocol::SignalState;
 
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
-use crate::config::{CredentialStore, EnvironmentConfig};
+use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
 pub const JOBS_SIGNAL_ID: &str = "jobs";
@@ -12,8 +12,10 @@ pub const JOBS_OVERDUE_PATH: &str = "/api/now/stats/sys_trigger?sysparm_count=tr
 pub const JOBS_ERROR_PATH: &str =
     "/api/now/stats/sys_trigger?sysparm_count=true&sysparm_query=state=3";
 
-pub fn jobs_state(overdue_ready: u64) -> SignalState {
-    if overdue_ready > 0 {
+pub fn jobs_state(overdue_ready: u64, error: u64, thresholds: &Thresholds) -> SignalState {
+    if overdue_ready >= thresholds.jobs_overdue_degraded_at
+        || error >= thresholds.jobs_error_degraded_at
+    {
         SignalState::Degraded
     } else {
         SignalState::Healthy
@@ -53,7 +55,7 @@ impl Signal for JobsSignal {
             }
         };
         Ok(Observation {
-            state: jobs_state(overdue_ready),
+            state: jobs_state(overdue_ready, error, &environment.thresholds),
             payload: serde_json::json!({
                 "overdue_ready": overdue_ready,
                 "error": error,
@@ -167,6 +169,42 @@ mod tests {
         let samples =
             persistence::load_signal_samples(&connection, "prod", JOBS_SIGNAL_ID).unwrap();
         assert_eq!(samples[0].value_real, Some(2.0));
+    }
+
+    #[test]
+    fn jobs_state_honours_threshold_overrides() {
+        use crate::config::Thresholds;
+        let defaults = Thresholds::default();
+        assert_eq!(
+            jobs_state(1, 0, &defaults),
+            daku_protocol::SignalState::Degraded
+        );
+        assert_eq!(
+            jobs_state(0, 0, &defaults),
+            daku_protocol::SignalState::Healthy
+        );
+        // Error count never voted historically; the MAX default keeps that.
+        assert_eq!(
+            jobs_state(0, 41, &defaults),
+            daku_protocol::SignalState::Healthy
+        );
+        let lenient = Thresholds {
+            jobs_overdue_degraded_at: 5,
+            jobs_error_degraded_at: 3,
+            ..Thresholds::default()
+        };
+        assert_eq!(
+            jobs_state(4, 2, &lenient),
+            daku_protocol::SignalState::Healthy
+        );
+        assert_eq!(
+            jobs_state(5, 0, &lenient),
+            daku_protocol::SignalState::Degraded
+        );
+        assert_eq!(
+            jobs_state(0, 3, &lenient),
+            daku_protocol::SignalState::Degraded
+        );
     }
 
     struct JobsFailTransport;

@@ -19,6 +19,12 @@
     "label": "Dev",
     "instance_url": "https://acme-dev.example.service-now.com",
     "auth_method": "basic",
-    "sort_order": 2
+    "sort_order": 2,
+    "thresholds": {
+      "jobs_overdue_degraded_at": 5,
+      "syslog_error_degraded_at": 10,
+      "outbound_failures_degraded_at": 5
+    },
+    "expected_drift": ["com.example.staged_plugin"]
   }
 ]

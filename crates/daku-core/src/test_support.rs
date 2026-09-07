@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{AuthMethod, EnvironmentConfig};
+use crate::config::{AuthMethod, EnvironmentConfig, Thresholds};
 use crate::persistence::StateStore;
 
 /// Unique SQLite path under the OS temp dir; removes the db and its WAL/SHM
@@ -77,6 +77,8 @@ pub fn prod() -> EnvironmentConfig {
         auth_method: AuthMethod::Basic,
         sort_order: 0,
         clone_source: false,
+        thresholds: Thresholds::default(),
+        expected_drift: Vec::new(),
     }
 }
 

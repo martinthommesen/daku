@@ -3,7 +3,7 @@
 use daku_protocol::SignalState;
 
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
-use crate::config::{CredentialStore, EnvironmentConfig};
+use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
 pub const SYSLOG_SIGNAL_ID: &str = "syslog";
@@ -15,8 +15,8 @@ pub fn syslog_error_path() -> String {
     )
 }
 
-pub fn syslog_state(error_count_1h: u64) -> SignalState {
-    if error_count_1h > 0 {
+pub fn syslog_state(error_count_1h: u64, thresholds: &Thresholds) -> SignalState {
+    if error_count_1h >= thresholds.syslog_error_degraded_at {
         SignalState::Degraded
     } else {
         SignalState::Healthy
@@ -46,7 +46,7 @@ impl Signal for SyslogSignal {
         let error_count_1h =
             fetch_aggregate_count(client, environment, credentials, &syslog_error_path())?;
         Ok(Observation {
-            state: syslog_state(error_count_1h),
+            state: syslog_state(error_count_1h, &environment.thresholds),
             payload: serde_json::json!({ "error_count_1h": error_count_1h }),
             sample: Some(error_count_1h as f64),
         })
@@ -66,6 +66,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::config::Thresholds;
 
     struct SyslogCountTransport {
         body: &'static str,
@@ -94,6 +95,20 @@ mod tests {
                 body: self.body.into(),
             })
         }
+    }
+
+    #[test]
+    fn syslog_state_honours_threshold_override() {
+        assert_eq!(
+            syslog_state(1, &Thresholds::default()),
+            SignalState::Degraded
+        );
+        let lenient = Thresholds {
+            syslog_error_degraded_at: 10,
+            ..Thresholds::default()
+        };
+        assert_eq!(syslog_state(9, &lenient), SignalState::Healthy);
+        assert_eq!(syslog_state(10, &lenient), SignalState::Degraded);
     }
 
     #[test]

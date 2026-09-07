@@ -7,7 +7,7 @@ use daku_protocol::{Reachability, SignalState};
 use rusqlite::Connection;
 
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
-use crate::config::{CredentialStore, EnvironmentConfig};
+use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::persistence;
 use crate::servicenow::ServiceNowClient;
 
@@ -158,7 +158,7 @@ impl AvailabilitySignal {
         environment: &EnvironmentConfig,
     ) -> AvailabilityObservation {
         let started = Instant::now();
-        match client.request(environment, credentials, "GET", GLIDE_WAR_PATH, None) {
+        let observed = match client.request(environment, credentials, "GET", GLIDE_WAR_PATH, None) {
             Ok(response) => classify_availability_response(
                 response.status,
                 response.header("content-type").unwrap_or(""),
@@ -172,7 +172,29 @@ impl AvailabilitySignal {
                 started.elapsed().as_millis() as u64,
                 Some(error.to_string()),
             ),
-        }
+        };
+        apply_rtt_threshold(observed, &environment.thresholds)
+    }
+}
+
+/// A reachable Environment slower than its configured ceiling degrades, with
+/// the ceiling in the error string so the card says why. `None` disables the
+/// check — the historical behaviour, since availability never had a response-
+/// time threshold before.
+pub fn apply_rtt_threshold(
+    observation: AvailabilityObservation,
+    thresholds: &Thresholds,
+) -> AvailabilityObservation {
+    let Some(max_ms) = thresholds.availability_rtt_degraded_ms else {
+        return observation;
+    };
+    if observation.reachability != Reachability::Reachable || observation.rtt_ms <= max_ms {
+        return observation;
+    }
+    AvailabilityObservation {
+        state: SignalState::Degraded,
+        error: Some(format!("rtt {} ms > {} ms", observation.rtt_ms, max_ms)),
+        ..observation
     }
 }
 
@@ -233,11 +255,44 @@ fn parse_glide_war(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Thresholds;
     use crate::test_support::TempDb;
 
     const OK_JSON: &str = include_str!("../tests/fixtures/availability/ok.json");
     const HIBERNATING_HTML: &str = include_str!("../tests/fixtures/availability/hibernating.html");
     const UNAUTH_JSON: &str = include_str!("../tests/fixtures/availability/401.json");
+
+    #[test]
+    fn rtt_threshold_is_disabled_by_default() {
+        let observation = classify_availability_response(200, "application/json", OK_JSON, 42);
+        let unchanged = apply_rtt_threshold(observation.clone(), &Thresholds::default());
+        assert_eq!(unchanged, observation);
+        assert_eq!(unchanged.state, SignalState::Healthy);
+    }
+
+    #[test]
+    fn slow_reachable_environment_degrades_with_ceiling_in_error() {
+        let observation = classify_availability_response(200, "application/json", OK_JSON, 1200);
+        let thresholds = Thresholds {
+            availability_rtt_degraded_ms: Some(500),
+            ..Thresholds::default()
+        };
+        let degraded = apply_rtt_threshold(observation, &thresholds);
+        assert_eq!(degraded.state, SignalState::Degraded);
+        assert_eq!(degraded.reachability, Reachability::Reachable);
+        assert_eq!(degraded.error.as_deref(), Some("rtt 1200 ms > 500 ms"));
+        // Fast stays healthy; unreachable never votes on latency.
+        let fast = classify_availability_response(200, "application/json", OK_JSON, 100);
+        assert_eq!(
+            apply_rtt_threshold(fast, &thresholds).state,
+            SignalState::Healthy
+        );
+        let down = classify_availability_response(429, "application/json", "{}", 5000);
+        assert_eq!(
+            apply_rtt_threshold(down, &thresholds).state,
+            SignalState::Down
+        );
+    }
 
     #[test]
     fn classify_availability_ok_is_reachable_healthy() {

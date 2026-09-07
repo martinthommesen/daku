@@ -50,6 +50,7 @@
   "drift_compare": {
     "payload": {
       "build_matches": false,
+      "expected_mismatches": 0,
       "mismatch_list": [
         {
           "id": "com.example.plugin_a",

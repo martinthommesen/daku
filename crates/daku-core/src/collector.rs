@@ -480,6 +480,10 @@ pub struct DoctorRow {
     pub build: Option<String>,
     pub error: Option<String>,
     pub rtt_ms: u64,
+    /// Effective per-Environment thresholds (`Thresholds::summary`).
+    pub thresholds: String,
+    /// Planned drift entries declared in `expected_drift`.
+    pub expected_drift: usize,
 }
 
 pub struct DoctorReport {
@@ -519,6 +523,8 @@ pub fn run_doctor(
                 build: observation.build,
                 error: observation.error,
                 rtt_ms: observation.rtt_ms,
+                thresholds: environment.thresholds.summary(),
+                expected_drift: environment.expected_drift.len(),
             }
         })
         .collect();

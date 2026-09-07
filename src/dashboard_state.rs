@@ -845,7 +845,15 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
                 "source of truth".into()
             } else if let Some(count) = value.get("mismatches").and_then(|item| item.as_u64()) {
-                format!("{count} plugins differ")
+                let expected = value
+                    .get("expected_mismatches")
+                    .and_then(|item| item.as_u64())
+                    .unwrap_or(0);
+                if expected > 0 {
+                    format!("{count} differ · {expected} expected")
+                } else {
+                    format!("{count} plugins differ")
+                }
             } else {
                 String::new()
             }
@@ -1304,6 +1312,32 @@ mod tests {
                 .unwrap(),
             "https://test.example.service-now.com/v_plugin_list.do"
         );
+    }
+
+    #[test]
+    fn drift_summary_shows_expected_count_when_planned() {
+        let mut state = DashboardState::new();
+        state.set_connected(true);
+        state.apply_all(&[
+            ServerMessage::EnvironmentsUpdated {
+                environments: vec![env(
+                    "e",
+                    "E",
+                    EnvironmentHealth::Degraded,
+                    Reachability::Reachable,
+                )],
+            },
+            ServerMessage::SignalSnapshotsUpdated {
+                environment_id: "e".into(),
+                snapshots: vec![snap(
+                    "drift",
+                    "degraded",
+                    r#"{"mismatches":3,"expected_mismatches":2,"build_matches":true}"#,
+                )],
+            },
+        ]);
+        state.select("e");
+        assert_eq!(state.card_summary("drift"), "3 differ · 2 expected");
     }
 
     #[test]

@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use daku_protocol::SignalState;
 
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
-use crate::config::{CredentialStore, EnvironmentConfig};
+use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
 pub const MID_ECC_SIGNAL_ID: &str = "mid_ecc";
@@ -64,8 +64,16 @@ fn is_validated_true(value: Option<&serde_json::Value>) -> bool {
     }
 }
 
-pub fn mid_ecc_state(agents_unhealthy: u64, ecc_error: u64, ecc_output_ready: u64) -> SignalState {
-    if agents_unhealthy == 0 && ecc_error == 0 && ecc_output_ready < ECC_READY_DEGRADED_AT {
+pub fn mid_ecc_state(
+    agents_unhealthy: u64,
+    ecc_error: u64,
+    ecc_output_ready: u64,
+    thresholds: &Thresholds,
+) -> SignalState {
+    if agents_unhealthy < thresholds.mid_unhealthy_degraded_at
+        && ecc_error < thresholds.ecc_error_degraded_at
+        && ecc_output_ready < thresholds.ecc_output_ready_degraded_at
+    {
         SignalState::Healthy
     } else {
         SignalState::Degraded
@@ -104,7 +112,12 @@ impl Signal for MidEccSignal {
             };
         let agents_unhealthy = unhealthy_list.len() as u64;
         Ok(Observation {
-            state: mid_ecc_state(agents_unhealthy, ecc_error, ecc_output_ready),
+            state: mid_ecc_state(
+                agents_unhealthy,
+                ecc_error,
+                ecc_output_ready,
+                &environment.thresholds,
+            ),
             payload: serde_json::json!({
                 "agents_total": agents_total,
                 "agents_unhealthy": agents_unhealthy,
@@ -143,6 +156,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::config::Thresholds;
 
     struct MidEccTransport {
         agents: &'static str,
@@ -211,6 +225,22 @@ mod tests {
         collector.collect().unwrap();
         let reopened = db.store();
         (db, reopened)
+    }
+
+    #[test]
+    fn mid_ecc_state_honours_threshold_overrides() {
+        let defaults = Thresholds::default();
+        assert_eq!(mid_ecc_state(0, 0, 0, &defaults), SignalState::Healthy);
+        assert_eq!(mid_ecc_state(1, 0, 0, &defaults), SignalState::Degraded);
+        assert_eq!(mid_ecc_state(0, 1, 0, &defaults), SignalState::Degraded);
+        assert_eq!(mid_ecc_state(0, 0, 100, &defaults), SignalState::Degraded);
+        let lenient = Thresholds {
+            mid_unhealthy_degraded_at: 3,
+            ecc_output_ready_degraded_at: 500,
+            ..Thresholds::default()
+        };
+        assert_eq!(mid_ecc_state(2, 0, 499, &lenient), SignalState::Healthy);
+        assert_eq!(mid_ecc_state(3, 0, 0, &lenient), SignalState::Degraded);
     }
 
     #[test]

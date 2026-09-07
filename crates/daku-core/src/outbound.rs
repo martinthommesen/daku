@@ -3,17 +3,17 @@
 use daku_protocol::SignalState;
 
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
-use crate::config::{CredentialStore, EnvironmentConfig};
+use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
 pub const OUTBOUND_SIGNAL_ID: &str = "outbound";
 pub const OUTBOUND_HTTP_PATH: &str = "/api/now/stats/sys_outbound_http_log?sysparm_count=true&sysparm_query=http_status>=400^sys_created_on>javascript:gs.hoursAgoStart(1)";
 
-pub fn outbound_state(outbound_http_4xx_5xx_1h: u64) -> SignalState {
-    if outbound_http_4xx_5xx_1h == 0 {
-        SignalState::Healthy
-    } else {
+pub fn outbound_state(outbound_http_4xx_5xx_1h: u64, thresholds: &Thresholds) -> SignalState {
+    if outbound_http_4xx_5xx_1h >= thresholds.outbound_failures_degraded_at {
         SignalState::Degraded
+    } else {
+        SignalState::Healthy
     }
 }
 
@@ -36,7 +36,7 @@ impl Signal for OutboundSignal {
         let outbound_http_4xx_5xx_1h =
             fetch_aggregate_count(client, environment, credentials, OUTBOUND_HTTP_PATH)?;
         Ok(Observation {
-            state: outbound_state(outbound_http_4xx_5xx_1h),
+            state: outbound_state(outbound_http_4xx_5xx_1h, &environment.thresholds),
             payload: serde_json::json!({
                 "outbound_http_4xx_5xx_1h": outbound_http_4xx_5xx_1h
             }),
@@ -61,12 +61,28 @@ mod tests {
 
     #[test]
     fn outbound_signal_zero_is_healthy() {
-        assert_eq!(outbound_state(0), SignalState::Healthy);
+        assert_eq!(
+            outbound_state(0, &Thresholds::default()),
+            SignalState::Healthy
+        );
     }
 
     #[test]
     fn outbound_signal_nonzero_is_degraded() {
-        assert_eq!(outbound_state(3), SignalState::Degraded);
+        assert_eq!(
+            outbound_state(3, &Thresholds::default()),
+            SignalState::Degraded
+        );
+    }
+
+    #[test]
+    fn outbound_threshold_override_tolerates_noise() {
+        let thresholds = Thresholds {
+            outbound_failures_degraded_at: 5,
+            ..Thresholds::default()
+        };
+        assert_eq!(outbound_state(4, &thresholds), SignalState::Healthy);
+        assert_eq!(outbound_state(5, &thresholds), SignalState::Degraded);
     }
 
     struct OutboundCountTransport {

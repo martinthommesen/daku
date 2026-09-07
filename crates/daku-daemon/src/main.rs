@@ -129,7 +129,7 @@ fn format_doctor_row(row: &daku_core::DoctorRow) -> String {
         (false, Some(error)) => format!("credential: ERROR {error}"),
     };
     format!(
-        "{} ({}) · {} · {} {} · build {} · {} ms{}",
+        "{} ({}) · {} · {} {} · build {} · {} ms{} · thresholds {}{}",
         row.id,
         row.label,
         credential,
@@ -141,6 +141,12 @@ fn format_doctor_row(row: &daku_core::DoctorRow) -> String {
             .as_deref()
             .map(|error| format!(" · {error}"))
             .unwrap_or_default(),
+        row.thresholds,
+        if row.expected_drift > 0 {
+            format!(" · expected drift {}", row.expected_drift)
+        } else {
+            String::new()
+        },
     )
 }
 
@@ -314,6 +320,8 @@ mod tests {
             build: None,
             error: None,
             rtt_ms: 12,
+            thresholds: daku_core::config::Thresholds::default().summary(),
+            expected_drift: 0,
         }
     }
 
@@ -323,6 +331,10 @@ mod tests {
         assert!(missing.contains("MISSING"), "{missing}");
         assert!(!missing.contains("client_secret") && !missing.contains("password"));
         assert!(format_doctor_row(&doctor_row(true)).contains("credential: present"));
+        assert!(
+            format_doctor_row(&doctor_row(true)).contains("thresholds jobs"),
+            "doctor prints effective thresholds"
+        );
     }
 
     #[test]

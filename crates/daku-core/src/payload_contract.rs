@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::availability::{classify_availability_response, persist_availability_snapshot};
 use crate::collector::SignalCollector;
-use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore};
+use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore, Thresholds};
 use crate::drift::{DRIFT_SIGNAL_ID, DriftCollector};
 use crate::jobs::{JOBS_SIGNAL_ID, JobsCollector};
 use crate::last_clone::{
@@ -118,6 +118,8 @@ fn env(id: &str, host: &str, clone_source: bool) -> EnvironmentConfig {
         auth_method: AuthMethod::Basic,
         sort_order: if clone_source { 0 } else { 1 },
         clone_source,
+        thresholds: Thresholds::default(),
+        expected_drift: Vec::new(),
     }
 }
 

@@ -14,7 +14,7 @@ use crate::availability::{
     classify_availability_response, recent_reachability,
 };
 use crate::collector::{SignalCollector, unix_now};
-use crate::config::{CredentialStore, EnvironmentConfig};
+use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::persistence::{self, StateStore};
 use crate::servicenow::ServiceNowClient;
 
@@ -35,12 +35,31 @@ pub const INVENTORY_REFRESH_SECS: i64 = 30 * 60;
 
 /// `build_matches: None` means at least one side's build could not be read —
 /// unknown is not a mismatch, and two unknowns are not agreement.
-pub fn drift_state(build_matches: Option<bool>, mismatches: u64) -> SignalState {
-    if build_matches != Some(false) && mismatches == 0 {
+/// `mismatches` counts unexpected differences only — entries named in the
+/// Environment's `expected_drift` list are partitioned out before this runs.
+pub fn drift_state(
+    build_matches: Option<bool>,
+    mismatches: u64,
+    thresholds: &Thresholds,
+) -> SignalState {
+    if build_matches != Some(false) && mismatches < thresholds.drift_mismatches_degraded_at {
         SignalState::Healthy
     } else {
         SignalState::Degraded
     }
+}
+
+/// Unexpected mismatches: entries whose `id` (plugin id or store-app scope)
+/// is not named in the Environment's `expected_drift` list. Borrows so the
+/// caller keeps the full sorted list for the drill-in payload.
+pub fn unexpected_mismatches<'a>(
+    mismatches: &'a [PluginMismatch],
+    expected_drift: &[String],
+) -> Vec<&'a PluginMismatch> {
+    mismatches
+        .iter()
+        .filter(|mismatch| !expected_drift.iter().any(|id| id == &mismatch.id))
+        .collect()
 }
 
 struct EnvInventory {
@@ -183,7 +202,7 @@ impl DriftCollector {
         };
         match self.env_inventory(environment, connection, observed_at, max_age_secs) {
             Ok(other) => {
-                persist_drift_compare(connection, &environment.id, source, &other, observed_at)
+                persist_drift_compare(connection, environment, source, &other, observed_at)
                     .map_err(anyhow::Error::from)
             }
             Err(error) => {
@@ -404,30 +423,33 @@ fn persist_drift_source(
 
 fn persist_drift_compare(
     connection: &Connection,
-    environment_id: &str,
+    environment: &EnvironmentConfig,
     source: &EnvInventory,
     other: &EnvInventory,
     observed_at: i64,
 ) -> io::Result<()> {
-    let mismatch_list = diff_plugin_inventory(&source.plugins, &other.plugins);
-    let mismatches = mismatch_list.len() as u64;
+    let full_list = diff_plugin_inventory(&source.plugins, &other.plugins);
+    let unexpected = unexpected_mismatches(&full_list, &environment.expected_drift);
+    let mismatches = unexpected.len() as u64;
+    let expected_mismatches = full_list.len() as u64 - mismatches;
     let build_matches = match (&source.build, &other.build) {
         (Some(source_build), Some(other_build)) => Some(source_build == other_build),
         _ => None,
     };
     let payload = serde_json::json!({
         "mismatches": mismatches,
+        "expected_mismatches": expected_mismatches,
         "build_matches": build_matches,
         "truncated": source.truncated || other.truncated,
-        "mismatch_list": &mismatch_list[..mismatch_list.len().min(MISMATCH_LIST_LIMIT)],
-        "mismatch_list_truncated": mismatch_list.len() > MISMATCH_LIST_LIMIT,
+        "mismatch_list": &full_list[..full_list.len().min(MISMATCH_LIST_LIMIT)],
+        "mismatch_list_truncated": full_list.len() > MISMATCH_LIST_LIMIT,
     });
     persistence::persist_signal_snapshot(
         connection,
-        environment_id,
+        &environment.id,
         DRIFT_SIGNAL_ID,
         observed_at,
-        drift_state(build_matches, mismatches),
+        drift_state(build_matches, mismatches, &environment.thresholds),
         &payload.to_string(),
     )
 }
@@ -555,7 +577,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::collector::SignalCollector;
-    use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore};
+    use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore, Thresholds};
     use crate::persistence::{self, StateStore};
     use crate::servicenow::{
         HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
@@ -699,6 +721,8 @@ mod tests {
             auth_method: AuthMethod::Basic,
             sort_order: if clone_source { 0 } else { 1 },
             clone_source,
+            thresholds: Thresholds::default(),
+            expected_drift: Vec::new(),
         }
     }
 
@@ -706,16 +730,25 @@ mod tests {
         source_plugins: &'static str,
         other_plugins: &'static str,
     ) -> (TempDb, StateStore) {
+        collect_pair_with_target(
+            source_plugins,
+            other_plugins,
+            env("test", "acme-test", false),
+        )
+    }
+
+    fn collect_pair_with_target(
+        source_plugins: &'static str,
+        other_plugins: &'static str,
+        target: EnvironmentConfig,
+    ) -> (TempDb, StateStore) {
         let db = TempDb::new("drift");
         let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
         credentials.insert("prod", r#"{"username":"reader","password":"secret"}"#);
         credentials.insert("test", r#"{"username":"reader","password":"secret"}"#);
         let collector = DriftCollector::new(
-            vec![
-                env("prod", "acme-prod", true),
-                env("test", "acme-test", false),
-            ],
+            vec![env("prod", "acme-prod", true), target],
             credentials,
             ServiceNowClient::new(
                 DriftTransport {
@@ -780,6 +813,91 @@ mod tests {
     }
 
     #[test]
+    fn drift_expected_entries_do_not_vote_but_are_counted() {
+        let mut target = env("test", "acme-test", false);
+        target.expected_drift = vec!["com.example.plugin_a".into()];
+        let (_db, store) = collect_pair_with_target(
+            include_str!("../tests/fixtures/drift/plugins_a.json"),
+            include_str!("../tests/fixtures/drift/plugins_a_v2.json"),
+            target,
+        );
+        let connection = store.open().unwrap();
+        let other = persistence::load_signal_snapshot(&connection, "test", DRIFT_SIGNAL_ID)
+            .unwrap()
+            .expect("other snapshot");
+        assert_eq!(other.state, "healthy");
+        let payload: serde_json::Value = serde_json::from_str(&other.payload_json).unwrap();
+        assert_eq!(payload["mismatches"], 0);
+        assert_eq!(payload["expected_mismatches"], 1);
+        // The drill-in still lists the planned difference.
+        assert_eq!(payload["mismatch_list"][0]["id"], "com.example.plugin_a");
+    }
+
+    #[test]
+    fn drift_unexpected_mismatches_filters_by_id() {
+        let mismatches = vec![
+            PluginMismatch {
+                id: "a".into(),
+                source_version: Some("1".into()),
+                other_version: Some("2".into()),
+            },
+            PluginMismatch {
+                id: "b".into(),
+                source_version: Some("1".into()),
+                other_version: Some("2".into()),
+            },
+        ];
+        let unexpected = unexpected_mismatches(&mismatches, &["b".to_owned()]);
+        assert_eq!(
+            unexpected
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a"]
+        );
+        assert!(
+            unexpected_mismatches(&mismatches, &[]).len() == 2,
+            "empty expected list keeps everything"
+        );
+    }
+
+    #[test]
+    fn drift_threshold_override_tolerates_known_noise() {
+        assert_eq!(
+            drift_state(
+                Some(true),
+                2,
+                &Thresholds {
+                    drift_mismatches_degraded_at: 3,
+                    ..Thresholds::default()
+                }
+            ),
+            SignalState::Healthy
+        );
+        assert_eq!(
+            drift_state(
+                Some(true),
+                2,
+                &Thresholds {
+                    drift_mismatches_degraded_at: 2,
+                    ..Thresholds::default()
+                }
+            ),
+            SignalState::Degraded
+        );
+        // Threshold 0 is degenerate (everything degrades); the default keeps
+        // the historical one-mismatch rule.
+        assert_eq!(
+            drift_state(Some(true), 0, &Thresholds::default()),
+            SignalState::Healthy
+        );
+        assert_eq!(
+            drift_state(Some(false), 0, &Thresholds::default()),
+            SignalState::Degraded
+        );
+    }
+
+    #[test]
     fn drift_payload_mismatch_list_is_bounded() {
         let db = TempDb::new("drift_bounded");
         let store = db.store();
@@ -792,7 +910,7 @@ mod tests {
             .collect();
         persist_drift_compare(
             &connection,
-            "test",
+            &env("test", "acme-test", false),
             &EnvInventory {
                 build: None,
                 plugins: source,
