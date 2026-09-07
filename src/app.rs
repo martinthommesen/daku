@@ -24,28 +24,35 @@ use crate::CloseWindow;
 use crate::ReloadDaemon;
 use crate::dashboard_state::{
     CompareRow, DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, fixture_events, freshness,
-    signal_label, ui_fixture_enabled,
+    mute_remaining_label, signal_label, ui_fixture_enabled,
 };
+use crate::persistence::{AppSettings, save_app_settings};
 
 const SIDEBAR_WIDTH: f32 = 220.0;
 
 pub struct Daku {
     state: DashboardState,
     supervisor: Option<DaemonSupervisor>,
+    settings: AppSettings,
     /// `Root` owns the window's root dispatch node, so the shell only receives
     /// menu- and keystroke-dispatched actions while this handle is focused.
     focus_handle: FocusHandle,
 }
+
+/// Mute durations offered in the Environment header.
+const MUTE_OPTIONS: [(i64, &str); 3] = [(3600, "1h"), (14_400, "4h"), (86_400, "24h")];
 
 impl Daku {
     pub fn new(
         window: &mut Window,
         cx: &mut App,
         supervisor: Option<DaemonSupervisor>,
+        settings: AppSettings,
     ) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
         let entity = cx.new(|cx| {
             let mut state = DashboardState::new();
+            state.apply_mutes(&settings.mutes, unix_now());
             if ui_fixture_enabled() {
                 state.set_connected(true);
                 state.apply_all(&fixture_events());
@@ -56,11 +63,38 @@ impl Daku {
             Self {
                 state,
                 supervisor,
+                settings,
                 focus_handle: focus_handle.clone(),
             }
         });
         window.focus(&focus_handle, cx);
         entity
+    }
+
+    fn mute_selected(&mut self, secs: i64, cx: &mut Context<Self>) {
+        let now = unix_now();
+        if let Some(id) = self.state.selected_id().map(str::to_owned) {
+            let until = now.saturating_add(secs);
+            self.state.set_mute(&id, until);
+            self.settings.mute_until(&id, until);
+            self.persist_settings();
+        }
+        cx.notify();
+    }
+
+    fn unmute_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.state.selected_id().map(str::to_owned) {
+            self.state.clear_mute(&id);
+            self.settings.unmute(&id);
+            self.persist_settings();
+        }
+        cx.notify();
+    }
+
+    fn persist_settings(&self) {
+        if let Err(error) = save_app_settings(&self.settings) {
+            eprintln!("could not save daku app settings: {error:#}");
+        }
     }
 }
 
@@ -145,7 +179,7 @@ impl Render for Daku {
         // render.
         let cards: Vec<gpui::AnyElement> = if self.state.selected().is_some() {
             self.state
-                .cards()
+                .cards(unix_now())
                 .into_iter()
                 .map(|card| self.signal_card(card, cx))
                 .collect()
@@ -156,7 +190,9 @@ impl Render for Daku {
             .state
             .selected_card()
             .map(|signal_id| self.drill_in_region(signal_id, cx));
-        let detail = self.render_detail(cards, drill_in, cx);
+        // Mute buttons carry click listeners like the cards do.
+        let mute_controls = self.mute_controls(cx);
+        let detail = self.render_detail(cards, drill_in, mute_controls, cx);
         let title: SharedString = self
             .state
             .selected()
@@ -214,12 +250,13 @@ impl Daku {
         let selected_id = self.state.selected_id().map(str::to_owned);
         let items: Vec<SidebarMenuItem> = self
             .state
-            .sidebar()
+            .sidebar(unix_now())
             .into_iter()
             .map(|row| {
                 let selected = selected_id.as_deref() == Some(row.id.as_str());
                 let id = row.id.clone();
-                let color = if row.muted {
+                let quiet = row.dimmed || row.muted;
+                let color = if quiet {
                     cx.theme().muted_foreground
                 } else {
                     health_color(row.health, cx)
@@ -233,10 +270,11 @@ impl Daku {
                     }))
             })
             .collect();
-        // Roll-up: the worst observed Environment colours the header dot.
+        // Roll-up: the worst unmuted Environment colours the header dot.
+        // Muted Environments stay quiet on every attention surface.
         let roll_up = self
             .state
-            .worst_health()
+            .worst_health_excluding_muted(unix_now())
             .map_or(cx.theme().muted_foreground, |health| {
                 health_color(health, cx)
             });
@@ -276,10 +314,58 @@ impl Daku {
             .into_any_element()
     }
 
+    /// Mute / unmute controls for the selected Environment header: the
+    /// mute deadline plus Unmute when muted, else 1 h / 4 h / 24 h options.
+    fn mute_controls(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let id = self.state.selected_id()?.to_owned();
+        let now = unix_now();
+        let base = h_flex().items_center().gap(px(8.0)).text_xs();
+        if let Some(until) = self
+            .state
+            .muted_until(&id)
+            .filter(|_| self.state.is_muted(&id, now))
+        {
+            Some(
+                base.child(
+                    div()
+                        .text_color(cx.theme().warning)
+                        .child(mute_remaining_label(until, now)),
+                )
+                .child(
+                    div()
+                        .id("mute-unmute")
+                        .text_color(cx.theme().muted_foreground)
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.unmute_selected(cx);
+                        }))
+                        .child("Unmute"),
+                )
+                .into_any_element(),
+            )
+        } else {
+            Some(
+                base.child(div().text_color(cx.theme().muted_foreground).child("Mute"))
+                    .children(MUTE_OPTIONS.into_iter().map(|(secs, label)| {
+                        div()
+                            .id(SharedString::from(format!("mute-{label}")))
+                            .text_color(cx.theme().muted_foreground)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.mute_selected(secs, cx);
+                            }))
+                            .child(label)
+                    }))
+                    .into_any_element(),
+            )
+        }
+    }
+
     fn render_detail(
         &self,
         cards: Vec<gpui::AnyElement>,
         drill_in: Option<gpui::AnyElement>,
+        mute_controls: Option<gpui::AnyElement>,
         cx: &App,
     ) -> gpui::AnyElement {
         let selected = self.state.selected().cloned();
@@ -348,7 +434,8 @@ impl Daku {
                                             .text_sm()
                                             .text_color(fresh_color)
                                             .child(fresh.label),
-                                    ),
+                                    )
+                                    .children(mute_controls),
                             )
                             .child(
                                 div()
@@ -412,8 +499,11 @@ impl Daku {
         };
         let waiting = card.status == crate::dashboard_state::WAITING;
         let skipped = card.status == "skipped";
-        let attention = !card.muted && matches!(card.status.as_str(), "degraded" | "down");
-        let color = if card.muted {
+        // Disconnected cards are stale; muted cards are quiet on purpose.
+        // Both paint grey and never carry attention colour.
+        let quiet = card.dimmed || card.muted;
+        let attention = !quiet && matches!(card.status.as_str(), "degraded" | "down");
+        let color = if quiet {
             cx.theme().muted_foreground
         } else {
             status_color(&card.status, cx)
@@ -510,7 +600,7 @@ impl Daku {
                 element.child(
                     div()
                         .text_xs()
-                        .text_color(if card.status == "down" && !card.muted {
+                        .text_color(if card.status == "down" && !quiet {
                             cx.theme().danger
                         } else {
                             cx.theme().muted_foreground
@@ -545,7 +635,7 @@ impl Daku {
         let url = self.state.signal_url(signal_id);
         let status = self
             .state
-            .cards()
+            .cards(unix_now())
             .into_iter()
             .find(|card| card.signal_id == signal_id)
             .map(|card| card.status)

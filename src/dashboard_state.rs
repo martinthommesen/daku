@@ -120,6 +120,9 @@ pub struct DashboardState {
     /// Health-transition + build-change events per Environment, published by
     /// the daemon (`072`). Rendered by the Recent timeline (`077`).
     health_events: HashMap<String, Vec<HealthEventDto>>,
+    /// Operator mutes: Environment id → unix seconds the attention surfaces
+    /// stay silent. Mirrors `AppSettings::mutes`; the daemon keeps collecting.
+    mutes: HashMap<String, i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,6 +130,9 @@ pub struct SidebarRow {
     pub id: String,
     pub label: String,
     pub health: EnvironmentHealth,
+    /// Never observed or disconnected: grey regardless of health.
+    pub dimmed: bool,
+    /// Operator mute (`074`): grey and silent on attention surfaces.
     pub muted: bool,
 }
 
@@ -149,7 +155,9 @@ pub struct SignalCard {
     pub status: String,
     pub sparkline: Vec<f64>,
     /// Disconnected: the status colour is stale, so the Environment detail
-    /// paints it grey. Unlike `SidebarRow.muted` this is `!connected` only.
+    /// paints it grey. Unlike `dimmed` this never covers an Operator mute.
+    pub dimmed: bool,
+    /// The selected Environment is Operator-muted: grey and quiet.
     pub muted: bool,
 }
 
@@ -180,6 +188,28 @@ impl DashboardState {
 
     pub fn set_connected(&mut self, connected: bool) {
         self.connected = connected;
+    }
+
+    /// True while `now` is before the mute deadline for `id`.
+    pub fn is_muted(&self, id: &str, now: i64) -> bool {
+        self.mutes.get(id).is_some_and(|until| now < *until)
+    }
+
+    pub fn muted_until(&self, id: &str) -> Option<i64> {
+        self.mutes.get(id).copied()
+    }
+
+    pub fn set_mute(&mut self, id: &str, until: i64) {
+        self.mutes.insert(id.to_owned(), until);
+    }
+
+    pub fn clear_mute(&mut self, id: &str) {
+        self.mutes.remove(id);
+    }
+
+    pub fn apply_mutes(&mut self, mutes: &HashMap<String, i64>, now: i64) {
+        self.mutes = mutes.clone();
+        self.mutes.retain(|_, until| now < *until);
     }
 
     pub fn connected(&self) -> bool {
@@ -449,21 +479,26 @@ impl DashboardState {
         DrillIn::Empty
     }
 
-    pub fn sidebar(&self) -> Vec<SidebarRow> {
+    pub fn sidebar(&self, now: i64) -> Vec<SidebarRow> {
         self.environments
             .iter()
             .map(|environment| SidebarRow {
                 id: environment.id.clone(),
                 label: environment.label.clone(),
                 health: environment.health,
-                muted: !self.connected || environment.last_observed_at.is_none(),
+                dimmed: !self.connected || environment.last_observed_at.is_none(),
+                muted: self.is_muted(&environment.id, now),
             })
             .collect()
     }
 
-    pub fn cards(&self) -> Vec<SignalCard> {
+    pub fn cards(&self, now: i64) -> Vec<SignalCard> {
         let environment_id = self.selected_id.as_deref().unwrap_or("");
         let snapshots = self.snapshots.get(environment_id);
+        let muted = self
+            .selected_id
+            .as_deref()
+            .is_some_and(|id| self.is_muted(id, now));
         let mut cards = SIGNAL_IDS
             .iter()
             .map(|&signal_id| {
@@ -500,7 +535,8 @@ impl DashboardState {
                     signal_id,
                     status,
                     sparkline,
-                    muted: !self.connected,
+                    dimmed: !self.connected,
+                    muted,
                 }
             })
             .collect::<Vec<_>>();
@@ -615,15 +651,17 @@ impl DashboardState {
         }
     }
 
-    /// The worst health across observed Environments, for the sidebar
-    /// roll-up. `None` when disconnected or nothing has been polled yet.
-    pub fn worst_health(&self) -> Option<EnvironmentHealth> {
+    /// The worst health across observed, unmuted Environments — what the
+    /// menu-bar dot, Dock badge and notifications consult. `None` when
+    /// disconnected, nothing polled yet, or everything muted.
+    pub fn worst_health_excluding_muted(&self, now: i64) -> Option<EnvironmentHealth> {
         if !self.connected {
             return None;
         }
         self.environments
             .iter()
             .filter(|environment| environment.last_observed_at.is_some())
+            .filter(|environment| !self.is_muted(&environment.id, now))
             .map(|environment| environment.health)
             .max_by_key(|health| match health {
                 EnvironmentHealth::Healthy => 0,
@@ -729,6 +767,17 @@ impl DashboardState {
             .and_then(|map| map.get(signal_id))
             .map(|snapshot| summarize_value(signal_id, &snapshot.payload))
             .unwrap_or_default()
+    }
+}
+
+/// "Muted 45m left" / "Muted 3h left" for the Environment header. Pure so
+/// the shell never formats clocks itself.
+pub fn mute_remaining_label(until: i64, now: i64) -> String {
+    let left = until.saturating_sub(now).max(0);
+    if left < 3600 {
+        format!("Muted {}m left", (left / 60).max(1))
+    } else {
+        format!("Muted {}h left", left / 3600)
     }
 }
 
@@ -1094,6 +1143,11 @@ fn snap(signal_id: &str, state: &str, payload_json: &str) -> SignalSnapshotDto {
 mod tests {
     use super::*;
 
+    /// `now` for sidebar()/cards() calls in tests: the fixture observed at
+    /// 1_700_000_000, so nothing fixture-loaded is stale and no test mute (set
+    /// explicitly per test) is active unless the test sets one.
+    const TEST_NOW: i64 = 1_700_000_000;
+
     /// What the client must render for every payload
     /// `crates/daku-core/tests/fixtures/payloads.json` pins: (case,
     /// `card_summary`, `card_detail`). Add a pinned case there and
@@ -1434,7 +1488,7 @@ mod tests {
     #[test]
     fn dashboard_state_environments_updated_preserves_ids_labels_order() {
         let state = loaded();
-        let rows = state.sidebar();
+        let rows = state.sidebar(TEST_NOW);
         assert_eq!(
             rows.iter()
                 .map(|row| (row.id.as_str(), row.label.as_str()))
@@ -1446,8 +1500,11 @@ mod tests {
     #[test]
     fn dashboard_state_health_degraded_maps_dot() {
         let state = loaded();
-        assert_eq!(state.sidebar()[0].health, EnvironmentHealth::Degraded);
-        assert!(!state.sidebar()[0].muted);
+        assert_eq!(
+            state.sidebar(TEST_NOW)[0].health,
+            EnvironmentHealth::Degraded
+        );
+        assert!(!state.sidebar(TEST_NOW)[0].dimmed);
     }
 
     #[test]
@@ -1483,7 +1540,7 @@ mod tests {
     fn dashboard_state_asleep_reachability_does_not_change_health() {
         let state = loaded();
         let test = state
-            .sidebar()
+            .sidebar(TEST_NOW)
             .into_iter()
             .find(|row| row.id == "test")
             .unwrap();
@@ -1502,14 +1559,14 @@ mod tests {
     fn dashboard_state_jobs_samples_fill_sparkline() {
         let state = loaded();
         let jobs = state
-            .cards()
+            .cards(TEST_NOW)
             .into_iter()
             .find(|card| card.signal_id == "jobs")
             .unwrap();
         assert_eq!(jobs.sparkline.len(), 3);
         assert_eq!(state.card_summary("jobs"), "2 overdue · 0 in error");
         let syslog = state
-            .cards()
+            .cards(TEST_NOW)
             .into_iter()
             .find(|card| card.signal_id == "syslog")
             .unwrap();
@@ -1520,7 +1577,7 @@ mod tests {
     fn dashboard_state_missing_snapshot_is_waiting() {
         let state = loaded();
         let last_clone = state
-            .cards()
+            .cards(TEST_NOW)
             .into_iter()
             .find(|card| card.signal_id == "last_clone")
             .unwrap();
@@ -1698,12 +1755,12 @@ mod tests {
         state.apply(&ServerMessage::EnvironmentsUpdated {
             environments: vec![summary.clone()],
         });
-        assert!(state.sidebar()[0].muted);
+        assert!(state.sidebar(TEST_NOW)[0].dimmed);
         summary.last_observed_at = Some(1_700_000_000);
         state.apply(&ServerMessage::EnvironmentsUpdated {
             environments: vec![summary],
         });
-        assert!(!state.sidebar()[0].muted);
+        assert!(!state.sidebar(TEST_NOW)[0].dimmed);
     }
 
     #[test]
@@ -1779,12 +1836,12 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_state_disconnected_mutes_every_row() {
+    fn dashboard_state_disconnected_dims_every_row() {
         let mut state = loaded();
         state.set_connected(false);
-        assert!(state.sidebar().iter().all(|row| row.muted));
+        assert!(state.sidebar(TEST_NOW).iter().all(|row| row.dimmed));
         state.set_connected(true);
-        assert!(state.sidebar().iter().all(|row| !row.muted));
+        assert!(state.sidebar(TEST_NOW).iter().all(|row| !row.dimmed));
     }
 
     #[test]
@@ -1800,7 +1857,12 @@ mod tests {
         });
         state.apply_all(&fixture_events()[..1]);
         state.select("test");
-        assert!(state.cards().iter().all(|card| card.status == WAITING));
+        assert!(
+            state
+                .cards(TEST_NOW)
+                .iter()
+                .all(|card| card.status == WAITING)
+        );
     }
 
     #[test]
@@ -1817,7 +1879,7 @@ mod tests {
         state.apply_all(&fixture_events()[..1]);
         state.select("test");
         let syslog = state
-            .cards()
+            .cards(TEST_NOW)
             .into_iter()
             .find(|card| card.signal_id == "syslog")
             .unwrap();
@@ -1825,11 +1887,79 @@ mod tests {
     }
 
     #[test]
-    fn signal_cards_are_muted_while_disconnected() {
+    fn signal_cards_are_dimmed_while_disconnected() {
         let mut state = loaded();
-        assert!(state.cards().iter().all(|card| !card.muted));
+        assert!(state.cards(TEST_NOW).iter().all(|card| !card.dimmed));
         state.set_connected(false);
-        assert!(state.cards().iter().all(|card| card.muted));
+        assert!(state.cards(TEST_NOW).iter().all(|card| card.dimmed));
+    }
+
+    #[test]
+    fn muted_environment_marks_rows_and_cards_without_dimming() {
+        let mut state = loaded();
+        assert!(!state.is_muted("prod", TEST_NOW));
+        state.set_mute("prod", TEST_NOW + 3600);
+        assert!(state.is_muted("prod", TEST_NOW));
+        assert!(!state.is_muted("prod", TEST_NOW + 3600));
+        assert!(!state.is_muted("test", TEST_NOW));
+        let prod = state
+            .sidebar(TEST_NOW)
+            .into_iter()
+            .find(|row| row.id == "prod")
+            .unwrap();
+        assert!(prod.muted);
+        assert!(!prod.dimmed);
+        assert!(state.cards(TEST_NOW).iter().all(|card| card.muted));
+        assert!(state.cards(TEST_NOW).iter().all(|card| !card.dimmed));
+        state.clear_mute("prod");
+        assert!(!state.is_muted("prod", TEST_NOW));
+    }
+
+    #[test]
+    fn worst_health_excluding_muted_skips_muted_environments() {
+        let mut state = loaded();
+        // Fixture: prod degraded, test healthy.
+        assert_eq!(
+            state.worst_health_excluding_muted(TEST_NOW),
+            Some(EnvironmentHealth::Degraded)
+        );
+        state.set_mute("prod", TEST_NOW + 3600);
+        assert_eq!(
+            state.worst_health_excluding_muted(TEST_NOW),
+            Some(EnvironmentHealth::Healthy)
+        );
+        state.set_mute("test", TEST_NOW + 3600);
+        assert_eq!(state.worst_health_excluding_muted(TEST_NOW), None);
+        state.set_connected(false);
+        assert_eq!(state.worst_health_excluding_muted(TEST_NOW), None);
+    }
+
+    #[test]
+    fn mute_remaining_label_counts_down() {
+        assert_eq!(
+            mute_remaining_label(1_700_003_600, 1_700_000_000),
+            "Muted 1h left"
+        );
+        assert_eq!(
+            mute_remaining_label(1_700_000_600, 1_700_000_000),
+            "Muted 10m left"
+        );
+        assert_eq!(
+            mute_remaining_label(1_700_000_000, 1_700_000_000),
+            "Muted 1m left"
+        );
+    }
+
+    #[test]
+    fn apply_mutes_prunes_expired_deadlines() {
+        let mut state = loaded();
+        let mut mutes = HashMap::new();
+        mutes.insert("prod".to_owned(), TEST_NOW - 1);
+        mutes.insert("test".to_owned(), TEST_NOW + 100);
+        state.apply_mutes(&mutes, TEST_NOW);
+        assert!(!state.is_muted("prod", TEST_NOW));
+        assert!(state.is_muted("test", TEST_NOW));
+        assert_eq!(state.muted_until("test"), Some(TEST_NOW + 100));
     }
 
     #[test]
@@ -1858,7 +1988,7 @@ mod tests {
         });
         let card = |signal_id: &str| {
             state
-                .cards()
+                .cards(TEST_NOW)
                 .into_iter()
                 .find(|card| card.signal_id == signal_id)
                 .unwrap()
@@ -1872,7 +2002,7 @@ mod tests {
         let mut state = loaded();
         state.select("test");
         let statuses: Vec<(&str, String)> = state
-            .cards()
+            .cards(TEST_NOW)
             .into_iter()
             .map(|card| (card.signal_id, card.status))
             .collect();
@@ -1912,7 +2042,7 @@ mod tests {
         ]);
         state.select("e");
         let card = state
-            .cards()
+            .cards(TEST_NOW)
             .into_iter()
             .find(|card| card.signal_id == "mid_ecc")
             .unwrap();
@@ -1923,9 +2053,12 @@ mod tests {
     #[test]
     fn worst_health_and_card_hint() {
         let mut state = loaded();
-        assert_eq!(state.worst_health(), Some(EnvironmentHealth::Degraded));
+        assert_eq!(
+            state.worst_health_excluding_muted(TEST_NOW),
+            Some(EnvironmentHealth::Degraded)
+        );
         state.set_connected(false);
-        assert_eq!(state.worst_health(), None);
+        assert_eq!(state.worst_health_excluding_muted(TEST_NOW), None);
         state.set_connected(true);
         state.apply(&ServerMessage::SignalSnapshotsUpdated {
             environment_id: "prod".into(),
@@ -2109,7 +2242,7 @@ mod tests {
     fn dashboard_state_ignores_non_dashboard_messages() {
         let mut state = loaded();
         state.apply(&ServerMessage::ShuttingDown);
-        assert_eq!(state.sidebar().len(), 2);
+        assert_eq!(state.sidebar(TEST_NOW).len(), 2);
         assert_eq!(state.selected_id(), Some("prod"));
     }
 

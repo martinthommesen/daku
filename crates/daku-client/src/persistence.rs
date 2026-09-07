@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::process::DaemonExposureSettings;
@@ -16,6 +18,45 @@ use crate::process::DaemonExposureSettings;
 #[serde(default)]
 pub struct AppSettings {
     pub daemon_exposure: DaemonExposureSettings,
+    /// Operator mutes: Environment id → unix seconds until which attention
+    /// surfaces (notifications, menu-bar dot, Dock badge) stay silent.
+    /// Expired entries are pruned on read. The daemon keeps collecting.
+    pub mutes: HashMap<String, i64>,
+}
+
+impl AppSettings {
+    /// True while `now` is before the mute deadline. Expired entries read as
+    /// unmuted (and are pruned on the next save).
+    pub fn is_muted(&self, environment_id: &str, now: i64) -> bool {
+        self.mutes
+            .get(environment_id)
+            .is_some_and(|until| now < *until)
+    }
+
+    pub fn mute_until(&mut self, environment_id: &str, until: i64) {
+        self.mutes.insert(environment_id.to_owned(), until);
+    }
+
+    pub fn unmute(&mut self, environment_id: &str) {
+        self.mutes.remove(environment_id);
+    }
+
+    pub fn prune_mutes(&mut self, now: i64) {
+        self.mutes.retain(|_, until| now < *until);
+    }
+}
+
+/// Persists desktop preferences atomically (`0600`). Mutes call this on every
+/// change; the daemon-exposure token path in `load_or_create_app_settings_at`
+/// already writes through `write_json_atomically`.
+pub fn save_app_settings(settings: &AppSettings) -> io::Result<()> {
+    save_app_settings_at(&default_app_settings_path(), settings)
+}
+
+pub fn save_app_settings_at(path: &Path, settings: &AppSettings) -> io::Result<()> {
+    let mut settings = settings.clone();
+    settings.daemon_exposure.ensure_token();
+    write_json_atomically(path, &settings)
 }
 
 fn configuration_directory() -> PathBuf {
@@ -152,6 +193,49 @@ mod tests {
             written.daemon_exposure.token,
             settings.daemon_exposure.token
         );
+    }
+
+    #[test]
+    fn mutes_round_trip_and_expire() {
+        let settings_file = TempSettings::new();
+        let path = settings_file.path();
+        let mut settings = load_or_create_app_settings_at(path).unwrap();
+        assert!(!settings.is_muted("prod", 1_700_000_000));
+        settings.mute_until("prod", 1_700_000_100);
+        assert!(settings.is_muted("prod", 1_700_000_000));
+        assert!(!settings.is_muted("prod", 1_700_000_100));
+        assert!(!settings.is_muted("test", 1_700_000_000));
+        save_app_settings_at(path, &settings).unwrap();
+        let reloaded = load_or_create_app_settings_at(path).unwrap();
+        assert!(reloaded.is_muted("prod", 1_700_000_000));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn unmute_and_prune_drop_mutes() {
+        let mut settings = AppSettings::default();
+        settings.mute_until("prod", 100);
+        settings.mute_until("test", 300);
+        settings.unmute("prod");
+        assert!(!settings.is_muted("prod", 50));
+        assert!(settings.is_muted("test", 200));
+        settings.prune_mutes(400);
+        assert!(!settings.is_muted("test", 400));
+        assert!(settings.mutes.is_empty());
+    }
+
+    #[test]
+    fn legacy_settings_without_mutes_load_empty() {
+        let settings_file = TempSettings::new();
+        let path = settings_file.path();
+        fs::write(path, r#"{"daemon_exposure":{"token":"abc"}}"#).unwrap();
+        let settings = load_or_create_app_settings_at(path).unwrap();
+        assert!(settings.mutes.is_empty());
+        assert!(!settings.is_muted("prod", 1_700_000_000));
     }
 
     #[test]
