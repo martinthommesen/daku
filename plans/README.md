@@ -353,3 +353,29 @@ otherwise.
 - Real pagination for drift's plugin inventory, and one-request-per-target for
   last-clone — both genuine options, both request-count trade-offs that need the
   Operator's call. Recorded as recommendations inside 057 and 058 instead.
+
+---
+
+## Usefulness batch — 2026-08-18 (tracking #110, children #95–#109)
+
+"Make daku more useful" batch, implemented directly from the issue bodies in
+strict wave order (069–083 are plan references inside those issues, not files
+here). All 15 children landed on `main` in order, each with `bun run check`
+green: 069 docs/ADR amendment (#95), 070 reload without relaunch (#96),
+071 semaphore spike — conditional no (#97), 072 health/build events with
+migration `0001` + protocol 5 (#98), 073 per-Environment thresholds +
+expected drift (#99), 074 mutes (#100), 075 unhealthy-only drill-in rows
+(#101), 076 compare-click/shortcuts/copy + `SelectEnvironment` (#102),
+077 timeline + build age, client-only (#103), 078 hourly roll-ups with
+migration `0002` + protocol 6 (#104), 079 notifications (#105),
+080 environment GUI with protocol 7 — daemon half and sheet in two commits
+(#106), 081 menu-bar dot + Dock badge (#107), 083 signal reference + docs
+(#109), 082 detached window, droppable, last (#108).
+
+Deliberate deviations from the issue text, all recorded in the closing
+comments: timeline uses relative ages (no tz deps); copy confirmation is a
+footer flash (not the notification subsystem); dock/menu-bar menus cut from
+081 (NSApp-delegate collision — dot + badge ship); detached windows share no
+mute state until relaunch. Operator visual checks still open for every GUI
+surface (sheet, notifications, dot/badge, detached); the Keychain
+same-binary round-trip was verified live (`-- --ignored keychain`).
