@@ -1,3 +1,5 @@
 # ServiceNow auth and local credential storage
 
 For real Environments, daku uses **OAuth 2.0 client credentials** with a Machine / web-service-only user (`snc_read_only` + a custom read role on polled tables). **Basic auth** is allowed only for PDI / dev stand-ins. Secrets live in the **macOS Keychain** under a daku-owned service (not the Fluent now-sdk entry long-term); non-secret Environment config lives in **`~/.daku/`** (directory `0700`; files daku writes are `0600`, `environments.json` is Operator-created — `chmod 600`). Collector outcomes distinguish **reachable**, **unreachable**, and **asleep** (PDI hibernate).
+
+**Amendment (v1.1, ADR-0009):** the daemon may **write** a Credential to the Keychain, but only on an explicit Operator command received over the authenticated loopback socket (the Environment management GUI, plan `080`), and never when started with `--allow-non-loopback`. Reads remain as above. The secret never reaches a log, command line, environment variable, SQLite, or `environments.json`. Creating binary reads back without a prompt is the assumed Keychain behaviour — verified by an Operator-run check in `080` before shipping.

@@ -25,8 +25,28 @@ The person running daku. In v1 this is the platform owner on their own machine; 
 _Avoid_: user, admin, viewer (those imply daku-side accounts we are not building in v1)
 
 **Environment health**:
-A rolled-up status for an Environment derived from its Signals: **healthy**, **degraded**, or **down**. v1 uses hard-coded defaults (not Operator-configured alert rules).
+A rolled-up status for an Environment derived from its Signals: **healthy**, **degraded**, or **down**. v1 uses hard-coded defaults (not Operator-configured alert rules). v1.1 allows per-Environment threshold overrides (see **threshold override**).
 _Avoid_: severity, priority, alert state
+
+**Threshold override**:
+Per-Environment configuration in `environments.json` that replaces a default Signal threshold for that Environment only (e.g. dev tolerates more overdue jobs than prod). Missing keys fall back to defaults; unknown keys are rejected at load.
+_Avoid_: alert rule (implies a rules engine daku does not have), per-signal config
+
+**Expected drift**:
+Plugin/app ids or scopes declared in `environments.json` as planned differences from the clone source. Drift partitions mismatches into expected vs unexpected; only unexpected votes toward degraded. Rendered as "N differ · M expected".
+_Avoid_: allowlist (implies security semantics), baseline
+
+**Mute**:
+A desktop preference (not daemon state) that silences attention surfaces for one Environment until a chosen time (1 h / 4 h / 24 h) or until unmuted. Stored in `app.json`. The daemon keeps collecting and history stays complete; the client stops notifying, badging, and dotting. Expired mutes clear automatically.
+_Avoid_: silence (verb), snooze, acknowledge (implies on-call semantics daku does not have)
+
+**Health event**:
+A bounded, persisted record that an Environment's rolled-up health changed (for two consecutive publishes, so a single flap is not an event) or that its build string changed, including a bootstrap event on the first build observed. Written by `publish_dashboard`, published as its own `ServerMessage`, replayed to late subscribers. Rendered in the Recent timeline.
+_Avoid_: alert, incident, audit log
+
+**Roll-up**:
+An hourly aggregate over raw Signal samples (avg for latency, max for backlog/error counts) kept for 30 days. Raw 24 h samples answer "spiking now?"; roll-ups answer "normal for a Monday?" with a flat ~720 points per Environment per Signal instead of ~86k raw points.
+_Avoid_: downsampling (the rejected per-frame optimisation), archive
 
 ### Screen
 
