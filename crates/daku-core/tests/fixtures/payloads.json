@@ -85,7 +85,17 @@
   "jobs_counts": {
     "payload": {
       "error": 0,
-      "overdue_ready": 2
+      "error_rows": [],
+      "error_rows_truncated": false,
+      "overdue_ready": 2,
+      "overdue_rows": [
+        {
+          "detail": "2026-01-27 02:00:00",
+          "name": "Nightly sync",
+          "sys_id": "job-1"
+        }
+      ],
+      "overdue_rows_truncated": false
     },
     "signal_id": "jobs",
     "state": "degraded"
@@ -93,7 +103,11 @@
   "jobs_zero": {
     "payload": {
       "error": 0,
-      "overdue_ready": 0
+      "error_rows": [],
+      "error_rows_truncated": false,
+      "overdue_ready": 0,
+      "overdue_rows": [],
+      "overdue_rows_truncated": false
     },
     "signal_id": "jobs",
     "state": "healthy"
@@ -177,6 +191,15 @@
   },
   "outbound_count": {
     "payload": {
+      "failure_rows": [
+        {
+          "http_status": "502",
+          "sys_created_on": "2026-01-27 00:12:00",
+          "sys_id": "out-1",
+          "url": "https://partner.example.com/hook"
+        }
+      ],
+      "failure_rows_truncated": false,
       "outbound_http_4xx_5xx_1h": 3
     },
     "signal_id": "outbound",
@@ -184,6 +207,8 @@
   },
   "outbound_zero": {
     "payload": {
+      "failure_rows": [],
+      "failure_rows_truncated": false,
       "outbound_http_4xx_5xx_1h": 0
     },
     "signal_id": "outbound",
@@ -240,14 +265,25 @@
   },
   "syslog_count": {
     "payload": {
-      "error_count_1h": 4
+      "error_count_1h": 4,
+      "error_rows": [
+        {
+          "message": "Null pointer in transform",
+          "source": "Scheduled job",
+          "sys_created_on": "2026-01-27 00:12:00",
+          "sys_id": "log-1"
+        }
+      ],
+      "error_rows_truncated": false
     },
     "signal_id": "syslog",
     "state": "degraded"
   },
   "syslog_zero": {
     "payload": {
-      "error_count_1h": 0
+      "error_count_1h": 0,
+      "error_rows": [],
+      "error_rows_truncated": false
     },
     "signal_id": "syslog",
     "state": "healthy"

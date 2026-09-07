@@ -61,6 +61,14 @@ detail region"** — in scope `crates/daku-core/src/mid_ecc.rs` (bounded
 (`selected_signal`, `card_rows`), `src/app.rs` (card `on_click`, detail
 region). Estimate: M.
 
+**Amendment (v1.1, #101):** the "second request per tick forever" objection
+no longer holds — jobs, syslog and outbound now fetch bounded row lists
+(10, newest/worst first) **only when the count is non-zero**, so a healthy
+Environment costs nothing and an unhealthy one costs one extra request.
+Job rows deep-link to their `sys_trigger` records; the rows take precedence
+over the trend in the drill-in while present. Outbound URLs are stored
+without query/fragment. See `ROW_LIST_LIMIT` in `crates/daku-core/src/collector.rs`.
+
 ## Open questions
 
 1. Is "which MID is unhealthy, by host name" enough, or does the Operator

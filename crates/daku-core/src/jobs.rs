@@ -3,7 +3,7 @@
 use anyhow::anyhow;
 use daku_protocol::SignalState;
 
-use crate::collector::{Observation, PerEnvironmentCollector, Signal};
+use crate::collector::{Observation, PerEnvironmentCollector, ROW_LIST_LIMIT, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
@@ -11,6 +11,9 @@ pub const JOBS_SIGNAL_ID: &str = "jobs";
 pub const JOBS_OVERDUE_PATH: &str = "/api/now/stats/sys_trigger?sysparm_count=true&sysparm_query=state=0^next_action<javascript:gs.minutesAgoStart(15)";
 pub const JOBS_ERROR_PATH: &str =
     "/api/now/stats/sys_trigger?sysparm_count=true&sysparm_query=state=3";
+/// Oldest overdue first (waiting longest); errors newest first.
+pub const JOBS_OVERDUE_ROWS_PATH: &str = "/api/now/table/sys_trigger?sysparm_fields=sys_id,name,state,next_action&sysparm_query=state=0^next_action<javascript:gs.minutesAgoStart(15)^ORDERBYnext_action&sysparm_limit=10";
+pub const JOBS_ERROR_ROWS_PATH: &str = "/api/now/table/sys_trigger?sysparm_fields=sys_id,name,state,next_action&sysparm_query=state=3^ORDERBYDESCsys_updated_on&sysparm_limit=10";
 
 pub fn jobs_state(overdue_ready: u64, error: u64, thresholds: &Thresholds) -> SignalState {
     if overdue_ready >= thresholds.jobs_overdue_degraded_at
@@ -20,6 +23,67 @@ pub fn jobs_state(overdue_ready: u64, error: u64, thresholds: &Thresholds) -> Si
     } else {
         SignalState::Healthy
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct JobRow {
+    sys_id: String,
+    name: String,
+    detail: String,
+}
+
+fn text(row: &serde_json::Value, key: &str) -> String {
+    row.get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Offending rows for one non-zero count. A failed rows request yields no
+/// rows — the count already determined the state, and the drill-in header
+/// still links the filtered list.
+fn fetch_job_rows(
+    client: &ServiceNowClient,
+    environment: &EnvironmentConfig,
+    credentials: &dyn CredentialStore,
+    path: &str,
+    error_detail: bool,
+) -> (Vec<JobRow>, bool) {
+    let Ok(response) = client.request(environment, credentials, "GET", path, None) else {
+        return (Vec::new(), false);
+    };
+    if response.status != 200 {
+        return (Vec::new(), false);
+    }
+    let rows: Vec<JobRow> = serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("result")
+                .and_then(|result| result.as_array())
+                .cloned()
+        })
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            let sys_id = text(row, "sys_id");
+            if sys_id.is_empty() {
+                return None;
+            }
+            let name = text(row, "name");
+            Some(JobRow {
+                sys_id: sys_id.clone(),
+                name: if name.is_empty() { sys_id } else { name },
+                detail: if error_detail {
+                    text(row, "state")
+                } else {
+                    text(row, "next_action")
+                },
+            })
+        })
+        .collect();
+    let truncated = rows.len() >= ROW_LIST_LIMIT;
+    (rows.into_iter().take(ROW_LIST_LIMIT).collect(), truncated)
 }
 
 #[derive(Default)]
@@ -54,11 +118,32 @@ impl Signal for JobsSignal {
                 });
             }
         };
+        // Rows only while unhealthy: a zero count costs no extra request.
+        let (overdue_rows, overdue_rows_truncated) = if overdue_ready > 0 {
+            fetch_job_rows(
+                client,
+                environment,
+                credentials,
+                JOBS_OVERDUE_ROWS_PATH,
+                false,
+            )
+        } else {
+            (Vec::new(), false)
+        };
+        let (error_rows, error_rows_truncated) = if error > 0 {
+            fetch_job_rows(client, environment, credentials, JOBS_ERROR_ROWS_PATH, true)
+        } else {
+            (Vec::new(), false)
+        };
         Ok(Observation {
             state: jobs_state(overdue_ready, error, &environment.thresholds),
             payload: serde_json::json!({
                 "overdue_ready": overdue_ready,
                 "error": error,
+                "overdue_rows": overdue_rows,
+                "overdue_rows_truncated": overdue_rows_truncated,
+                "error_rows": error_rows,
+                "error_rows_truncated": error_rows_truncated,
             }),
             sample: Some((overdue_ready + error) as f64),
         })
@@ -82,10 +167,23 @@ mod tests {
     struct JobsCountTransport {
         overdue: &'static str,
         error: &'static str,
+        /// Rows body for table URLs; `None` panics, proving a healthy tick
+        /// fetches no rows at all.
+        rows: Option<&'static str>,
     }
 
     impl HttpTransport for JobsCountTransport {
         fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+            if request.url.contains("/api/now/table/sys_trigger") {
+                let Some(rows) = self.rows else {
+                    panic!("healthy jobs tick must not fetch rows: {}", request.url);
+                };
+                return Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![("content-type".into(), "application/json".into())],
+                    body: rows.into(),
+                });
+            }
             assert!(
                 request.url.contains("/api/now/stats/sys_trigger"),
                 "jobs collector must use Aggregate API: {}",
@@ -117,6 +215,7 @@ mod tests {
                 JobsCountTransport {
                     overdue: include_str!("../tests/fixtures/jobs/count_0.json"),
                     error: include_str!("../tests/fixtures/jobs/count_0.json"),
+                    rows: None,
                 },
                 SystemClock,
             ),
@@ -151,6 +250,12 @@ mod tests {
                 JobsCountTransport {
                     overdue: include_str!("../tests/fixtures/jobs/count_2.json"),
                     error: include_str!("../tests/fixtures/jobs/count_0.json"),
+                    rows: Some(
+                        r#"{"result":[
+                            {"sys_id":"aaa","name":"Nightly sync","state":"0","next_action":"2026-01-01 02:00:00"},
+                            {"sys_id":"bbb","name":"","state":"0","next_action":""}
+                        ]}"#,
+                    ),
                 },
                 SystemClock,
             ),
@@ -166,6 +271,14 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["overdue_ready"], 2);
         assert_eq!(payload["error"], 0);
+        assert_eq!(payload["overdue_rows"][0]["name"], "Nightly sync");
+        assert_eq!(payload["overdue_rows"][1]["name"], "bbb");
+        assert_eq!(payload["overdue_rows_truncated"], false);
+        assert_eq!(
+            payload["error_rows"].as_array().unwrap().len(),
+            0,
+            "zero error count fetches no rows"
+        );
         let samples =
             persistence::load_signal_samples(&connection, "prod", JOBS_SIGNAL_ID).unwrap();
         assert_eq!(samples[0].value_real, Some(2.0));

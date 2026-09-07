@@ -30,6 +30,12 @@ pub use daku_protocol::settings::DEFAULT_POLL_INTERVAL_SECS;
 /// Fastest cadence the daemon will poll at, however low the setting is.
 pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
 
+/// Bound on the offending-row lists the jobs/syslog/outbound Signals fetch
+/// while unhealthy (`101`). Healthy Environments fetch no rows at all, so a
+/// healthy tick costs nothing extra; an unhealthy one costs one bounded
+/// request per non-zero count.
+pub const ROW_LIST_LIMIT: usize = 10;
+
 pub fn poll_interval_secs(settings: &DaemonSettings) -> u64 {
     match settings.poll_interval_secs {
         0 => DEFAULT_POLL_INTERVAL_SECS,

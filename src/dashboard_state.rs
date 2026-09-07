@@ -161,13 +161,21 @@ pub struct SignalCard {
     pub muted: bool,
 }
 
+/// One drill-in table row: cells plus an optional deep link rendered on
+/// the first cell (job rows link their ServiceNow records).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrillInRow {
+    pub cells: Vec<String>,
+    pub link: Option<String>,
+}
+
 /// Content of the Drill-in region under the Signal cards, built from what the
 /// snapshot payload already carries.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DrillIn {
     Rows {
         headers: Vec<&'static str>,
-        rows: Vec<Vec<String>>,
+        rows: Vec<DrillInRow>,
         truncated: bool,
     },
     Trend(Vec<f64>),
@@ -389,12 +397,13 @@ impl DashboardState {
                     rows: list
                         .iter()
                         .take(DRILL_IN_ROW_LIMIT)
-                        .map(|entry| {
-                            vec![
+                        .map(|entry| DrillInRow {
+                            cells: vec![
                                 text(entry, "id"),
                                 text(entry, "source_version"),
                                 text(entry, "other_version"),
-                            ]
+                            ],
+                            link: None,
                         })
                         .collect(),
                     truncated: value.get("mismatch_list_truncated")
@@ -415,12 +424,13 @@ impl DashboardState {
                     rows: list
                         .iter()
                         .take(DRILL_IN_ROW_LIMIT)
-                        .map(|entry| {
-                            vec![
+                        .map(|entry| DrillInRow {
+                            cells: vec![
                                 text(entry, "host_name"),
                                 text(entry, "status"),
                                 text(entry, "version"),
-                            ]
+                            ],
+                            link: None,
                         })
                         .collect(),
                     truncated: value.get("agents_unhealthy_list_truncated")
@@ -438,36 +448,162 @@ impl DashboardState {
                 }
                 DrillIn::Rows {
                     headers: vec!["Completed", "Age", "Source"],
-                    rows: vec![vec![
-                        text(value, "completed"),
-                        summarize_value(signal_id, value),
-                        text(value, "source_id"),
-                    ]],
+                    rows: vec![DrillInRow {
+                        cells: vec![
+                            text(value, "completed"),
+                            summarize_value(signal_id, value),
+                            text(value, "source_id"),
+                        ],
+                        link: None,
+                    }],
                     truncated: false,
                 }
             }
-            "availability" | "jobs" | "syslog" => {
-                let points: Vec<f64> = self
-                    .samples
-                    .get(&(
-                        self.selected_id.clone().unwrap_or_default(),
-                        signal_id.to_owned(),
-                    ))
-                    .map(|points| {
-                        points
-                            .iter()
-                            .map(|point| point.value_real.unwrap_or(0.0))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if points.len() < 2 {
-                    self.drill_in_text(signal_id)
+            "jobs" => {
+                if let Some(rows) = self.job_rows(value) {
+                    rows
                 } else {
-                    DrillIn::Trend(points)
+                    self.drill_in_trend(signal_id)
                 }
             }
+            "syslog" => {
+                if let Some(rows) = self.syslog_rows(value) {
+                    rows
+                } else {
+                    self.drill_in_trend(signal_id)
+                }
+            }
+            "outbound" => self
+                .outbound_rows(value)
+                .unwrap_or_else(|| self.drill_in_text(signal_id)),
+            "availability" => self.drill_in_trend(signal_id),
             _ => self.drill_in_text(signal_id),
         }
+    }
+
+    fn drill_in_trend(&self, signal_id: &str) -> DrillIn {
+        let points: Vec<f64> = self
+            .samples
+            .get(&(
+                self.selected_id.clone().unwrap_or_default(),
+                signal_id.to_owned(),
+            ))
+            .map(|points| {
+                points
+                    .iter()
+                    .map(|point| point.value_real.unwrap_or(0.0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if points.len() < 2 {
+            self.drill_in_text(signal_id)
+        } else {
+            DrillIn::Trend(points)
+        }
+    }
+
+    /// Job rows the daemon fetched while unhealthy (`101`): overdue first,
+    /// then errors. Each row links its `sys_trigger` record. `None` when
+    /// there are no rows, so the trend renders instead.
+    fn job_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let mut rows: Vec<DrillInRow> = Vec::new();
+        let mut truncated = false;
+        for (list_key, trunc_key) in [
+            ("overdue_rows", "overdue_rows_truncated"),
+            ("error_rows", "error_rows_truncated"),
+        ] {
+            truncated |= value.get(trunc_key) == Some(&serde_json::Value::Bool(true));
+            let Some(list) = value.get(list_key).and_then(|item| item.as_array()) else {
+                continue;
+            };
+            rows.extend(list.iter().take(DRILL_IN_ROW_LIMIT).map(|entry| {
+                let sys_id = entry
+                    .get("sys_id")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("");
+                // The collector persists each row as {sys_id, name,
+                // detail} — next_action for overdue rows, state for errors.
+                DrillInRow {
+                    cells: vec![cell(entry, "name"), cell(entry, "detail")],
+                    link: self.record_url("sys_trigger", sys_id),
+                }
+            }));
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        rows.truncate(DRILL_IN_ROW_LIMIT);
+        let full_page = rows.len() >= DRILL_IN_ROW_LIMIT;
+        Some(DrillIn::Rows {
+            headers: vec!["Job", "Detail"],
+            rows,
+            truncated: truncated || full_page,
+        })
+    }
+
+    /// Syslog error rows the daemon fetched while unhealthy. `None` when
+    /// there are none, so the trend renders instead.
+    fn syslog_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let list = value
+            .get("error_rows")
+            .and_then(|item| item.as_array())
+            .filter(|list| !list.is_empty())?;
+        Some(DrillIn::Rows {
+            headers: vec!["Time", "Source", "Message"],
+            rows: list
+                .iter()
+                .take(DRILL_IN_ROW_LIMIT)
+                .map(|entry| DrillInRow {
+                    cells: vec![
+                        cell(entry, "sys_created_on"),
+                        cell(entry, "source"),
+                        cell(entry, "message"),
+                    ],
+                    link: None,
+                })
+                .collect(),
+            truncated: value.get("error_rows_truncated") == Some(&serde_json::Value::Bool(true))
+                || list.len() > DRILL_IN_ROW_LIMIT,
+        })
+    }
+
+    /// Outbound failure rows the daemon fetched while unhealthy.
+    fn outbound_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let list = value
+            .get("failure_rows")
+            .and_then(|item| item.as_array())
+            .filter(|list| !list.is_empty())?;
+        Some(DrillIn::Rows {
+            headers: vec!["Time", "URL", "Status"],
+            rows: list
+                .iter()
+                .take(DRILL_IN_ROW_LIMIT)
+                .map(|entry| DrillInRow {
+                    cells: vec![
+                        cell(entry, "sys_created_on"),
+                        url_host(cell(entry, "url")),
+                        cell(entry, "http_status"),
+                    ],
+                    link: None,
+                })
+                .collect(),
+            truncated: value.get("failure_rows_truncated") == Some(&serde_json::Value::Bool(true))
+                || list.len() > DRILL_IN_ROW_LIMIT,
+        })
+    }
+
+    /// Deep link to one ServiceNow record. `None` without a selected
+    /// Environment, an untrusted URL, or an empty id.
+    fn record_url(&self, table: &str, sys_id: &str) -> Option<String> {
+        if sys_id.is_empty() {
+            return None;
+        }
+        let instance_url = &self.selected()?.instance_url;
+        if !is_supported_instance_url(instance_url) {
+            return None;
+        }
+        let base = instance_url.trim_end_matches('/');
+        Some(format!("{base}/{table}.do?sys_id={sys_id}"))
     }
 
     fn drill_in_text(&self, signal_id: &str) -> DrillIn {
@@ -779,6 +915,33 @@ pub fn mute_remaining_label(until: i64, now: i64) -> String {
     } else {
         format!("Muted {}h left", left / 3600)
     }
+}
+
+/// One drill-in table cell: the string value or an em dash.
+fn cell(entry: &serde_json::Value, key: &str) -> String {
+    entry
+        .get(key)
+        .and_then(|item| item.as_str())
+        .filter(|text| !text.is_empty())
+        .unwrap_or("\u{2014}")
+        .to_owned()
+}
+
+/// Host (plus path) of a URL for the outbound table. The collector already
+/// stripped query and fragment; this keeps the cell to what identifies the
+/// integration.
+fn url_host(url: String) -> String {
+    if url == "\u{2014}" {
+        return url;
+    }
+    url.split("://")
+        .nth(1)
+        .unwrap_or(&url)
+        .split('/')
+        .next()
+        .filter(|host| !host.is_empty())
+        .unwrap_or("\u{2014}")
+        .to_owned()
 }
 
 /// Lower sorts first on the card grid.
@@ -1409,13 +1572,14 @@ mod tests {
         assert_eq!(headers, vec!["Plugin", "Source", "Here"]);
         assert_eq!(rows.len(), 3);
         assert_eq!(
-            rows[0],
+            rows[0].cells,
             vec!["com.example.plugin_a", "1.0.0", "1.1.0"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(rows[1][2], "\u{2014}");
+        assert_eq!(rows[0].link, None);
+        assert_eq!(rows[1].cells[2], "\u{2014}");
         assert!(!truncated);
         // The clone source has no mismatch list.
         state.select("prod");
@@ -1434,8 +1598,14 @@ mod tests {
             DrillIn::Rows {
                 headers: vec!["MID", "Status", "Version"],
                 rows: vec![
-                    vec!["mid-b".to_owned(), "Down".to_owned(), "5.0.0".to_owned()],
-                    vec!["\u{2014}".to_owned(), "Up".to_owned(), "5.0.1".to_owned()],
+                    DrillInRow {
+                        cells: vec!["mid-b".to_owned(), "Down".to_owned(), "5.0.0".to_owned()],
+                        link: None,
+                    },
+                    DrillInRow {
+                        cells: vec!["\u{2014}".to_owned(), "Up".to_owned(), "5.0.1".to_owned()],
+                        link: None,
+                    },
                 ],
                 truncated: false,
             }
@@ -1454,11 +1624,36 @@ mod tests {
     #[test]
     fn drill_in_trends_and_text() {
         let mut state = loaded();
-        assert_eq!(state.drill_in("jobs"), DrillIn::Trend(vec![1.0, 2.0, 3.0]));
-        // prod carries no syslog samples: fall back to the one-line summary.
+        // prod jobs has both rows and samples: rows win (actionable, unhealthy-only).
+        assert_eq!(
+            state.drill_in("jobs"),
+            DrillIn::Rows {
+                headers: vec!["Job", "Detail"],
+                rows: vec![DrillInRow {
+                    cells: vec!["Nightly sync".to_owned(), "2026-01-27 02:00:00".to_owned()],
+                    link: Some(
+                        "https://prod.example.service-now.com/sys_trigger.do?sys_id=job-1"
+                            .to_owned()
+                    ),
+                }],
+                truncated: false,
+            }
+        );
+        // prod syslog likewise carries one fetched row.
         assert_eq!(
             state.drill_in("syslog"),
-            DrillIn::Text("4 errors · last hour".into())
+            DrillIn::Rows {
+                headers: vec!["Time", "Source", "Message"],
+                rows: vec![DrillInRow {
+                    cells: vec![
+                        "2026-01-27 00:12:00".to_owned(),
+                        "Scheduled job".to_owned(),
+                        "Null pointer in transform".to_owned(),
+                    ],
+                    link: None,
+                }],
+                truncated: false,
+            }
         );
         state.select("test");
         assert_eq!(state.drill_in("outbound"), DrillIn::Text("HTTP 429".into()));
@@ -1466,11 +1661,14 @@ mod tests {
             state.drill_in("last_clone"),
             DrillIn::Rows {
                 headers: vec!["Completed", "Age", "Source"],
-                rows: vec![vec![
-                    "2026-01-15 12:00:00".to_owned(),
-                    "12 days ago".to_owned(),
-                    "prod".to_owned(),
-                ]],
+                rows: vec![DrillInRow {
+                    cells: vec![
+                        "2026-01-15 12:00:00".to_owned(),
+                        "12 days ago".to_owned(),
+                        "prod".to_owned(),
+                    ],
+                    link: None,
+                }],
                 truncated: false,
             }
         );

@@ -706,7 +706,7 @@ impl Daku {
                     )
                     .child(Separator::horizontal().color(cx.theme().border))
                     .children(rows.into_iter().map(|row| {
-                        compare_row_cells(row)
+                        drill_in_row_cells(row)
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                     }))
@@ -895,6 +895,39 @@ fn compare_strip(has_mismatch: bool, rows: &[CompareRow], cx: &App) -> impl Into
                     .child("build / drift mismatch"),
             )
         })
+}
+
+/// One drill-in table row. The first cell is a deep link when the row
+/// carries one (job rows link their ServiceNow records); opening it must not
+/// toggle the Drill-in, like the header link.
+fn drill_in_row_cells(row: crate::dashboard_state::DrillInRow) -> gpui::Div {
+    h_flex()
+        .w_full()
+        .px(px(14.0))
+        .py(px(8.0))
+        .gap(px(12.0))
+        .children(row.cells.into_iter().enumerate().map(|(index, cell)| {
+            let body = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
+            match (&row.link, index) {
+                (Some(url), 0) => body
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("drill-row-{url}")))
+                            .cursor_pointer()
+                            .hover(|style| style.text_decoration_1())
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation()
+                            })
+                            .on_click({
+                                let url = url.clone();
+                                move |_, _, cx| cx.open_url(&url)
+                            })
+                            .child(cell),
+                    )
+                    .into_any_element(),
+                _ => body.child(cell).into_any_element(),
+            }
+        }))
 }
 
 fn compare_row_cells(cells: impl IntoIterator<Item = String>) -> gpui::Div {

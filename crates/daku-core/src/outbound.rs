@@ -2,12 +2,37 @@
 
 use daku_protocol::SignalState;
 
-use crate::collector::{Observation, PerEnvironmentCollector, Signal};
+use crate::collector::{Observation, PerEnvironmentCollector, ROW_LIST_LIMIT, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
 pub const OUTBOUND_SIGNAL_ID: &str = "outbound";
 pub const OUTBOUND_HTTP_PATH: &str = "/api/now/stats/sys_outbound_http_log?sysparm_count=true&sysparm_query=http_status>=400^sys_created_on>javascript:gs.hoursAgoStart(1)";
+/// Newest failures first, bounded for the drill-in.
+pub const OUTBOUND_FAILURE_ROWS_PATH: &str = "/api/now/table/sys_outbound_http_log?sysparm_fields=sys_id,url,http_status,sys_created_on&sysparm_query=http_status>=400^sys_created_on>javascript:gs.hoursAgoStart(1)^ORDERBYDESCsys_created_on&sysparm_limit=10";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct OutboundRow {
+    sys_id: String,
+    url: String,
+    http_status: String,
+    sys_created_on: String,
+}
+
+/// Keeps scheme + host + path; drops query and fragment, which can carry
+/// third-party secrets the drill-in never needs.
+fn redact_url(url: String) -> String {
+    let without_fragment = url.split('#').next().unwrap_or("").to_owned();
+    without_fragment.split('?').next().unwrap_or("").to_owned()
+}
+
+fn row_text(row: &serde_json::Value, key: &str) -> String {
+    match row.get(key) {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(value) if value.is_number() => value.to_string(),
+        _ => String::new(),
+    }
+}
 
 pub fn outbound_state(outbound_http_4xx_5xx_1h: u64, thresholds: &Thresholds) -> SignalState {
     if outbound_http_4xx_5xx_1h >= thresholds.outbound_failures_degraded_at {
@@ -15,6 +40,53 @@ pub fn outbound_state(outbound_http_4xx_5xx_1h: u64, thresholds: &Thresholds) ->
     } else {
         SignalState::Healthy
     }
+}
+
+/// Offending failure rows, newest first. A failed rows request yields no
+/// rows — the count already determined the state.
+fn fetch_outbound_rows(
+    client: &ServiceNowClient,
+    environment: &EnvironmentConfig,
+    credentials: &dyn CredentialStore,
+) -> (Vec<OutboundRow>, bool) {
+    let Ok(response) = client.request(
+        environment,
+        credentials,
+        "GET",
+        OUTBOUND_FAILURE_ROWS_PATH,
+        None,
+    ) else {
+        return (Vec::new(), false);
+    };
+    if response.status != 200 {
+        return (Vec::new(), false);
+    }
+    let rows: Vec<OutboundRow> =
+        serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("result")
+                    .and_then(|result| result.as_array())
+                    .cloned()
+            })
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| {
+                let sys_id = row_text(row, "sys_id");
+                if sys_id.is_empty() {
+                    return None;
+                }
+                Some(OutboundRow {
+                    sys_id,
+                    url: redact_url(row_text(row, "url")),
+                    http_status: row_text(row, "http_status"),
+                    sys_created_on: row_text(row, "sys_created_on"),
+                })
+            })
+            .collect();
+    let truncated = rows.len() >= ROW_LIST_LIMIT;
+    (rows.into_iter().take(ROW_LIST_LIMIT).collect(), truncated)
 }
 
 #[derive(Default)]
@@ -35,10 +107,18 @@ impl Signal for OutboundSignal {
     ) -> anyhow::Result<Observation> {
         let outbound_http_4xx_5xx_1h =
             fetch_aggregate_count(client, environment, credentials, OUTBOUND_HTTP_PATH)?;
+        // Rows only while unhealthy: a zero count costs no extra request.
+        let (failure_rows, failure_rows_truncated) = if outbound_http_4xx_5xx_1h > 0 {
+            fetch_outbound_rows(client, environment, credentials)
+        } else {
+            (Vec::new(), false)
+        };
         Ok(Observation {
             state: outbound_state(outbound_http_4xx_5xx_1h, &environment.thresholds),
             payload: serde_json::json!({
-                "outbound_http_4xx_5xx_1h": outbound_http_4xx_5xx_1h
+                "outbound_http_4xx_5xx_1h": outbound_http_4xx_5xx_1h,
+                "failure_rows": failure_rows,
+                "failure_rows_truncated": failure_rows_truncated,
             }),
             sample: None,
         })
@@ -87,10 +167,23 @@ mod tests {
 
     struct OutboundCountTransport {
         body: &'static str,
+        /// Rows body for table URLs; `None` panics, proving a healthy tick
+        /// fetches no rows at all.
+        rows: Option<&'static str>,
     }
 
     impl HttpTransport for OutboundCountTransport {
         fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+            if request.url.contains("/api/now/table/sys_outbound_http_log") {
+                let Some(rows) = self.rows else {
+                    panic!("healthy outbound tick must not fetch rows: {}", request.url);
+                };
+                return Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![("content-type".into(), "application/json".into())],
+                    body: rows.into(),
+                });
+            }
             assert!(
                 request.url.contains("/api/now/stats/sys_outbound_http_log"),
                 "outbound collector must use Aggregate API: {}",
@@ -115,7 +208,11 @@ mod tests {
         }
     }
 
-    fn collect_with(body: &'static str) -> (TempDb, StateStore) {
+    const FAILURE_ROWS: &str = r#"{"result":[
+        {"sys_id":"o1","url":"https://partner.example.com/hook?token=secret","http_status":500,"sys_created_on":"2026-01-15 12:00:01"}
+    ]}"#;
+
+    fn collect_with(body: &'static str, rows: Option<&'static str>) -> (TempDb, StateStore) {
         let db = TempDb::new("outbound");
         let store = db.store();
         let credentials = Arc::new(MemoryCredentialStore::default());
@@ -123,7 +220,7 @@ mod tests {
         let collector = OutboundCollector::new(
             vec![prod()],
             credentials,
-            ServiceNowClient::new(OutboundCountTransport { body }, SystemClock),
+            ServiceNowClient::new(OutboundCountTransport { body, rows }, SystemClock),
             store,
         );
         collector.collect().unwrap();
@@ -133,7 +230,10 @@ mod tests {
 
     #[test]
     fn outbound_signal_zero_writes_healthy_snapshot_without_sample() {
-        let (_db, store) = collect_with(include_str!("../tests/fixtures/outbound/count_0.json"));
+        let (_db, store) = collect_with(
+            include_str!("../tests/fixtures/outbound/count_0.json"),
+            None,
+        );
         let connection = store.open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", OUTBOUND_SIGNAL_ID)
             .unwrap()
@@ -150,7 +250,10 @@ mod tests {
 
     #[test]
     fn outbound_signal_nonzero_writes_degraded_snapshot() {
-        let (_db, store) = collect_with(include_str!("../tests/fixtures/outbound/count_3.json"));
+        let (_db, store) = collect_with(
+            include_str!("../tests/fixtures/outbound/count_3.json"),
+            Some(FAILURE_ROWS),
+        );
         let connection = store.open().unwrap();
         let row = persistence::load_signal_snapshot(&connection, "prod", OUTBOUND_SIGNAL_ID)
             .unwrap()
@@ -158,6 +261,12 @@ mod tests {
         assert_eq!(row.state, "degraded");
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["outbound_http_4xx_5xx_1h"], 3);
+        assert_eq!(
+            payload["failure_rows"][0]["url"], "https://partner.example.com/hook",
+            "query strings never reach the drill-in"
+        );
+        assert_eq!(payload["failure_rows"][0]["http_status"], "500");
+        assert_eq!(payload["failure_rows_truncated"], false);
         assert!(
             persistence::load_signal_samples(&connection, "prod", OUTBOUND_SIGNAL_ID)
                 .unwrap()

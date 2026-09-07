@@ -69,6 +69,18 @@ impl HttpTransport for ContractTransport {
             } else {
                 include_str!("../tests/fixtures/syslog/count_0.json")
             }
+        } else if url.contains("/api/now/table/sys_trigger") {
+            r#"{"result":[
+                {"sys_id":"job-1","name":"Nightly sync","state":"0","next_action":"2026-01-27 02:00:00"}
+            ]}"#
+        } else if url.contains("/api/now/table/syslog") {
+            r#"{"result":[
+                {"sys_id":"log-1","source":"Scheduled job","message":"Null pointer in transform","level":"2","sys_created_on":"2026-01-27 00:12:00"}
+            ]}"#
+        } else if url.contains("/api/now/table/sys_outbound_http_log") {
+            r#"{"result":[
+                {"sys_id":"out-1","url":"https://partner.example.com/hook","http_status":502,"sys_created_on":"2026-01-27 00:12:00"}
+            ]}"#
         } else if url.contains("/api/now/stats/sys_outbound_http_log") {
             if source {
                 include_str!("../tests/fixtures/outbound/count_3.json")

@@ -2,12 +2,34 @@
 
 use daku_protocol::SignalState;
 
-use crate::collector::{Observation, PerEnvironmentCollector, Signal};
+use crate::collector::{Observation, PerEnvironmentCollector, ROW_LIST_LIMIT, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
 
 pub const SYSLOG_SIGNAL_ID: &str = "syslog";
 pub const SYSLOG_ERROR_LEVEL: u8 = 2;
+
+/// Newest errors first, bounded for the drill-in.
+pub fn syslog_error_rows_path() -> String {
+    format!(
+        "/api/now/table/syslog?sysparm_fields=sys_id,source,message,level,sys_created_on&sysparm_query=level={SYSLOG_ERROR_LEVEL}^sys_created_on>javascript:gs.hoursAgoStart(1)^ORDERBYDESCsys_created_on&sysparm_limit={ROW_LIST_LIMIT}"
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct SyslogRow {
+    sys_id: String,
+    source: String,
+    message: String,
+    sys_created_on: String,
+}
+
+fn row_text(row: &serde_json::Value, key: &str) -> String {
+    row.get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_owned()
+}
 
 pub fn syslog_error_path() -> String {
     format!(
@@ -21,6 +43,55 @@ pub fn syslog_state(error_count_1h: u64, thresholds: &Thresholds) -> SignalState
     } else {
         SignalState::Healthy
     }
+}
+
+/// Offending error rows, newest first. A failed rows request yields no rows —
+/// the count already determined the state.
+fn fetch_syslog_rows(
+    client: &ServiceNowClient,
+    environment: &EnvironmentConfig,
+    credentials: &dyn CredentialStore,
+) -> (Vec<SyslogRow>, bool) {
+    let Ok(response) = client.request(
+        environment,
+        credentials,
+        "GET",
+        &syslog_error_rows_path(),
+        None,
+    ) else {
+        return (Vec::new(), false);
+    };
+    if response.status != 200 {
+        return (Vec::new(), false);
+    }
+    let rows: Vec<SyslogRow> =
+        serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("result")
+                    .and_then(|result| result.as_array())
+                    .cloned()
+            })
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| {
+                let sys_id = row_text(row, "sys_id");
+                if sys_id.is_empty() {
+                    return None;
+                }
+                // Bound the payload: messages can be stack traces.
+                let message: String = row_text(row, "message").chars().take(160).collect();
+                Some(SyslogRow {
+                    sys_id,
+                    source: row_text(row, "source"),
+                    message,
+                    sys_created_on: row_text(row, "sys_created_on"),
+                })
+            })
+            .collect();
+    let truncated = rows.len() >= ROW_LIST_LIMIT;
+    (rows.into_iter().take(ROW_LIST_LIMIT).collect(), truncated)
 }
 
 #[derive(Default)]
@@ -45,9 +116,19 @@ impl Signal for SyslogSignal {
     ) -> anyhow::Result<Observation> {
         let error_count_1h =
             fetch_aggregate_count(client, environment, credentials, &syslog_error_path())?;
+        // Rows only while unhealthy: a zero count costs no extra request.
+        let (error_rows, error_rows_truncated) = if error_count_1h > 0 {
+            fetch_syslog_rows(client, environment, credentials)
+        } else {
+            (Vec::new(), false)
+        };
         Ok(Observation {
             state: syslog_state(error_count_1h, &environment.thresholds),
-            payload: serde_json::json!({ "error_count_1h": error_count_1h }),
+            payload: serde_json::json!({
+                "error_count_1h": error_count_1h,
+                "error_rows": error_rows,
+                "error_rows_truncated": error_rows_truncated,
+            }),
             sample: Some(error_count_1h as f64),
         })
     }
@@ -70,10 +151,23 @@ mod tests {
 
     struct SyslogCountTransport {
         body: &'static str,
+        /// Rows body for table URLs; `None` panics, proving a healthy tick
+        /// fetches no rows at all.
+        rows: Option<&'static str>,
     }
 
     impl HttpTransport for SyslogCountTransport {
         fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+            if request.url.contains("/api/now/table/syslog") {
+                let Some(rows) = self.rows else {
+                    panic!("healthy syslog tick must not fetch rows: {}", request.url);
+                };
+                return Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![("content-type".into(), "application/json".into())],
+                    body: rows.into(),
+                });
+            }
             assert!(
                 request.url.contains("/api/now/stats/syslog"),
                 "syslog collector must use Aggregate API: {}",
@@ -123,6 +217,7 @@ mod tests {
             ServiceNowClient::new(
                 SyslogCountTransport {
                     body: include_str!("../tests/fixtures/syslog/count_0.json"),
+                    rows: None,
                 },
                 SystemClock,
             ),
@@ -155,6 +250,11 @@ mod tests {
             ServiceNowClient::new(
                 SyslogCountTransport {
                     body: include_str!("../tests/fixtures/syslog/count_4.json"),
+                    rows: Some(
+                        r#"{"result":[
+                            {"sys_id":"s1","source":"Scheduled job","message":"Null pointer in transform","level":"2","sys_created_on":"2026-01-15 12:00:01"}
+                        ]}"#,
+                    ),
                 },
                 SystemClock,
             ),
@@ -169,6 +269,12 @@ mod tests {
         assert_eq!(row.state, "degraded");
         let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
         assert_eq!(payload["error_count_1h"], 4);
+        assert_eq!(payload["error_rows"][0]["source"], "Scheduled job");
+        assert_eq!(
+            payload["error_rows"][0]["message"],
+            "Null pointer in transform"
+        );
+        assert_eq!(payload["error_rows_truncated"], false);
         let samples =
             persistence::load_signal_samples(&connection, "prod", SYSLOG_SIGNAL_ID).unwrap();
         assert_eq!(samples[0].value_real, Some(4.0));
