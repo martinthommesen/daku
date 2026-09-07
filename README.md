@@ -55,11 +55,11 @@ Daemon Hello auth uses env **`DAKU_DAEMON_TOKEN`**. Operator data/config lives u
 
 Copy [`environments.example.json`](environments.example.json) to `~/.daku/environments.json` (`chmod 600` it — the daemon only enforces `0700` on the directory and `0600` on files it writes) and edit Environment URLs/labels. URLs must be `https://` with no user:password part. **Secrets stay in the macOS Keychain** (daku-owned service) — never in that JSON file or in SQLite.
 
-Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settings.json`, e.g. `{"poll_interval_secs": 60}` (default **120**, values below 30 are raised to 30; the daemon reads it at start — relaunch after editing). One shared `CollectorLoop` polls every Environment; Availability, jobs, syslog, MID/ECC, outbound, drift, and last-clone register onto it. After each tick the daemon broadcasts `EnvironmentsUpdated`, `SignalSnapshotsUpdated`, and `SignalSamplesUpdated` (jobs/syslog ≤24h) so the GPUI client never opens SQLite. The GPUI shell is sidebar + Environment detail; `DAKU_UI_FIXTURE=1` loads the same events as the dashboard_state tests (no ServiceNow).
+Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settings.json`, e.g. `{"poll_interval_secs": 60}` (default **120**, values below 30 are raised to 30; the daemon reads it at start — relaunch after editing `settings.json`). One shared `CollectorLoop` polls every Environment; Availability, jobs, syslog, MID/ECC, outbound, drift, and last-clone register onto it. After each tick the daemon broadcasts `EnvironmentsUpdated`, `SignalSnapshotsUpdated`, and `SignalSamplesUpdated` (jobs/syslog ≤24h) so the GPUI client never opens SQLite. The GPUI shell is sidebar + Environment detail; `DAKU_UI_FIXTURE=1` loads the same events as the dashboard_state tests (no ServiceNow).
 
 ### Operator smoke (local)
 
-1. Copy the example file to `~/.daku/environments.json`. Use your own Environment URLs locally — do not commit them. The daemon reads this file at start — relaunch daku after creating or editing it. Daemon diagnostics (missing config, Keychain misses, HTTP errors) are appended to `~/.daku/daemon.log`.
+1. Copy the example file to `~/.daku/environments.json`. Use your own Environment URLs locally — do not commit them. The daemon reads this file at start — press ⌘R (Window → Reload Daemon) after creating or editing it. Daemon diagnostics (missing config, Keychain misses, HTTP errors) are appended to `~/.daku/daemon.log`.
 2. Store Credentials in Keychain, service `daku`, account = Environment `id`:
    - OAuth: `{"client_id":"…","client_secret":"…"}`
    - Basic (PDI stand-in only): `{"username":"…","password":"…"}`

@@ -16,7 +16,10 @@ use gpui::{
 use crate::app::Daku;
 use crate::identity::{APP_ID, APP_NAME};
 
-actions!(daku, [Quit, About, CloseWindow, CheckForUpdates]);
+actions!(
+    daku,
+    [Quit, About, CloseWindow, CheckForUpdates, ReloadDaemon]
+);
 
 const DEFAULT_WINDOW_WIDTH: f32 = 1380.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 880.0;
@@ -71,6 +74,7 @@ pub fn run() {
             cx.bind_keys([
                 KeyBinding::new("secondary-q", Quit, None),
                 KeyBinding::new("secondary-w", CloseWindow, None),
+                KeyBinding::new("secondary-r", ReloadDaemon, None),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
 
@@ -142,7 +146,11 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
         Menu {
             name: "Window".into(),
             disabled: false,
-            items: vec![MenuItem::action("Close Window", CloseWindow)],
+            items: vec![
+                MenuItem::action("Close Window", CloseWindow),
+                MenuItem::separator(),
+                MenuItem::action("Reload Daemon", ReloadDaemon),
+            ],
         },
     ]);
 }

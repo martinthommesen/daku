@@ -426,6 +426,28 @@ impl DaemonSupervisor {
         self.inner.last_error.lock().clone()
     }
 
+    /// True when the daemon is a locally spawned child that this supervisor
+    /// owns. Reload (shutdown + respawn) is only safe then: reloading a remote
+    /// daemon would kill it and re-dial a dead address forever.
+    pub fn is_local(&self) -> bool {
+        self.inner.executable.is_some()
+    }
+
+    /// Reload config and poll now by restarting the locally supervised daemon.
+    /// The fresh daemon re-reads `environments.json`/`settings.json` and ticks
+    /// immediately; last-known cards replay from SQLite so the UI never blanks.
+    /// No-op (error) for remote daemons. No protocol change.
+    pub fn reload(&self) -> anyhow::Result<()> {
+        if !self.is_local() {
+            bail!("the connected daemon is managed outside daku Desktop");
+        }
+        // Shutdown is graceful: the daemon sends `ShuttingDown`, the client's
+        // reader marks disconnected, and `monitor_daemon` (~500 ms poll)
+        // respawns via `replace_local_daemon`. Total is ~0.5 s measured.
+        self.client().shutdown();
+        Ok(())
+    }
+
     pub fn client(&self) -> DaemonClient {
         self.inner.target.lock().client()
     }

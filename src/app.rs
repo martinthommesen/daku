@@ -21,6 +21,7 @@ use gpui_component::{
 };
 
 use crate::CloseWindow;
+use crate::ReloadDaemon;
 use crate::dashboard_state::{
     CompareRow, DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, fixture_events, freshness,
     signal_label, ui_fixture_enabled,
@@ -30,7 +31,7 @@ const SIDEBAR_WIDTH: f32 = 220.0;
 
 pub struct Daku {
     state: DashboardState,
-    _supervisor: Option<DaemonSupervisor>,
+    supervisor: Option<DaemonSupervisor>,
     /// `Root` owns the window's root dispatch node, so the shell only receives
     /// menu- and keystroke-dispatched actions while this handle is focused.
     focus_handle: FocusHandle,
@@ -54,7 +55,7 @@ impl Daku {
             tick_freshness(cx);
             Self {
                 state,
-                _supervisor: supervisor,
+                supervisor,
                 focus_handle: focus_handle.clone(),
             }
         });
@@ -172,6 +173,16 @@ impl Render for Daku {
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(|_, _: &CloseWindow, window, _cx| {
                 crate::platform::hide_window(window);
+            }))
+            .on_action(cx.listener(|this, _: &ReloadDaemon, _, cx| {
+                // Local-only: `DaemonSupervisor::reload` refuses remote daemons
+                // so a reload can never kill a daemon it cannot respawn.
+                // Failures surface as a disconnected banner via the existing
+                // dashboard listener; the daemon log holds the detail.
+                if let Some(supervisor) = this.supervisor.as_ref().filter(|s| s.is_local()) {
+                    let _ = supervisor.reload();
+                }
+                cx.notify();
             }))
             .child(
                 TitleBar::new()
@@ -373,7 +384,7 @@ impl Daku {
             })
             .when(self.state.selected().is_none(), |element| {
                 let message = if self.state.connected() && !self.state.has_environments() {
-                    "No Environments configured \u{2014} copy environments.example.json to ~/.daku/environments.json, then relaunch daku. Daemon diagnostics: ~/.daku/daemon.log"
+                    "No Environments configured — copy environments.example.json to ~/.daku/environments.json, then press ⌘R to reload. Daemon diagnostics: ~/.daku/daemon.log"
                 } else {
                     "No Environment selected."
                 };

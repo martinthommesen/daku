@@ -247,3 +247,23 @@ fn wrong_protocol_version_is_rejected() {
         "unexpected {reply:?}"
     );
 }
+
+#[test]
+fn remote_supervisor_refuses_reload() {
+    use daku_client::DaemonSupervisor;
+
+    let daemon = Daemon::start(false, &[]);
+    let supervisor = DaemonSupervisor::connect(&daemon.address, TOKEN.to_owned()).unwrap();
+    assert!(
+        !supervisor.is_local(),
+        "an attached daemon must not count as local"
+    );
+    let error = supervisor.reload().unwrap_err();
+    assert!(
+        error.to_string().contains("managed outside"),
+        "unexpected error: {error:#}"
+    );
+    // Remote stays usable after a refused reload.
+    let ack = supervisor.client().request(Command::Ping).unwrap();
+    assert!(matches!(ack, ResponsePayload::Ack), "unexpected {ack:?}");
+}
