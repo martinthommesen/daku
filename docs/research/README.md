@@ -10,6 +10,7 @@ Landed on `main` (formerly orphan `research/*` branches). Read these instead of 
 | Signal drill-in: what detail exists, and how far to take it | [signal-drill-in.md](./signal-drill-in.md) |
 | Operator setup: should the daemon fix what `doctor` diagnoses (option C + README fixes) | [operator-setup.md](./operator-setup.md) |
 | Reload / poll-now decision note (option A: restart the local daemon, no protocol change) | [reload-command.md](./reload-command.md) |
+| Semaphore / transaction Signal spike (conditional no; 4 Operator probes open) | [semaphore-spike.md](./semaphore-spike.md) |
 | Waku reuse survey (early; web lean **overridden** by ADR-0001) | [waku-reuse.md](./waku-reuse.md) |
 | Waku pin + partial-fork inventory | [waku-fork-inventory.md](./waku-fork-inventory.md) |
 
