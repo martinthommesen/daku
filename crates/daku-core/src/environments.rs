@@ -20,7 +20,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use anyhow::{Context, anyhow, bail};
 
-use daku_protocol::{AuthMethod, Command, EnvironmentConfig, ResponsePayload};
+use daku_protocol::{Command, EnvironmentConfig, ResponsePayload, validate_credential};
 
 use crate::Backend;
 use crate::availability::AvailabilitySignal;
@@ -100,32 +100,6 @@ impl Backend for EnvironmentsBackend {
     }
 }
 
-/// Shape-checks a Credential blob against its auth method without ever
-/// echoing the blob: OAuth needs non-empty `client_id` + `client_secret`,
-/// basic needs non-empty `username` + `password`.
-pub fn validate_credential(auth_method: AuthMethod, blob: &str) -> anyhow::Result<()> {
-    let value: serde_json::Value =
-        serde_json::from_str(blob).context("credential is not valid JSON")?;
-    let present = |key: &str| {
-        value
-            .get(key)
-            .and_then(|item| item.as_str())
-            .is_some_and(|text| !text.trim().is_empty())
-    };
-    let ok = match auth_method {
-        AuthMethod::OauthClientCredentials => present("client_id") && present("client_secret"),
-        AuthMethod::Basic => present("username") && present("password"),
-    };
-    if !ok {
-        let want = match auth_method {
-            AuthMethod::OauthClientCredentials => "client_id and client_secret",
-            AuthMethod::Basic => "username and password",
-        };
-        bail!("credential does not match its auth method (needs {want})");
-    }
-    Ok(())
-}
-
 fn validate_environment(environment: &EnvironmentConfig) -> anyhow::Result<()> {
     if environment.id.trim().is_empty() {
         bail!("environment id must not be empty");
@@ -196,7 +170,7 @@ pub fn save_environment(
         if !allow_credential_write {
             bail!("refusing credential write on a non-loopback daemon");
         }
-        validate_credential(environment.auth_method, blob)?;
+        validate_credential(environment.auth_method, blob).map_err(|error| anyhow!("{error}"))?;
     }
     let mut environments = load_or_empty(path)?;
     match environments
@@ -255,7 +229,8 @@ pub fn test_environment(
     let ephemeral;
     let store: &dyn CredentialStore = match credential_json {
         Some(blob) => {
-            validate_credential(environment.auth_method, blob)?;
+            validate_credential(environment.auth_method, blob)
+                .map_err(|error| anyhow!("{error}"))?;
             ephemeral = MemoryCredentialStore::default();
             ephemeral.insert(&environment.id, blob);
             &ephemeral
@@ -270,6 +245,7 @@ mod tests {
     use super::*;
     use crate::config::MemoryCredentialStore;
     use crate::test_support::TempFile;
+    use daku_protocol::AuthMethod;
 
     const OAUTH: &str = r#"{"client_id":"id","client_secret":"secret"}"#;
     const BASIC: &str = r#"{"username":"reader","password":"secret"}"#;
@@ -459,7 +435,7 @@ mod tests {
                 "irrelevant",
             ),
         ] {
-            let error = validate_credential(method, blob).unwrap_err().to_string();
+            let error = validate_credential(method, blob).unwrap_err();
             assert!(!error.contains(secret), "{error}");
         }
         assert!(validate_credential(AuthMethod::Basic, BASIC).is_ok());

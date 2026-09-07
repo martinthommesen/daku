@@ -111,6 +111,11 @@ pub fn publish_dashboard(
                 health,
                 reachability,
                 last_observed_at: env_snaps.iter().map(|snapshot| snapshot.observed_at).max(),
+                auth_method: environment.auth_method,
+                clone_source: environment.clone_source,
+                thresholds: environment.thresholds.clone(),
+                expected_drift: environment.expected_drift.clone(),
+                sort_order: environment.sort_order,
             },
             environment: environment.clone(),
         });

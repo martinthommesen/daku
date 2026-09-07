@@ -61,14 +61,8 @@ Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settin
 
 ### Operator smoke (local)
 
-1. Copy the example file to `~/.daku/environments.json`. Use your own Environment URLs locally — do not commit them. The daemon reads this file at start — press ⌘R (Window → Reload Daemon) after creating or editing it. Daemon diagnostics (missing config, Keychain misses, HTTP errors) are appended to `~/.daku/daemon.log`.
-2. Store Credentials in Keychain, service `daku`, account = Environment `id`:
-   - OAuth: `{"client_id":"…","client_secret":"…"}`
-   - Basic (PDI stand-in only): `{"username":"…","password":"…"}`
-
-   ```sh
-   security add-generic-password -s daku -a prod -w '{"client_id":"…","client_secret":"…"}'
-   ```
+1. Add an Environment from the app menu (daku → Add Environment…): label, `https://` URL, auth method, Credential — Test dry-runs the probe, Save writes `~/.daku/environments.json` (0600) and the Keychain item, then reloads. Editing works from the Environment header (Edit); deleting asks twice. The sheet refuses malformed URLs and mismatched Credential shapes before anything is written.
+2. Prefer OAuth (`{"client_id":"…","client_secret":"…"}`), basic only for PDI stand-ins (`{"username":"…","password":"…"}`). Hand-editing stays supported: copy [`environments.example.json`](environments.example.json) to `~/.daku/environments.json` (`chmod 600` it) and store Credentials with `security add-generic-password -U -s daku -a <id> -w` (with `-w` last so the shell prompts — the secret never lands in history). Press ⌘R after hand-editing. Daemon diagnostics (missing config, Keychain misses, HTTP errors) are appended to `~/.daku/daemon.log`. Do not commit URLs or secrets.
 
 3. One-shot Availability probe (no daemon token):
 

@@ -386,7 +386,12 @@ mod tests {
                 "platformId": "servicenow",
                 "health": "healthy",
                 "reachability": "asleep",
-                "lastObservedAt": 1_700_000_000
+                "lastObservedAt": 1_700_000_000,
+                "authMethod": "basic",
+                "cloneSource": false,
+                "thresholds": {},
+                "expectedDrift": [],
+                "sortOrder": 0
             }]
         });
         match serde_json::from_value::<ServerMessage>(json).unwrap() {

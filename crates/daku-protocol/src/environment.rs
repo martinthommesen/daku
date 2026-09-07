@@ -69,6 +69,36 @@ impl Default for Thresholds {
     }
 }
 
+/// Shape-checks a Credential blob against its auth method without ever
+/// echoing the blob: OAuth needs non-empty `client_id` + `client_secret`,
+/// basic needs non-empty `username` + `password`. Shared by the daemon
+/// (save path) and the desktop sheet (pre-flight) so both reject the same
+/// garbage with the same message.
+pub fn validate_credential(auth_method: AuthMethod, blob: &str) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(blob).map_err(|_| "credential is not valid JSON".to_owned())?;
+    let present = |key: &str| {
+        value
+            .get(key)
+            .and_then(|item| item.as_str())
+            .is_some_and(|text| !text.trim().is_empty())
+    };
+    let ok = match auth_method {
+        AuthMethod::OauthClientCredentials => present("client_id") && present("client_secret"),
+        AuthMethod::Basic => present("username") && present("password"),
+    };
+    if !ok {
+        let want = match auth_method {
+            AuthMethod::OauthClientCredentials => "client_id and client_secret",
+            AuthMethod::Basic => "username and password",
+        };
+        return Err(format!(
+            "credential does not match its auth method (needs {want})"
+        ));
+    }
+    Ok(())
+}
+
 impl Thresholds {
     /// One-line effective values for `daku-daemon doctor`.
     pub fn summary(&self) -> String {

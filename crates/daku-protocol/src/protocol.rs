@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::environment::EnvironmentConfig;
+use crate::environment::{AuthMethod, EnvironmentConfig, Thresholds};
 use crate::settings::DaemonSettings;
 
 pub const PROTOCOL_VERSION: u32 = 7;
@@ -176,6 +176,14 @@ pub struct EnvironmentSummary {
     pub health: EnvironmentHealth,
     pub reachability: Reachability,
     pub last_observed_at: Option<i64>,
+    /// Full config for the edit sheet (`106`): auth method, clone-source
+    /// flag, per-Environment thresholds and expected drift. The daemon
+    /// re-publishes after every reload, so edits never go stale.
+    pub auth_method: AuthMethod,
+    pub clone_source: bool,
+    pub thresholds: Thresholds,
+    pub expected_drift: Vec<String>,
+    pub sort_order: i64,
 }
 
 /// ADR-0004: Environment URLs carry Credentials on every request, so they are
@@ -462,11 +470,18 @@ mod tests {
                 health: EnvironmentHealth::Healthy,
                 reachability: Reachability::Asleep,
                 last_observed_at: Some(1_700_000_000),
+                auth_method: crate::environment::AuthMethod::Basic,
+                clone_source: false,
+                thresholds: crate::environment::Thresholds::default(),
+                expected_drift: Vec::new(),
+                sort_order: 0,
             }],
         };
         let json = serde_json::to_value(&message).unwrap();
         assert_eq!(json["type"], "environmentsUpdated");
         assert_eq!(json["environments"][0]["platformId"], "servicenow");
+        assert_eq!(json["environments"][0]["authMethod"], "basic");
+        assert_eq!(json["environments"][0]["cloneSource"], false);
         assert_eq!(
             json["environments"][0]["instanceUrl"],
             "https://prod.example.service-now.com"

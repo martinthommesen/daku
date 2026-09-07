@@ -3,6 +3,7 @@
 mod app;
 pub mod daemon;
 mod dashboard_state;
+mod env_sheet;
 mod notifications;
 mod platform;
 mod updater;
@@ -26,7 +27,8 @@ actions!(
         CheckForUpdates,
         ReloadDaemon,
         CopySummary,
-        ToggleNotifications
+        ToggleNotifications,
+        AddEnvironment
     ]
 );
 
@@ -189,6 +191,7 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
                     "Toggle Health Notifications",
                     ToggleNotifications,
                 ));
+                items.push(MenuItem::action("Add Environment…", AddEnvironment));
                 items.push(MenuItem::separator());
                 items.push(MenuItem::action(format!("Quit {APP_NAME}"), Quit));
                 items

@@ -23,6 +23,7 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::AddEnvironment;
 use crate::CloseWindow;
 use crate::CopySummary;
 use crate::ReloadDaemon;
@@ -34,6 +35,7 @@ use crate::dashboard_state::{
     fixture_events, format_health_event, freshness, is_trend_signal, mute_remaining_label,
     signal_label, ui_fixture_enabled,
 };
+use crate::env_sheet::{EnvSheet, auth_label, build_config, credential_blob, credential_captions};
 use crate::notifications::{
     notification_body, notification_title, post_health_notification, select_notification,
 };
@@ -52,6 +54,8 @@ pub struct Daku {
     boot_now: i64,
     /// (Environment, observed_at, kind) triples already decided on.
     notify_seen: HashSet<(String, i64, String)>,
+    /// Add/edit Environment sheet (`106`); `None` hides it.
+    env_sheet: Option<EnvSheet>,
     /// `Root` owns the window's root dispatch node, so the shell only receives
     /// menu- and keystroke-dispatched actions while this handle is focused.
     focus_handle: FocusHandle,
@@ -89,6 +93,7 @@ impl Daku {
                 copied_flash: false,
                 boot_now: unix_now(),
                 notify_seen: HashSet::new(),
+                env_sheet: None,
                 focus_handle: focus_handle.clone(),
             }
         });
@@ -172,6 +177,273 @@ impl Daku {
         {
             self.select_environment(&id, false, cx);
         }
+    }
+
+    fn open_add_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.env_sheet = Some(EnvSheet::add(window, cx));
+        cx.notify();
+    }
+
+    fn open_edit_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.state.selected().cloned();
+        if let Some(summary) = selected {
+            self.env_sheet = Some(EnvSheet::edit(
+                window,
+                cx,
+                &daku_protocol::EnvironmentConfig {
+                    id: summary.id,
+                    label: summary.label,
+                    instance_url: summary.instance_url,
+                    auth_method: summary.auth_method,
+                    sort_order: summary.sort_order,
+                    clone_source: summary.clone_source,
+                    thresholds: summary.thresholds,
+                    expected_drift: summary.expected_drift,
+                },
+            ));
+        }
+        cx.notify();
+    }
+
+    /// Reads the open sheet into a saveable config plus an optional fresh
+    /// Credential blob. `None` without an open sheet.
+    fn read_sheet(&self, cx: &App) -> Option<(daku_protocol::EnvironmentConfig, Option<String>)> {
+        let sheet = self.env_sheet.as_ref()?;
+        let values = sheet.values(cx);
+        let existing = sheet
+            .editing_id
+            .as_deref()
+            .and_then(|id| self.state.environments().iter().find(|env| env.id == id));
+        let (id, sort_order) = match &sheet.editing_id {
+            // Ids are immutable: sort order and tuning ride along untouched.
+            Some(id) => (
+                id.clone(),
+                self.state
+                    .environments()
+                    .iter()
+                    .find(|env| &env.id == id)
+                    .map(|env| env.sort_order)
+                    .unwrap_or(0),
+            ),
+            None => (
+                values.id.trim().to_owned(),
+                self.state.environments().len() as i64,
+            ),
+        };
+        let existing_config = existing.map(|summary| daku_protocol::EnvironmentConfig {
+            id: summary.id.clone(),
+            label: summary.label.clone(),
+            instance_url: summary.instance_url.clone(),
+            auth_method: summary.auth_method,
+            sort_order: summary.sort_order,
+            clone_source: summary.clone_source,
+            thresholds: summary.thresholds.clone(),
+            expected_drift: summary.expected_drift.clone(),
+        });
+        let config = build_config(
+            id,
+            values.label.trim().to_owned(),
+            values.url.trim().to_owned(),
+            sheet.auth,
+            sheet.clone_source,
+            sort_order,
+            existing_config.as_ref(),
+        );
+        let blob = credential_blob(sheet.auth, &values.secret_a, &values.secret_b);
+        Some((config, blob))
+    }
+
+    fn set_sheet_notice(&mut self, is_error: bool, text: String) {
+        if let Some(sheet) = self.env_sheet.as_mut() {
+            sheet.busy = false;
+            sheet.notice = Some((is_error, text));
+        }
+    }
+
+    /// Pre-flight: plain fields plus Credential shape when a fresh blob was
+    /// entered. Shows the first problem in the sheet.
+    fn validate_sheet(
+        &mut self,
+        cx: &App,
+    ) -> Option<(daku_protocol::EnvironmentConfig, Option<String>)> {
+        let (config, blob) = self.read_sheet(cx)?;
+        if let Err(error) =
+            crate::env_sheet::validate_fields(&config.id, &config.label, &config.instance_url)
+        {
+            self.set_sheet_notice(true, error);
+            return None;
+        }
+        if let Some(blob) = &blob
+            && let Err(error) = daku_protocol::validate_credential(config.auth_method, blob)
+        {
+            self.set_sheet_notice(true, error);
+            return None;
+        }
+        Some((config, blob))
+    }
+
+    /// Runs one management RPC off the UI thread; `done` applies the outcome
+    /// back on the entity. Secrets ride the caller's owned command only.
+    fn sheet_rpc(
+        &mut self,
+        command: daku_protocol::Command,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, anyhow::Result<daku_protocol::ResponsePayload>, &mut Context<Self>)
+        + 'static,
+    ) {
+        let Some(client) = self
+            .supervisor
+            .as_ref()
+            .map(|supervisor| supervisor.client())
+        else {
+            self.set_sheet_notice(true, "daemon unavailable".to_owned());
+            cx.notify();
+            return;
+        };
+        if let Some(sheet) = self.env_sheet.as_mut() {
+            sheet.busy = true;
+            sheet.notice = None;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.request(command) })
+                .await;
+            let _ = this.update(cx, |this, cx| done(this, result, cx));
+        })
+        .detach();
+    }
+
+    fn test_sheet(&mut self, cx: &mut Context<Self>) {
+        let Some((config, blob)) = self.validate_sheet(cx) else {
+            cx.notify();
+            return;
+        };
+        self.sheet_rpc(
+            daku_protocol::Command::TestEnvironment {
+                environment: config,
+                credential_json: blob,
+            },
+            cx,
+            |this, result, cx| {
+                match result {
+                    Ok(daku_protocol::ResponsePayload::EnvironmentTest {
+                        reachability,
+                        state,
+                        build,
+                        error,
+                        rtt_ms,
+                    }) => {
+                        let mut line = format!(
+                            "{} · {} · {} ms",
+                            reachability.as_str(),
+                            state.as_str(),
+                            rtt_ms
+                        );
+                        if let Some(build) = build {
+                            line.push_str(&format!(" · build {build}"));
+                        }
+                        if let Some(error) = error {
+                            line.push_str(&format!(" · {error}"));
+                        }
+                        this.set_sheet_notice(false, line);
+                    }
+                    Ok(other) => {
+                        this.set_sheet_notice(true, format!("unexpected daemon reply: {other:?}"))
+                    }
+                    Err(error) => this.set_sheet_notice(true, format!("{error:#}")),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn save_sheet(&mut self, cx: &mut Context<Self>) {
+        let Some((config, blob)) = self.validate_sheet(cx) else {
+            cx.notify();
+            return;
+        };
+        let id = config.id.clone();
+        self.sheet_rpc(
+            daku_protocol::Command::SaveEnvironment {
+                environment: config,
+                credential_json: blob,
+            },
+            cx,
+            move |this, result, cx| {
+                match result {
+                    Ok(_) => {
+                        // The sheet ends by triggering the 070 reload, which
+                        // re-reads the file this just wrote. A remote daemon
+                        // cannot be reloaded from here: say so and stay open.
+                        let local = this
+                            .supervisor
+                            .as_ref()
+                            .is_some_and(|supervisor| supervisor.is_local());
+                        if local {
+                            this.supervisor
+                                .as_ref()
+                                .map(|supervisor| supervisor.reload());
+                            this.env_sheet = None;
+                        } else {
+                            this.set_sheet_notice(
+                                false,
+                                format!(
+                                    "Saved {id} on the daemon host — restart that daemon to apply."
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => this.set_sheet_notice(true, format!("{error:#}")),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn delete_sheet(&mut self, cx: &mut Context<Self>) {
+        let Some(sheet) = self.env_sheet.as_ref() else {
+            return;
+        };
+        let Some(id) = sheet.editing_id.clone() else {
+            return;
+        };
+        if !sheet.delete_armed {
+            if let Some(sheet) = self.env_sheet.as_mut() {
+                sheet.delete_armed = true;
+                sheet.notice = Some((true, "Click Delete again to confirm.".into()));
+            }
+            cx.notify();
+            return;
+        }
+        self.sheet_rpc(
+            daku_protocol::Command::DeleteEnvironment { id: id.clone() },
+            cx,
+            move |this, result, cx| {
+                match result {
+                    Ok(_) => {
+                        let local = this
+                            .supervisor
+                            .as_ref()
+                            .is_some_and(|supervisor| supervisor.is_local());
+                        if local {
+                            this.supervisor.as_ref().map(|supervisor| supervisor.reload());
+                            this.env_sheet = None;
+                        } else {
+                            this.set_sheet_notice(
+                                false,
+                                format!(
+                                    "Deleted {id} on the daemon host — restart that daemon to apply."
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => this.set_sheet_notice(true, format!("{error:#}")),
+                }
+                cx.notify();
+            },
+        );
     }
 
     fn copy_summary(&mut self, cx: &mut Context<Self>) {
@@ -329,6 +601,7 @@ impl Render for Daku {
         // cards do, so they are built here and handed to the detail render.
         let mute_controls = self.mute_controls(cx);
         let compare = self.compare_strip(cx);
+        let sheet = self.env_sheet_view(cx);
         let detail = self.render_detail(cards, drill_in, mute_controls, compare, cx);
         let title: SharedString = self
             .state
@@ -338,6 +611,7 @@ impl Render for Daku {
         div()
             .track_focus(&self.focus_handle)
             .size_full()
+            .relative()
             // One flat, slightly translucent surface: sidebar, title bar and
             // detail all share the sidebar colour over the blurred backdrop.
             .bg(cx.theme().sidebar.opacity(0.92))
@@ -371,6 +645,9 @@ impl Render for Daku {
                 this.persist_settings();
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &AddEnvironment, window, cx| {
+                this.open_add_sheet(window, cx);
+            }))
             .child(
                 TitleBar::new()
                     .bg(gpui::transparent_black())
@@ -393,7 +670,49 @@ impl Render for Daku {
                     .child(sidebar)
                     .child(detail),
             )
+            .children(sheet)
     }
+}
+
+/// Small "Edit" opener for the Environment sheet (`106`). A free function
+/// so both mute-controls branches share it.
+fn edit_button(cx: &mut Context<Daku>) -> gpui::AnyElement {
+    div()
+        .id("env-edit")
+        .text_color(cx.theme().muted_foreground)
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+            this.open_edit_sheet(window, cx);
+        }))
+        .child("Edit")
+        .into_any_element()
+}
+
+/// Toggle meanings in sheet option rows.
+#[derive(Clone, Copy, PartialEq)]
+enum SheetToggle {
+    Auth(daku_protocol::AuthMethod),
+    CloneSource(bool),
+}
+
+/// One sheet action button.
+fn sheet_button(
+    cx: &mut Context<Daku>,
+    id: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&mut Daku, &ClickEvent, &mut Context<Daku>) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .px(px(12.0))
+        .py(px(6.0))
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| on_click(this, event, cx)))
+        .child(div().text_sm().child(label))
+        .into_any_element()
 }
 
 impl Daku {
@@ -496,6 +815,7 @@ impl Daku {
                         }))
                         .child("Unmute"),
                 )
+                .child(edit_button(cx))
                 .into_any_element(),
             )
         } else {
@@ -511,9 +831,238 @@ impl Daku {
                             }))
                             .child(label)
                     }))
+                    .child(edit_button(cx))
                     .into_any_element(),
             )
         }
+    }
+
+    /// Add / edit Environment overlay (`106`). A centred panel over a
+    /// dimmed backdrop; backdrop clicks never close it, so typed secrets
+    /// cannot be lost to a stray click.
+    fn env_sheet_view(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use gpui_component::input::Input;
+
+        let sheet = self.env_sheet.as_ref()?;
+        let values = sheet.values(cx);
+        let title: SharedString = match &sheet.editing_id {
+            Some(id) => format!("Edit {id}").into(),
+            None => "Add Environment".into(),
+        };
+        let (caption_a, caption_b) = credential_captions(sheet.auth);
+        let overwrite_hint = sheet.editing_id.is_none()
+            && self
+                .state
+                .environments()
+                .iter()
+                .any(|env| env.id == values.id.trim());
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .bg(gpui::black().opacity(0.45))
+                .flex()
+                .items_start()
+                .justify_center()
+                .pt(px(64.0))
+                .child(
+                    div()
+                        .w(px(520.0))
+                        .rounded(cx.theme().radius)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().background)
+                        .p(px(20.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                        .when(sheet.editing_id.is_none(), |element| {
+                            element.child(EnvSheet::field_row("ID", &sheet.id_field, cx))
+                        })
+                        .child(EnvSheet::field_row("Label", &sheet.label_field, cx))
+                        .child(EnvSheet::field_row("Instance URL", &sheet.url_field, cx))
+                        .child(self.sheet_toggle_row(
+                            "Auth",
+                            &[
+                                (
+                                    SheetToggle::Auth(
+                                        daku_protocol::AuthMethod::OauthClientCredentials,
+                                    ),
+                                    auth_label(
+                                        daku_protocol::AuthMethod::OauthClientCredentials,
+                                    ),
+                                ),
+                                (
+                                    SheetToggle::Auth(daku_protocol::AuthMethod::Basic),
+                                    auth_label(daku_protocol::AuthMethod::Basic),
+                                ),
+                            ],
+                            cx,
+                        ))
+                        .child(self.sheet_toggle_row(
+                            "Clone source",
+                            &[
+                                (SheetToggle::CloneSource(false), "No"),
+                                (SheetToggle::CloneSource(true), "Yes"),
+                            ],
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(caption_a, &sheet.secret_a, cx))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(caption_b),
+                                )
+                                .child(Input::new(&sheet.secret_b).mask_toggle()),
+                        )
+                        .when(sheet.editing_id.is_some(), |element| {
+                            element.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        "Leave both Credential fields blank to keep the stored one.",
+                                    ),
+                            )
+                        })
+                        .when(overwrite_hint, |element| {
+                            element.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().warning)
+                                    .child("This id already exists — Save will overwrite it."),
+                            )
+                        })
+                        .when_some(sheet.notice.clone(), |element, (is_error, text)| {
+                            element.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(if is_error {
+                                        cx.theme().danger
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    })
+                                    .child(text),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(8.0))
+                                .child(sheet_button(cx, "sheet-cancel", "Cancel", |this, _, cx| {
+                                    this.env_sheet = None;
+                                    cx.notify();
+                                }))
+                                .child(sheet_button(cx, "sheet-test", "Test", |this, _, cx| {
+                                    this.test_sheet(cx);
+                                }))
+                                .when(sheet.editing_id.is_some(), |element| {
+                                    let label = if sheet.delete_armed {
+                                        "Confirm delete"
+                                    } else {
+                                        "Delete"
+                                    };
+                                    element.child(sheet_button(
+                                        cx,
+                                        "sheet-delete",
+                                        label,
+                                        |this, _, cx| {
+                                            this.delete_sheet(cx);
+                                        },
+                                    ))
+                                })
+                                .child(sheet_button(cx, "sheet-save", "Save", |this, _, cx| {
+                                    this.save_sheet(cx);
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// One toggle row in the sheet. Options carry their meaning so the
+    /// handler stays a single match.
+    fn sheet_toggle_row(
+        &self,
+        caption: &'static str,
+        options: &[(SheetToggle, &'static str)],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(caption),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.0))
+                    .children(options.iter().map(|(pick, label)| {
+                        let pick = *pick;
+                        let selected = match pick {
+                            SheetToggle::Auth(auth) => self
+                                .env_sheet
+                                .as_ref()
+                                .is_some_and(|sheet| sheet.auth == auth),
+                            SheetToggle::CloneSource(flag) => self
+                                .env_sheet
+                                .as_ref()
+                                .is_some_and(|sheet| sheet.clone_source == flag),
+                        };
+                        div()
+                            .id(SharedString::from(format!("sheet-pick-{label}")))
+                            .px(px(10.0))
+                            .py(px(4.0))
+                            .rounded(cx.theme().radius)
+                            .border_1()
+                            .border_color(if selected {
+                                cx.theme().primary
+                            } else {
+                                cx.theme().border
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                if let Some(sheet) = this.env_sheet.as_mut() {
+                                    match pick {
+                                        SheetToggle::Auth(auth) => sheet.auth = auth,
+                                        SheetToggle::CloneSource(flag) => sheet.clone_source = flag,
+                                    }
+                                    sheet.delete_armed = false;
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(if selected {
+                                        cx.theme().foreground
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    })
+                                    .child(*label),
+                            )
+                    })),
+            )
+            .into_any_element()
     }
 
     /// Compare strip: build, drift and last-clone across Environments. A
@@ -726,7 +1275,7 @@ impl Daku {
             })
             .when(self.state.selected().is_none(), |element| {
                 let message = if self.state.connected() && !self.state.has_environments() {
-                    "No Environments configured — copy environments.example.json to ~/.daku/environments.json, then press ⌘R to reload. Daemon diagnostics: ~/.daku/daemon.log"
+                    "No Environments configured — add one from the app menu (daku → Add Environment…), or copy environments.example.json to ~/.daku/environments.json and press ⌘R. Daemon diagnostics: ~/.daku/daemon.log"
                 } else {
                     "No Environment selected."
                 };

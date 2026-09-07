@@ -295,6 +295,10 @@ impl DashboardState {
         !self.environments.is_empty()
     }
 
+    pub fn environments(&self) -> &[EnvironmentSummary] {
+        &self.environments
+    }
+
     pub fn apply_all(&mut self, messages: &[ServerMessage]) {
         for message in messages {
             self.apply(message);
@@ -1568,6 +1572,11 @@ fn env(
         health,
         reachability,
         last_observed_at: Some(1_700_000_000),
+        auth_method: daku_protocol::AuthMethod::Basic,
+        clone_source: false,
+        thresholds: daku_protocol::Thresholds::default(),
+        expected_drift: Vec::new(),
+        sort_order: 0,
     }
 }
 
