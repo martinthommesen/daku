@@ -21,9 +21,12 @@ use gpui_component::{
 };
 
 use crate::CloseWindow;
+use crate::CopySummary;
 use crate::ReloadDaemon;
+use crate::SelectEnvironment;
+use crate::SelectEnvironmentSlot;
 use crate::dashboard_state::{
-    CompareRow, DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, fixture_events, freshness,
+    DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, fixture_events, freshness,
     mute_remaining_label, signal_label, ui_fixture_enabled,
 };
 use crate::persistence::{AppSettings, save_app_settings};
@@ -34,6 +37,8 @@ pub struct Daku {
     state: DashboardState,
     supervisor: Option<DaemonSupervisor>,
     settings: AppSettings,
+    /// Copy-summary confirmation, cleared ~2 s after ⌘⇧C.
+    copied_flash: bool,
     /// `Root` owns the window's root dispatch node, so the shell only receives
     /// menu- and keystroke-dispatched actions while this handle is focused.
     focus_handle: FocusHandle,
@@ -64,6 +69,7 @@ impl Daku {
                 state,
                 supervisor,
                 settings,
+                copied_flash: false,
                 focus_handle: focus_handle.clone(),
             }
         });
@@ -95,6 +101,46 @@ impl Daku {
         if let Err(error) = save_app_settings(&self.settings) {
             eprintln!("could not save daku app settings: {error:#}");
         }
+    }
+
+    /// The one "take me there" primitive: selects an Environment and
+    /// optionally opens its drift drill-in. Compare-row clicks dispatch the
+    /// `SelectEnvironment` action into this; notification and menu-bar clicks
+    /// (079/081) will call it directly.
+    fn select_environment(&mut self, env_id: &str, open_drift: bool, cx: &mut Context<Self>) {
+        self.state.select(env_id);
+        if open_drift {
+            self.state.open_card("drift");
+        }
+        cx.notify();
+    }
+
+    fn select_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
+        if let Some(id) = self
+            .state
+            .sidebar(unix_now())
+            .get(slot)
+            .map(|row| row.id.clone())
+        {
+            self.select_environment(&id, false, cx);
+        }
+    }
+
+    fn copy_summary(&mut self, cx: &mut Context<Self>) {
+        let text = self.state.summary_text(unix_now());
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.copied_flash = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                this.copied_flash = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
@@ -190,9 +236,11 @@ impl Render for Daku {
             .state
             .selected_card()
             .map(|signal_id| self.drill_in_region(signal_id, cx));
-        // Mute buttons carry click listeners like the cards do.
+        // Mute buttons and compare rows carry click listeners like the
+        // cards do, so they are built here and handed to the detail render.
         let mute_controls = self.mute_controls(cx);
-        let detail = self.render_detail(cards, drill_in, mute_controls, cx);
+        let compare = self.compare_strip(cx);
+        let detail = self.render_detail(cards, drill_in, mute_controls, compare, cx);
         let title: SharedString = self
             .state
             .selected()
@@ -219,6 +267,15 @@ impl Render for Daku {
                     let _ = supervisor.reload();
                 }
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, action: &SelectEnvironment, _, cx| {
+                this.select_environment(&action.env_id, action.open_drift, cx);
+            }))
+            .on_action(cx.listener(|this, action: &SelectEnvironmentSlot, _, cx| {
+                this.select_slot(action.slot, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopySummary, _, cx| {
+                this.copy_summary(cx);
             }))
             .child(
                 TitleBar::new()
@@ -278,15 +335,19 @@ impl Daku {
             .map_or(cx.theme().muted_foreground, |health| {
                 health_color(health, cx)
             });
-        let footer = format!(
-            "{} \u{b7} v{}",
-            if self.state.connected() {
-                "daemon connected"
-            } else {
-                "daemon disconnected"
-            },
-            env!("CARGO_PKG_VERSION")
-        );
+        let footer = if self.copied_flash {
+            "Copied Environment summary".to_owned()
+        } else {
+            format!(
+                "{} \u{b7} v{}",
+                if self.state.connected() {
+                    "daemon connected"
+                } else {
+                    "daemon disconnected"
+                },
+                env!("CARGO_PKG_VERSION")
+            )
+        };
 
         Sidebar::new("daku-sidebar")
             .collapsible(SidebarCollapsible::None)
@@ -361,15 +422,77 @@ impl Daku {
         }
     }
 
+    /// Compare strip: build, drift and last-clone across Environments. A
+    /// row click selects that Environment and opens its drift drill-in via
+    /// the shared `SelectEnvironment` action.
+    fn compare_strip(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let strip = self.state.compare_strip();
+        if !strip.visible {
+            return None;
+        }
+        let rows = self.state.compare_rows();
+        Some(
+            v_flex()
+                .mx(px(22.0))
+                .mb(px(16.0))
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted)
+                .child(
+                    compare_row_cells(
+                        ["Environment", "Build", "Drift", "Last clone"].map(str::to_owned),
+                    )
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground),
+                )
+                .child(Separator::horizontal().color(cx.theme().border))
+                .children(rows.into_iter().map(|row| {
+                    let action = SelectEnvironment {
+                        env_id: SharedString::from(row.id.clone()),
+                        open_drift: true,
+                    };
+                    compare_row_cells([
+                        row.label.clone(),
+                        row.build.clone().unwrap_or_else(|| "\u{2014}".to_owned()),
+                        row.drift.clone(),
+                        row.last_clone.clone(),
+                    ])
+                    .text_sm()
+                    .text_color(if row.mismatch {
+                        cx.theme().warning
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .id(SharedString::from(format!("compare-{}", row.id)))
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(action.clone()), cx);
+                    })
+                }))
+                .when(strip.has_mismatch, |element| {
+                    element.child(
+                        div()
+                            .px(px(14.0))
+                            .pb(px(10.0))
+                            .text_xs()
+                            .text_color(cx.theme().warning)
+                            .child("build / drift mismatch"),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_detail(
         &self,
         cards: Vec<gpui::AnyElement>,
         drill_in: Option<gpui::AnyElement>,
         mute_controls: Option<gpui::AnyElement>,
+        compare: Option<gpui::AnyElement>,
         cx: &App,
     ) -> gpui::AnyElement {
         let selected = self.state.selected().cloned();
-        let strip = self.state.compare_strip();
         div()
             .id("detail")
             .flex_1()
@@ -459,15 +582,7 @@ impl Daku {
                             .children(cards),
                     )
                     .children(drill_in)
-                    // The rows are built only when the strip is on screen; a
-                    // hidden strip must not cost a pass over every Environment.
-                    .when(strip.visible, |element| {
-                        element.child(compare_strip(
-                            strip.has_mismatch,
-                            &self.state.compare_rows(),
-                            cx,
-                        ))
-                    })
+                    .children(compare)
             })
             .when(self.state.selected().is_none(), |element| {
                 let message = if self.state.connected() && !self.state.has_environments() {
@@ -857,46 +972,6 @@ fn health_color(health: EnvironmentHealth, cx: &App) -> gpui::Hsla {
 /// gpui-component's `Table` needs a delegate `Entity`, which `render_detail`
 /// (a `&App` render with no entity context) cannot build, so the strip is a
 /// bordered grid with a `Separator` under the header row.
-fn compare_strip(has_mismatch: bool, rows: &[CompareRow], cx: &App) -> impl IntoElement {
-    v_flex()
-        .mx(px(22.0))
-        .mb(px(16.0))
-        .rounded(cx.theme().radius)
-        .border_1()
-        .border_color(cx.theme().border)
-        .bg(cx.theme().muted)
-        .child(
-            compare_row_cells(["Environment", "Build", "Drift", "Last clone"].map(str::to_owned))
-                .text_xs()
-                .text_color(cx.theme().muted_foreground),
-        )
-        .child(Separator::horizontal().color(cx.theme().border))
-        .children(rows.iter().map(|row| {
-            compare_row_cells([
-                row.label.clone(),
-                row.build.clone().unwrap_or_else(|| "\u{2014}".to_owned()),
-                row.drift.clone(),
-                row.last_clone.clone(),
-            ])
-            .text_sm()
-            .text_color(if row.mismatch {
-                cx.theme().warning
-            } else {
-                cx.theme().muted_foreground
-            })
-        }))
-        .when(has_mismatch, |element| {
-            element.child(
-                div()
-                    .px(px(14.0))
-                    .pb(px(10.0))
-                    .text_xs()
-                    .text_color(cx.theme().warning)
-                    .child("build / drift mismatch"),
-            )
-        })
-}
-
 /// One drill-in table row. The first cell is a deep link when the row
 /// carries one (job rows link their ServiceNow records); opening it must not
 /// toggle the Drill-in, like the header link.

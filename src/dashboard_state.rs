@@ -342,6 +342,62 @@ impl DashboardState {
         self.selected_card
     }
 
+    /// Opens the Drill-in for a Signal without toggling: selecting an
+    /// Environment from the compare strip, a notification or the menu bar
+    /// always lands on the drift card, never closes it.
+    pub fn open_card(&mut self, signal_id: &str) {
+        if SIGNAL_IDS.contains(&signal_id) {
+            self.selected_card = SIGNAL_IDS.iter().find(|&&id| id == signal_id).copied();
+        }
+    }
+
+    /// Plain-text state block for ⌘⇧C: Environment, health, freshness, one
+    /// line per Signal, the build. Pasted into Slack or a ticket.
+    pub fn summary_text(&self, now: i64) -> String {
+        let Some(selected) = self.selected() else {
+            return "daku — no Environment selected".to_owned();
+        };
+        let health = match selected.health {
+            EnvironmentHealth::Healthy => "healthy",
+            EnvironmentHealth::Degraded => "degraded",
+            EnvironmentHealth::Down => "down",
+        };
+        let fresh = freshness(selected.last_observed_at, now);
+        let mut lines = vec![format!(
+            "{} ({}) — {}{}{}",
+            selected.id,
+            selected.label,
+            health,
+            if self.is_muted(&selected.id, now) {
+                " (muted)"
+            } else {
+                ""
+            },
+            format!(", {}", fresh.label),
+        )];
+        for signal_id in SIGNAL_IDS {
+            let status = self
+                .snapshots
+                .get(&selected.id)
+                .and_then(|map| map.get(signal_id))
+                .map(|snapshot| snapshot.dto.state.as_str())
+                .unwrap_or(WAITING);
+            let summary = self.card_summary(signal_id);
+            let detail = self.card_detail(signal_id);
+            let body = if !summary.is_empty() { summary } else { detail };
+            lines.push(if body.is_empty() {
+                format!("{}: {status}", signal_label(signal_id))
+            } else {
+                format!("{}: {status} — {body}", signal_label(signal_id))
+            });
+        }
+        lines.push(format!(
+            "Build: {}",
+            environment_build(&self.snapshots, &selected.id).unwrap_or_else(|| "—".to_owned())
+        ));
+        lines.join("\n")
+    }
+
     /// Deep link into the ServiceNow list the Signal is measured from, mirroring
     /// the collectors' encoded queries. `None` without a selected Environment.
     pub fn signal_url(&self, signal_id: &str) -> Option<String> {
@@ -1454,6 +1510,52 @@ mod tests {
         state.select_card("drift");
         state.select("test");
         assert_eq!(state.selected_card(), Some("drift"));
+    }
+
+    #[test]
+    fn open_card_sets_without_toggling() {
+        let mut state = loaded();
+        state.open_card("drift");
+        assert_eq!(state.selected_card(), Some("drift"));
+        // Compare-strip clicks must land, never close.
+        state.open_card("drift");
+        assert_eq!(state.selected_card(), Some("drift"));
+        state.open_card("nonsense");
+        assert_eq!(state.selected_card(), Some("drift"));
+    }
+
+    #[test]
+    fn summary_text_copies_state_as_plain_text() {
+        let state = loaded();
+        let text = state.summary_text(1_700_000_012);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "prod (Production) — degraded, polled 12 s ago");
+        assert!(
+            lines.iter().any(|line| line.starts_with("Availability: ")),
+            "{text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Scheduled jobs: degraded")),
+            "{text}"
+        );
+        assert!(lines.last().unwrap().starts_with("Build: "), "{text}");
+        assert_eq!(lines.len(), 9, "{text}");
+    }
+
+    #[test]
+    fn summary_text_marks_muted_environments() {
+        let mut state = loaded();
+        state.set_mute("prod", TEST_NOW + 3600);
+        assert!(
+            state
+                .summary_text(TEST_NOW)
+                .lines()
+                .next()
+                .unwrap()
+                .contains("(muted)"),
+        );
     }
 
     #[test]

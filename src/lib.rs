@@ -9,7 +9,7 @@ mod updater;
 pub use daku_client::{identity, persistence};
 
 use gpui::{
-    App, AppContext as _, Application, Bounds, KeyBinding, Menu, MenuItem,
+    App, AppContext as _, Application, Bounds, KeyBinding, Menu, MenuItem, SharedString,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, px, size,
 };
 
@@ -18,8 +18,34 @@ use crate::identity::{APP_ID, APP_NAME};
 
 actions!(
     daku,
-    [Quit, About, CloseWindow, CheckForUpdates, ReloadDaemon]
+    [
+        Quit,
+        About,
+        CloseWindow,
+        CheckForUpdates,
+        ReloadDaemon,
+        CopySummary
+    ]
 );
+
+/// Selects an Environment and optionally opens its drift drill-in. The one
+/// "take me there" primitive: compare-row clicks dispatch it, and the
+/// health-notification (079) and menu-bar (081) clicks will too.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, gpui::Action)]
+#[action(namespace = daku, no_json)]
+pub struct SelectEnvironment {
+    pub env_id: SharedString,
+    pub open_drift: bool,
+}
+
+/// Keyboard slot for ⌘1–9 in sidebar order. Slots are positional because
+/// keybindings are static while the Environment list is not; the handler
+/// resolves the slot against the current sidebar order.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, gpui::Action)]
+#[action(namespace = daku, no_json)]
+pub struct SelectEnvironmentSlot {
+    pub slot: usize,
+}
 
 const DEFAULT_WINDOW_WIDTH: f32 = 1380.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 880.0;
@@ -79,6 +105,16 @@ pub fn run() {
                 KeyBinding::new("secondary-q", Quit, None),
                 KeyBinding::new("secondary-w", CloseWindow, None),
                 KeyBinding::new("secondary-r", ReloadDaemon, None),
+                KeyBinding::new("secondary-shift-c", CopySummary, None),
+                KeyBinding::new("secondary-1", SelectEnvironmentSlot { slot: 0 }, None),
+                KeyBinding::new("secondary-2", SelectEnvironmentSlot { slot: 1 }, None),
+                KeyBinding::new("secondary-3", SelectEnvironmentSlot { slot: 2 }, None),
+                KeyBinding::new("secondary-4", SelectEnvironmentSlot { slot: 3 }, None),
+                KeyBinding::new("secondary-5", SelectEnvironmentSlot { slot: 4 }, None),
+                KeyBinding::new("secondary-6", SelectEnvironmentSlot { slot: 5 }, None),
+                KeyBinding::new("secondary-7", SelectEnvironmentSlot { slot: 6 }, None),
+                KeyBinding::new("secondary-8", SelectEnvironmentSlot { slot: 7 }, None),
+                KeyBinding::new("secondary-9", SelectEnvironmentSlot { slot: 8 }, None),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
 
@@ -142,6 +178,7 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
                 if updater_available {
                     items.push(MenuItem::action("Check for Updates…", CheckForUpdates));
                 }
+                items.push(MenuItem::action("Copy Environment Summary", CopySummary));
                 items.push(MenuItem::separator());
                 items.push(MenuItem::action(format!("Quit {APP_NAME}"), Quit));
                 items
