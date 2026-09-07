@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use daku_protocol::{
-    EnvironmentHealth, EnvironmentSummary, HealthEventDto, Reachability, SamplePoint,
-    ServerMessage, SignalSnapshotDto, is_supported_instance_url,
+    EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, Reachability,
+    SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
 };
 
 pub const SIGNAL_IDS: [&str; 7] = [
@@ -205,6 +205,37 @@ impl DashboardState {
 
     pub fn muted_until(&self, id: &str) -> Option<i64> {
         self.mutes.get(id).copied()
+    }
+
+    /// Last `limit` health/build events for the selected Environment, oldest
+    /// first. Empty when the daemon never published any (pre-072 data or a
+    /// fresh Environment) — the shell omits the Recent block then.
+    pub fn recent_events(&self, limit: usize) -> Vec<HealthEventDto> {
+        let Some(id) = self.selected_id.as_deref() else {
+            return Vec::new();
+        };
+        let Some(events) = self.health_events.get(id) else {
+            return Vec::new();
+        };
+        events.iter().rev().take(limit).rev().cloned().collect()
+    }
+
+    /// The selected Environment's current build plus when daku first saw this
+    /// build string (latest matching build event). `None` without a known
+    /// build or without events yet — the header omits the line then.
+    pub fn build_age(&self) -> Option<(String, i64)> {
+        let id = self.selected_id.as_deref()?;
+        let build = environment_build(&self.snapshots, id)?;
+        let since = self
+            .health_events
+            .get(id)?
+            .iter()
+            .filter(|event| {
+                event.kind == HealthEventKind::Build && event.build.as_deref() == Some(&build)
+            })
+            .map(|event| event.observed_at)
+            .max()?;
+        Some((build, since))
     }
 
     pub fn set_mute(&mut self, id: &str, until: i64) {
@@ -962,6 +993,47 @@ impl DashboardState {
     }
 }
 
+/// Compact age without a prefix: "40 s", "45 min", "3 h", "12 d".
+/// Recent timelines and build age share it; `freshness` keeps its own
+/// "polled … ago" phrasing untouched.
+pub fn age_phrase(age_secs: i64) -> String {
+    let age = age_secs.max(0);
+    if age < 60 {
+        format!("{age} s")
+    } else if age < 3600 {
+        format!("{} min", age / 60)
+    } else if age < 86_400 {
+        format!("{} h", age / 3600)
+    } else {
+        format!("{} d", age / 86_400)
+    }
+}
+
+/// One Recent-timeline line for a health/build event: "healthy → degraded,
+/// 12 min ago" / "build glide-…, 3 d ago". Pure and unit-tested; the shell
+/// only places the lines.
+pub fn format_health_event(event: &HealthEventDto, now: i64) -> String {
+    let ago = age_phrase(now.saturating_sub(event.observed_at));
+    match event.kind {
+        HealthEventKind::Health => {
+            let from = event.from_health.map(health_word).unwrap_or("?");
+            format!("{from} → {}, {ago} ago", health_word(event.to_health))
+        }
+        HealthEventKind::Build => {
+            let build = event.build.as_deref().unwrap_or("?");
+            format!("build {build}, {ago} ago")
+        }
+    }
+}
+
+fn health_word(health: EnvironmentHealth) -> &'static str {
+    match health {
+        EnvironmentHealth::Healthy => "healthy",
+        EnvironmentHealth::Degraded => "degraded",
+        EnvironmentHealth::Down => "down",
+    }
+}
+
 /// "Muted 45m left" / "Muted 3h left" for the Environment header. Pure so
 /// the shell never formats clocks itself.
 pub fn mute_remaining_label(until: i64, now: i64) -> String {
@@ -1280,6 +1352,25 @@ pub fn fixture_events() -> Vec<ServerMessage> {
             ]
             .map(pinned)
             .into(),
+        },
+        ServerMessage::HealthEventsUpdated {
+            environment_id: "prod".into(),
+            events: vec![
+                HealthEventDto {
+                    observed_at: 1_699_913_600,
+                    kind: HealthEventKind::Build,
+                    from_health: None,
+                    to_health: EnvironmentHealth::Degraded,
+                    build: Some("glide-zurich-12-18-2025__patch0-hotfix1".into()),
+                },
+                HealthEventDto {
+                    observed_at: 1_699_996_400,
+                    kind: HealthEventKind::Health,
+                    from_health: Some(EnvironmentHealth::Healthy),
+                    to_health: EnvironmentHealth::Degraded,
+                    build: None,
+                },
+            ],
         },
         ServerMessage::SignalSamplesUpdated {
             environment_id: "prod".into(),
@@ -2248,6 +2339,51 @@ mod tests {
             mute_remaining_label(1_700_000_000, 1_700_000_000),
             "Muted 1m left"
         );
+    }
+
+    #[test]
+    fn age_phrase_tiers_match_freshness_words() {
+        assert_eq!(age_phrase(12), "12 s");
+        assert_eq!(age_phrase(600), "10 min");
+        assert_eq!(age_phrase(7200), "2 h");
+        assert_eq!(age_phrase(3 * 86_400), "3 d");
+    }
+
+    #[test]
+    fn recent_events_returns_last_n_oldest_first() {
+        let state = loaded();
+        // Fixture prod carries bootstrap build + one health transition.
+        let events = state.recent_events(10);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, HealthEventKind::Build);
+        assert_eq!(events[1].kind, HealthEventKind::Health);
+        assert_eq!(state.recent_events(1).len(), 1);
+        assert_eq!(
+            state.recent_events(1)[0].kind,
+            HealthEventKind::Health,
+            "limit keeps the newest"
+        );
+        assert_eq!(
+            format_health_event(&events[1], 1_700_000_000),
+            "healthy → degraded, 1 h ago"
+        );
+        assert!(format_health_event(&events[0], 1_700_000_000).starts_with("build glide-"));
+        // Test carries no events.
+        let mut test = loaded();
+        test.select("test");
+        assert!(test.recent_events(10).is_empty());
+    }
+
+    #[test]
+    fn build_age_uses_latest_matching_build_event() {
+        let state = loaded();
+        let (build, since) = state.build_age().expect("prod build age");
+        assert_eq!(build, "glide-zurich-12-18-2025__patch0-hotfix1");
+        assert_eq!(since, 1_699_913_600);
+        let mut test = loaded();
+        test.select("test");
+        assert!(test.build_age().is_none(), "test carries no build events");
+        assert!(DashboardState::new().build_age().is_none());
     }
 
     #[test]

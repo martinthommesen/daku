@@ -26,8 +26,8 @@ use crate::ReloadDaemon;
 use crate::SelectEnvironment;
 use crate::SelectEnvironmentSlot;
 use crate::dashboard_state::{
-    DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, fixture_events, freshness,
-    mute_remaining_label, signal_label, ui_fixture_enabled,
+    DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, age_phrase, fixture_events,
+    format_health_event, freshness, mute_remaining_label, signal_label, ui_fixture_enabled,
 };
 use crate::persistence::{AppSettings, save_app_settings};
 
@@ -484,6 +484,40 @@ impl Daku {
         )
     }
 
+    /// Recent health/build transitions under the Signal cards. Omitted
+    /// entirely without events — a fresh Environment shows no empty box.
+    fn recent_block(&self, cx: &App) -> Option<gpui::AnyElement> {
+        let now = unix_now();
+        let lines: Vec<String> = self
+            .state
+            .recent_events(5)
+            .iter()
+            .map(|event| format_health_event(event, now))
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .mx(px(22.0))
+                .mb(px(16.0))
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Recent"),
+                )
+                .children(lines.into_iter().map(|line| {
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(line)
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_detail(
         &self,
         cards: Vec<gpui::AnyElement>,
@@ -570,7 +604,18 @@ impl Daku {
                                             .trim_start_matches("https://")
                                             .to_owned(),
                                     ),
-                            ),
+                            )
+                            .when_some(self.state.build_age(), |element, (_, since)| {
+                                element.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!(
+                                            "on this build {} ago",
+                                            age_phrase(unix_now().saturating_sub(since))
+                                        )),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -581,6 +626,7 @@ impl Daku {
                             .p(px(22.0))
                             .children(cards),
                     )
+                    .children(self.recent_block(cx))
                     .children(drill_in)
                     .children(compare)
             })
