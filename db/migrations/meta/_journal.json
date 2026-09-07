@@ -15,6 +15,13 @@
       "when": 1788771633576,
       "tag": "0001_petite_morbius",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1788773890851,
+      "tag": "0002_lazy_vampiro",
+      "breakpoints": true
     }
   ]
 }

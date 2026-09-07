@@ -26,8 +26,9 @@ use crate::ReloadDaemon;
 use crate::SelectEnvironment;
 use crate::SelectEnvironmentSlot;
 use crate::dashboard_state::{
-    DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, age_phrase, fixture_events,
-    format_health_event, freshness, mute_remaining_label, signal_label, ui_fixture_enabled,
+    DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase,
+    fixture_events, format_health_event, freshness, is_trend_signal, mute_remaining_label,
+    signal_label, ui_fixture_enabled,
 };
 use crate::persistence::{AppSettings, save_app_settings};
 
@@ -790,9 +791,53 @@ impl Daku {
     }
 
     /// The Drill-in: a bounded region under the cards showing the rows, trend
+    /// 24 h / 7 d / 30 d switch for trend Signals. The 24 h view reads raw
+    /// samples; 7 d / 30 d read hourly roll-ups. Other Signals get no switch.
+    fn trend_switch(
+        &self,
+        signal_id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        // Windowed rows are not trends: the switch only shows while a trend
+        // draws, so it never sits inert above row lists or text.
+        if !is_trend_signal(signal_id)
+            || !matches!(
+                self.state.drill_in(signal_id, unix_now()),
+                DrillIn::Trend(_)
+            )
+        {
+            return None;
+        }
+        let active = self.state.trend_window();
+        Some(
+            h_flex()
+                .items_center()
+                .gap(px(8.0))
+                .children(TrendWindow::ALL.into_iter().map(|(window, label)| {
+                    let selected = window == active;
+                    div()
+                        .id(SharedString::from(format!("trend-{label}")))
+                        .text_xs()
+                        .cursor_pointer()
+                        .text_color(if selected {
+                            cx.theme().foreground
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .hover(|style| style.text_decoration_1())
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.state.set_trend_window(window);
+                            cx.notify();
+                        }))
+                        .child(label)
+                }))
+                .into_any_element(),
+        )
+    }
+
     /// or text the selected Signal's snapshot already carries.
     fn drill_in_region(&self, signal_id: &'static str, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let content = self.state.drill_in(signal_id);
+        let content = self.state.drill_in(signal_id, unix_now());
         let url = self.state.signal_url(signal_id);
         let status = self
             .state
@@ -837,6 +882,7 @@ impl Daku {
                             .text_xs(),
                         )
                     })
+                    .children(self.trend_switch(signal_id, cx))
                     .child(div().flex_1())
                     .child(
                         div()

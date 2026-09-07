@@ -89,6 +89,34 @@ export const healthEvents = sqliteTable(
 );
 
 /**
+ * Hourly aggregates over raw samples for 30-day trends (v1.1, ADR-0009).
+ * One idempotent recompute of the current hour per publish; the 24 h raw
+ * ring stays untouched. `avg_real` draws the line, `max_real` the ticks.
+ */
+export const signalRollupsHourly = sqliteTable(
+  "signal_rollups_hourly",
+  {
+    environmentId: text("environment_id").notNull(),
+    signalId: text("signal_id").notNull(),
+    /** Hour bucket start, unix seconds. */
+    hourStart: integer("hour_start").notNull(),
+    avgReal: real("avg_real"),
+    maxReal: real("max_real"),
+    sampleCount: integer("sample_count").notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.environmentId, table.signalId, table.hourStart],
+    }),
+    index("signal_rollups_by_env_signal_hour").on(
+      table.environmentId,
+      table.signalId,
+      table.hourStart,
+    ),
+  ],
+);
+
+/**
  * Last-published rollup per Environment so `publish_dashboard` can fire a
  * health event only after two consecutive publishes agree (flap suppression)
  * without keeping in-memory daemon state. One row per Environment, bounded.

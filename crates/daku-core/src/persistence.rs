@@ -366,6 +366,90 @@ pub fn load_signal_samples(
 
 pub const SAMPLE_RETENTION_SECS: i64 = 24 * 60 * 60;
 
+/// Hourly roll-up retention: 30 days of hour buckets per Environment × Signal.
+pub const ROLLUP_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+pub const ROLLUP_BUCKET_SECS: i64 = 60 * 60;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalRollup {
+    pub environment_id: String,
+    pub signal_id: String,
+    pub hour_start: i64,
+    pub avg_real: Option<f64>,
+    pub max_real: Option<f64>,
+    pub sample_count: i64,
+}
+
+/// Recomputes one hour bucket from the raw samples. Idempotent: re-publishing
+/// the same tick replaces the row, so restarts never duplicate history.
+/// Hours without samples leave no row.
+pub fn record_hour_rollup(
+    connection: &Connection,
+    environment_id: &str,
+    signal_id: &str,
+    hour_start: i64,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "INSERT INTO signal_rollups_hourly (
+                environment_id, signal_id, hour_start, avg_real, max_real, sample_count
+             ) SELECT ?1, ?2, ?3, AVG(value_real), MAX(value_real), COUNT(*)
+               FROM signal_samples
+               WHERE environment_id = ?1 AND signal_id = ?2
+                 AND value_real IS NOT NULL
+                 AND observed_at >= ?3 AND observed_at < ?3 + 3600
+               HAVING COUNT(*) > 0
+             ON CONFLICT(environment_id, signal_id, hour_start) DO UPDATE SET
+                avg_real = excluded.avg_real,
+                max_real = excluded.max_real,
+                sample_count = excluded.sample_count",
+            params![environment_id, signal_id, hour_start],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+pub fn load_signal_rollups(
+    connection: &Connection,
+    environment_id: &str,
+    signal_id: &str,
+    since: i64,
+) -> io::Result<Vec<SignalRollup>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT environment_id, signal_id, hour_start, avg_real, max_real, sample_count
+             FROM signal_rollups_hourly
+             WHERE environment_id = ?1 AND signal_id = ?2 AND hour_start >= ?3
+             ORDER BY hour_start ASC",
+        )
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![environment_id, signal_id, since])
+        .map_err(to_io_error)?;
+    let mut rollups = Vec::new();
+    while let Some(row) = rows.next().map_err(to_io_error)? {
+        rollups.push(SignalRollup {
+            environment_id: row.get(0).map_err(to_io_error)?,
+            signal_id: row.get(1).map_err(to_io_error)?,
+            hour_start: row.get(2).map_err(to_io_error)?,
+            avg_real: row.get(3).map_err(to_io_error)?,
+            max_real: row.get(4).map_err(to_io_error)?,
+            sample_count: row.get(5).map_err(to_io_error)?,
+        });
+    }
+    Ok(rollups)
+}
+
+pub fn prune_signal_rollups(connection: &Connection, now: i64) -> io::Result<usize> {
+    let cutoff = now.saturating_sub(ROLLUP_RETENTION_SECS);
+    connection
+        .execute(
+            "DELETE FROM signal_rollups_hourly WHERE hour_start < ?1",
+            params![cutoff],
+        )
+        .map_err(to_io_error)
+}
+
 /// Health-event log bounds: 90 days and 500 events per Environment, enforced
 /// on every publish. Attention history, not an audit trail.
 pub const HEALTH_EVENTS_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
@@ -729,6 +813,42 @@ mod tests {
         assert_eq!(
             load_health_events(&connection, "prod", 100).unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn hour_rollup_recompute_is_idempotent_and_prunes() {
+        let db = TempDb::new("rollups");
+        let connection = db.store().open().unwrap();
+        assert!(table_exists(&connection, "signal_rollups_hourly"));
+        let hour = 1_700_000_000 - 1_700_000_000 % 3600;
+        for (at, value) in [(hour + 10, 1.0), (hour + 20, 3.0)] {
+            persist_signal_sample(&connection, "prod", "jobs", at, Some(value), None).unwrap();
+        }
+        record_hour_rollup(&connection, "prod", "jobs", hour).unwrap();
+        record_hour_rollup(&connection, "prod", "jobs", hour).unwrap();
+        let rollups = load_signal_rollups(&connection, "prod", "jobs", 0).unwrap();
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0].avg_real, Some(2.0));
+        assert_eq!(rollups[0].max_real, Some(3.0));
+        assert_eq!(rollups[0].sample_count, 2);
+        // Empty hours leave no row.
+        record_hour_rollup(&connection, "prod", "jobs", hour + 3600).unwrap();
+        assert_eq!(
+            load_signal_rollups(&connection, "prod", "jobs", 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Retention drops old buckets.
+        assert_eq!(
+            prune_signal_rollups(&connection, hour + ROLLUP_RETENTION_SECS + 1).unwrap(),
+            1
+        );
+        assert!(
+            load_signal_rollups(&connection, "prod", "jobs", 0)
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use daku_protocol::{
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, Reachability,
-    SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
+    RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
 };
 
 pub const SIGNAL_IDS: [&str; 7] = [
@@ -18,6 +18,11 @@ pub const SIGNAL_IDS: [&str; 7] = [
 ];
 
 pub const WAITING: &str = "Waiting";
+
+/// True for the Signals with trends (raw 24 h samples + hourly roll-ups).
+pub fn is_trend_signal(signal_id: &str) -> bool {
+    TREND_SIGNALS.contains(&signal_id)
+}
 
 pub fn signal_label(signal_id: &str) -> &'static str {
     match signal_id {
@@ -123,6 +128,37 @@ pub struct DashboardState {
     /// Operator mutes: Environment id → unix seconds the attention surfaces
     /// stay silent. Mirrors `AppSettings::mutes`; the daemon keeps collecting.
     mutes: HashMap<String, i64>,
+    /// Hourly roll-ups per (Environment, Signal), published by the daemon
+    /// (`104`). The 24 h raw samples in `samples` are untouched.
+    rollups: HashMap<(String, String), Vec<RollupPoint>>,
+    trend_window: TrendWindow,
+}
+
+/// Trend range for the drill-in sparklines. 24 h reads the raw samples the
+/// daemon keeps; 7 d / 30 d read the hourly roll-ups.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrendWindow {
+    #[default]
+    Day24,
+    Day7,
+    Day30,
+}
+
+impl TrendWindow {
+    pub const ALL: [(TrendWindow, &'static str); 3] = [
+        (TrendWindow::Day24, "24h"),
+        (TrendWindow::Day7, "7d"),
+        (TrendWindow::Day30, "30d"),
+    ];
+
+    /// Rollup cutoff in unix seconds: points at or after this render.
+    pub fn cutoff_secs(self, now: i64) -> i64 {
+        match self {
+            TrendWindow::Day24 => now.saturating_sub(24 * 3600),
+            TrendWindow::Day7 => now.saturating_sub(7 * 86_400),
+            TrendWindow::Day30 => now.saturating_sub(30 * 86_400),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,6 +329,8 @@ impl DashboardState {
                     .retain(|(id, _), _| known.contains(id.as_str()));
                 self.health_events
                     .retain(|id, _| known.contains(id.as_str()));
+                self.rollups
+                    .retain(|(id, _), _| known.contains(id.as_str()));
             }
             ServerMessage::SignalSnapshotsUpdated {
                 environment_id,
@@ -330,6 +368,14 @@ impl DashboardState {
             } => {
                 self.health_events
                     .insert(environment_id.clone(), events.clone());
+            }
+            ServerMessage::SignalRollupsUpdated {
+                environment_id,
+                signal_id,
+                points,
+            } => {
+                self.rollups
+                    .insert((environment_id.clone(), signal_id.clone()), points.clone());
             }
             _ => {}
         }
@@ -371,6 +417,14 @@ impl DashboardState {
 
     pub fn selected_card(&self) -> Option<&'static str> {
         self.selected_card
+    }
+
+    pub fn trend_window(&self) -> TrendWindow {
+        self.trend_window
+    }
+
+    pub fn set_trend_window(&mut self, window: TrendWindow) {
+        self.trend_window = window;
     }
 
     /// Opens the Drill-in for a Signal without toggling: selecting an
@@ -459,7 +513,7 @@ impl DashboardState {
         Some(format!("{base}{}", encode_query(path)))
     }
 
-    pub fn drill_in(&self, signal_id: &str) -> DrillIn {
+    pub fn drill_in(&self, signal_id: &str, now: i64) -> DrillIn {
         let missing = serde_json::Value::Null;
         let value = self
             .selected_id
@@ -550,38 +604,58 @@ impl DashboardState {
                 if let Some(rows) = self.job_rows(value) {
                     rows
                 } else {
-                    self.drill_in_trend(signal_id)
+                    self.drill_in_trend(signal_id, now)
                 }
             }
             "syslog" => {
                 if let Some(rows) = self.syslog_rows(value) {
                     rows
                 } else {
-                    self.drill_in_trend(signal_id)
+                    self.drill_in_trend(signal_id, now)
                 }
             }
             "outbound" => self
                 .outbound_rows(value)
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
-            "availability" => self.drill_in_trend(signal_id),
+            "availability" => self.drill_in_trend(signal_id, now),
             _ => self.drill_in_text(signal_id),
         }
     }
 
-    fn drill_in_trend(&self, signal_id: &str) -> DrillIn {
-        let points: Vec<f64> = self
-            .samples
-            .get(&(
-                self.selected_id.clone().unwrap_or_default(),
-                signal_id.to_owned(),
-            ))
-            .map(|points| {
-                points
-                    .iter()
-                    .map(|point| point.value_real.unwrap_or(0.0))
-                    .collect()
-            })
-            .unwrap_or_default();
+    fn drill_in_trend(&self, signal_id: &str, now: i64) -> DrillIn {
+        // 24 h renders the raw samples; 7 d / 30 d render hourly roll-up
+        // averages filtered to the window. Either needs two points to draw.
+        let points: Vec<f64> = match self.trend_window {
+            TrendWindow::Day24 => self
+                .samples
+                .get(&(
+                    self.selected_id.clone().unwrap_or_default(),
+                    signal_id.to_owned(),
+                ))
+                .map(|points| {
+                    points
+                        .iter()
+                        .map(|point| point.value_real.unwrap_or(0.0))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            window @ (TrendWindow::Day7 | TrendWindow::Day30) => {
+                let cutoff = window.cutoff_secs(now);
+                self.rollups
+                    .get(&(
+                        self.selected_id.clone().unwrap_or_default(),
+                        signal_id.to_owned(),
+                    ))
+                    .map(|points| {
+                        points
+                            .iter()
+                            .filter(|point| point.hour_start >= cutoff)
+                            .map(|point| point.avg_real.unwrap_or(0.0))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+        };
         if points.len() < 2 {
             self.drill_in_text(signal_id)
         } else {
@@ -1390,6 +1464,17 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 },
             ],
         },
+        ServerMessage::SignalRollupsUpdated {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            // Real-now-relative hours so every window renders in fixture
+            // mode; the 24 h view reads the raw samples above instead.
+            points: vec![
+                fixture_rollup(200, 8.0),
+                fixture_rollup(26, 5.0),
+                fixture_rollup(1, 2.0),
+            ],
+        },
         ServerMessage::SignalSamplesUpdated {
             environment_id: "prod".into(),
             signal_id: "syslog".into(),
@@ -1420,6 +1505,22 @@ pub fn fixture_events() -> Vec<ServerMessage> {
             ],
         },
     ]
+}
+
+/// One rollup point `hours_ago` hours before the current hour, so the
+/// 7 d / 30 d drill-in windows have something to draw in fixture mode.
+fn fixture_rollup(hours_ago: i64, avg: f64) -> RollupPoint {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(1_700_000_000);
+    let hour = now - now % 3600 - hours_ago * 3600;
+    RollupPoint {
+        hour_start: hour,
+        avg_real: Some(avg),
+        max_real: Some(avg + 1.0),
+        sample_count: 30,
+    }
 }
 
 fn env(
@@ -1758,7 +1859,7 @@ mod tests {
             headers,
             rows,
             truncated,
-        } = state.drill_in("drift")
+        } = state.drill_in("drift", TEST_NOW)
         else {
             panic!("drift drill-in must be rows");
         };
@@ -1777,7 +1878,7 @@ mod tests {
         // The clone source has no mismatch list.
         state.select("prod");
         assert_eq!(
-            state.drill_in("drift"),
+            state.drill_in("drift", TEST_NOW),
             DrillIn::Text("source of truth · glide-zurich-12-18-2025__patch0-hotfix1".into())
         );
     }
@@ -1787,7 +1888,7 @@ mod tests {
         let mut state = loaded();
         state.select("test");
         assert_eq!(
-            state.drill_in("mid_ecc"),
+            state.drill_in("mid_ecc", TEST_NOW),
             DrillIn::Rows {
                 headers: vec!["MID", "Status", "Version"],
                 rows: vec![
@@ -1809,7 +1910,7 @@ mod tests {
     fn drill_in_falls_back_to_text_when_every_mid_is_healthy() {
         let state = loaded();
         assert_eq!(
-            state.drill_in("mid_ecc"),
+            state.drill_in("mid_ecc", TEST_NOW),
             DrillIn::Text("3/3 MID up \u{b7} queue 2".into())
         );
     }
@@ -1819,7 +1920,7 @@ mod tests {
         let mut state = loaded();
         // prod jobs has both rows and samples: rows win (actionable, unhealthy-only).
         assert_eq!(
-            state.drill_in("jobs"),
+            state.drill_in("jobs", TEST_NOW),
             DrillIn::Rows {
                 headers: vec!["Job", "Detail"],
                 rows: vec![DrillInRow {
@@ -1834,7 +1935,7 @@ mod tests {
         );
         // prod syslog likewise carries one fetched row.
         assert_eq!(
-            state.drill_in("syslog"),
+            state.drill_in("syslog", TEST_NOW),
             DrillIn::Rows {
                 headers: vec!["Time", "Source", "Message"],
                 rows: vec![DrillInRow {
@@ -1849,9 +1950,12 @@ mod tests {
             }
         );
         state.select("test");
-        assert_eq!(state.drill_in("outbound"), DrillIn::Text("HTTP 429".into()));
         assert_eq!(
-            state.drill_in("last_clone"),
+            state.drill_in("outbound", TEST_NOW),
+            DrillIn::Text("HTTP 429".into())
+        );
+        assert_eq!(
+            state.drill_in("last_clone", TEST_NOW),
             DrillIn::Rows {
                 headers: vec!["Completed", "Age", "Source"],
                 rows: vec![DrillInRow {
@@ -1867,7 +1971,7 @@ mod tests {
         );
         // prod has no last_clone snapshot at all.
         state.select("prod");
-        assert_eq!(state.drill_in("last_clone"), DrillIn::Empty);
+        assert_eq!(state.drill_in("last_clone", TEST_NOW), DrillIn::Empty);
     }
 
     #[test]
@@ -2387,6 +2491,119 @@ mod tests {
     }
 
     #[test]
+    fn trend_window_cutoffs_span_day_week_month() {
+        let now = 1_700_000_000;
+        assert_eq!(TrendWindow::Day24.cutoff_secs(now), now - 86_400);
+        assert_eq!(TrendWindow::Day7.cutoff_secs(now), now - 7 * 86_400);
+        assert_eq!(TrendWindow::Day30.cutoff_secs(now), now - 30 * 86_400);
+        assert_eq!(
+            TrendWindow::ALL.map(|(_, label)| label),
+            ["24h", "7d", "30d"]
+        );
+    }
+
+    /// Signal with samples + rollups but no rows, so the window alone
+    /// decides what the trend draws.
+    fn trendable() -> DashboardState {
+        let mut state = DashboardState::new();
+        state.set_connected(true);
+        state.apply_all(&[
+            ServerMessage::EnvironmentsUpdated {
+                environments: vec![env(
+                    "e",
+                    "E",
+                    EnvironmentHealth::Healthy,
+                    Reachability::Reachable,
+                )],
+            },
+            ServerMessage::SignalSnapshotsUpdated {
+                environment_id: "e".into(),
+                snapshots: vec![snap("jobs", "healthy", r#"{"overdue_ready":0,"error":0,"overdue_rows":[],"overdue_rows_truncated":false,"error_rows":[],"error_rows_truncated":false}"#)],
+            },
+            ServerMessage::SignalSamplesUpdated {
+                environment_id: "e".into(),
+                signal_id: "jobs".into(),
+                points: vec![
+                    SamplePoint {
+                        observed_at: 10,
+                        value_real: Some(1.0),
+                    },
+                    SamplePoint {
+                        observed_at: 20,
+                        value_real: Some(2.0),
+                    },
+                ],
+            },
+            ServerMessage::SignalRollupsUpdated {
+                environment_id: "e".into(),
+                signal_id: "jobs".into(),
+                points: vec![
+                    RollupPoint {
+                        hour_start: 1_700_000_000 - 8 * 86_400,
+                        avg_real: Some(8.0),
+                        max_real: Some(9.0),
+                        sample_count: 30,
+                    },
+                    RollupPoint {
+                        hour_start: 1_700_000_000 - 2 * 86_400,
+                        avg_real: Some(5.0),
+                        max_real: Some(6.0),
+                        sample_count: 30,
+                    },
+                    RollupPoint {
+                        hour_start: 1_700_000_000 - 3600,
+                        avg_real: Some(2.0),
+                        max_real: Some(3.0),
+                        sample_count: 30,
+                    },
+                ],
+            },
+        ]);
+        state.select("e");
+        state
+    }
+
+    #[test]
+    fn trend_window_switches_between_samples_and_rollups() {
+        let mut state = trendable();
+        let now = 1_700_000_000;
+        assert_eq!(state.trend_window(), TrendWindow::Day24);
+        assert_eq!(state.drill_in("jobs", now), DrillIn::Trend(vec![1.0, 2.0]));
+        state.set_trend_window(TrendWindow::Day7);
+        assert_eq!(state.drill_in("jobs", now), DrillIn::Trend(vec![5.0, 2.0]));
+        state.set_trend_window(TrendWindow::Day30);
+        assert_eq!(
+            state.drill_in("jobs", now),
+            DrillIn::Trend(vec![8.0, 5.0, 2.0])
+        );
+        // One in-window point is no trend: fall back to text.
+        state.set_trend_window(TrendWindow::Day7);
+        state.apply(&ServerMessage::SignalRollupsUpdated {
+            environment_id: "e".into(),
+            signal_id: "jobs".into(),
+            points: vec![RollupPoint {
+                hour_start: now - 3600,
+                avg_real: Some(2.0),
+                max_real: Some(3.0),
+                sample_count: 30,
+            }],
+        });
+        assert_eq!(
+            state.drill_in("jobs", now),
+            DrillIn::Text("0 overdue · 0 in error".into())
+        );
+    }
+
+    #[test]
+    fn rollups_are_dropped_with_their_environment() {
+        let mut state = trendable();
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![],
+        });
+        assert!(state.rollups.is_empty());
+    }
+
+    #[test]
     fn apply_mutes_prunes_expired_deadlines() {
         let mut state = loaded();
         let mut mutes = HashMap::new();
@@ -2655,7 +2872,7 @@ mod tests {
         });
         assert_eq!(state.card_summary("jobs"), "");
         assert_eq!(state.card_detail("jobs"), "");
-        assert_eq!(state.drill_in("jobs"), DrillIn::Empty);
+        assert_eq!(state.drill_in("jobs", TEST_NOW), DrillIn::Empty);
         assert_eq!(state.drift_mismatch_lines(5), Vec::<String>::new());
         assert!(!state.compare_strip().has_mismatch);
     }
@@ -2670,7 +2887,10 @@ mod tests {
         let before = state.snapshots.clone();
         assert_eq!(state.card_summary("availability"), "142 ms");
         assert_eq!(state.card_summary("availability"), "142 ms");
-        assert_eq!(state.drill_in("drift"), state.drill_in("drift"));
+        assert_eq!(
+            state.drill_in("drift", TEST_NOW),
+            state.drill_in("drift", TEST_NOW)
+        );
         assert_eq!(state.snapshots, before);
     }
 

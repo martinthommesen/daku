@@ -206,7 +206,8 @@ fn run_client(
                     ServerMessage::EnvironmentsUpdated { .. }
                     | ServerMessage::SignalSnapshotsUpdated { .. }
                     | ServerMessage::SignalSamplesUpdated { .. }
-                    | ServerMessage::HealthEventsUpdated { .. } => {
+                    | ServerMessage::HealthEventsUpdated { .. }
+                    | ServerMessage::SignalRollupsUpdated { .. } => {
                         if let Some(key) = message.dashboard_cache_key() {
                             inner.dashboard_cache.lock().insert(key, message.clone());
                         }

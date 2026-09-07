@@ -11,8 +11,8 @@ mod protocol;
 pub use protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, MAX_WIRE_MESSAGE_BYTES,
-    PROTOCOL_VERSION, Reachability, Request, ResponseOutcome, ResponsePayload, RpcError,
-    SamplePoint, ServerMessage, SignalSnapshotDto, SignalState, instance_url_error,
+    PROTOCOL_VERSION, Reachability, Request, ResponseOutcome, ResponsePayload, RollupPoint,
+    RpcError, SamplePoint, ServerMessage, SignalSnapshotDto, SignalState, instance_url_error,
     is_supported_instance_url,
 };
 pub use settings::DaemonSettings;

@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::settings::DaemonSettings;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "DAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "DAKU_DAEMON_ADDRESS";
@@ -198,6 +198,17 @@ pub struct SamplePoint {
     pub value_real: Option<f64>,
 }
 
+/// One hourly aggregate over raw Signal samples. `avg_real` draws the
+/// trend line, `max_real` its ticks, `sample_count` its coverage.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollupPoint {
+    pub hour_start: i64,
+    pub avg_real: Option<f64>,
+    pub max_real: Option<f64>,
+    pub sample_count: i64,
+}
+
 /// What changed: a rolled-up health transition or a build-string change.
 /// Written by `publish_dashboard`, rendered by the Recent timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -270,6 +281,11 @@ pub enum ServerMessage {
         environment_id: String,
         events: Vec<HealthEventDto>,
     },
+    SignalRollupsUpdated {
+        environment_id: String,
+        signal_id: String,
+        points: Vec<RollupPoint>,
+    },
     ShuttingDown,
 }
 
@@ -291,6 +307,11 @@ impl ServerMessage {
             Self::HealthEventsUpdated { environment_id, .. } => {
                 Some(format!("3:health-events:{environment_id}"))
             }
+            Self::SignalRollupsUpdated {
+                environment_id,
+                signal_id,
+                ..
+            } => Some(format!("4:rollups:{environment_id}:{signal_id}")),
             _ => None,
         }
     }
@@ -489,7 +510,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_daku_domain() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 
     #[test]
@@ -527,6 +548,15 @@ mod tests {
             health_events, "3:health-events:prod",
             "health events replay after samples"
         );
+        let rollups = ServerMessage::SignalRollupsUpdated {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            points: Vec::new(),
+        }
+        .dashboard_cache_key()
+        .expect("rollups key");
+        assert_eq!(rollups, "4:rollups:prod:jobs");
+        assert!(health_events < rollups);
         assert_eq!(ServerMessage::ShuttingDown.dashboard_cache_key(), None);
     }
 
@@ -564,6 +594,33 @@ mod tests {
             Some(HealthEventKind::Build)
         );
         assert_eq!(HealthEventKind::parse("bogus"), None);
+    }
+
+    #[test]
+    fn signal_rollups_updated_round_trips() {
+        let message = ServerMessage::SignalRollupsUpdated {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            points: vec![RollupPoint {
+                hour_start: 1_700_000_000,
+                avg_real: Some(2.5),
+                max_real: Some(4.0),
+                sample_count: 30,
+            }],
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["type"], "signalRollupsUpdated");
+        assert_eq!(json["signalId"], "jobs");
+        assert_eq!(json["points"][0]["hourStart"], 1_700_000_000);
+        assert_eq!(json["points"][0]["avgReal"], 2.5);
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::SignalRollupsUpdated { points, .. } => {
+                assert_eq!(points.len(), 1);
+                assert_eq!(points[0].sample_count, 30);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

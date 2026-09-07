@@ -4,14 +4,17 @@ use anyhow::Context;
 use crossbeam_channel::Sender;
 use daku_protocol::{
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, Reachability,
-    SamplePoint, ServerMessage, SignalSnapshotDto, SignalState,
+    RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, SignalState,
 };
 
 use crate::availability::AVAILABILITY_SIGNAL_ID;
 use crate::config::EnvironmentConfig;
 use crate::jobs::JOBS_SIGNAL_ID;
 use crate::last_clone::LAST_CLONE_SIGNAL_ID;
-use crate::persistence::{self, HealthEvent, PublishState, SAMPLE_RETENTION_SECS, StateStore};
+use crate::persistence::{
+    self, HealthEvent, PublishState, ROLLUP_BUCKET_SECS, ROLLUP_RETENTION_SECS,
+    SAMPLE_RETENTION_SECS, StateStore,
+};
 use crate::syslog::SYSLOG_SIGNAL_ID;
 
 pub const SERVICENOW_PLATFORM_ID: &str = "servicenow";
@@ -19,6 +22,9 @@ pub const SERVICENOW_PLATFORM_ID: &str = "servicenow";
 /// Health events kept per Environment per publish (the table holds more;
 /// the wire carries what the timeline needs).
 pub const HEALTH_EVENT_PUBLISH_LIMIT: i64 = 100;
+
+// Rollup points kept per Environment x Signal per publish: 30 days of hour
+// buckets is a flat 720 points.
 
 pub fn health_rollup(
     reachability: Reachability,
@@ -143,7 +149,31 @@ pub fn publish_dashboard(
                 signal_id: signal_id.to_owned(),
                 points,
             });
+            // One idempotent recompute of the current hour bucket, then the
+            // bounded 30-day series. Raw 24 h samples are untouched.
+            let hour_start = now - now % ROLLUP_BUCKET_SECS;
+            persistence::record_hour_rollup(&connection, &environment.id, signal_id, hour_start)?;
+            let rollups = persistence::load_signal_rollups(
+                &connection,
+                &environment.id,
+                signal_id,
+                now.saturating_sub(ROLLUP_RETENTION_SECS),
+            )?
+            .into_iter()
+            .map(|rollup| RollupPoint {
+                hour_start: rollup.hour_start,
+                avg_real: rollup.avg_real,
+                max_real: rollup.max_real,
+                sample_count: rollup.sample_count,
+            })
+            .collect();
+            let _ = sink.send(ServerMessage::SignalRollupsUpdated {
+                environment_id: environment.id.clone(),
+                signal_id: signal_id.to_owned(),
+                points: rollups,
+            });
         }
+        persistence::prune_signal_rollups(&connection, now)?;
         let events = persistence::load_health_events(
             &connection,
             &environment.id,
@@ -583,6 +613,7 @@ mod tests {
         let mut jobs_samples = None;
         let mut syslog_samples = None;
         let mut health_events = None;
+        let mut rollups = std::collections::HashMap::new();
         while let Ok(message) = rx.try_recv() {
             match message {
                 ServerMessage::EnvironmentsUpdated { environments: list } => {
@@ -614,6 +645,14 @@ mod tests {
                     assert_eq!(environment_id, "prod");
                     health_events = Some(events);
                 }
+                ServerMessage::SignalRollupsUpdated {
+                    environment_id,
+                    signal_id,
+                    points,
+                } => {
+                    assert_eq!(environment_id, "prod");
+                    rollups.insert(signal_id, points);
+                }
                 other => panic!("unexpected {other:?}"),
             }
         }
@@ -642,5 +681,10 @@ mod tests {
         // No build in the availability payload, so no bootstrap event — but
         // the message itself is always published for Hub replay parity.
         assert!(health_events.expect("HealthEventsUpdated").is_empty());
+        // Jobs samples fall in the current hour: one rollup point.
+        let jobs_rollups = rollups.remove(JOBS_SIGNAL_ID).expect("jobs rollups");
+        assert_eq!(jobs_rollups.len(), 1);
+        assert_eq!(jobs_rollups[0].sample_count, 2);
+        assert_eq!(jobs_rollups[0].avg_real, Some(1.5));
     }
 }
