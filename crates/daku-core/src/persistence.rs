@@ -366,6 +366,163 @@ pub fn load_signal_samples(
 
 pub const SAMPLE_RETENTION_SECS: i64 = 24 * 60 * 60;
 
+/// Health-event log bounds: 90 days and 500 events per Environment, enforced
+/// on every publish. Attention history, not an audit trail.
+pub const HEALTH_EVENTS_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
+pub const HEALTH_EVENTS_MAX_PER_ENV: i64 = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthEvent {
+    pub environment_id: String,
+    pub observed_at: i64,
+    /// `"health"` or `"build"`.
+    pub kind: String,
+    pub from_health: Option<String>,
+    pub to_health: String,
+    pub build: Option<String>,
+}
+
+/// Idempotent: re-publishing the same tick (same env/observed_at/kind) is a
+/// no-op, so a restarted daemon cannot duplicate events.
+pub fn record_health_event(connection: &Connection, event: &HealthEvent) -> io::Result<()> {
+    connection
+        .execute(
+            "INSERT INTO health_events (
+                environment_id, observed_at, kind, from_health, to_health, build
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(environment_id, observed_at, kind) DO NOTHING",
+            params![
+                event.environment_id,
+                event.observed_at,
+                event.kind,
+                event.from_health,
+                event.to_health,
+                event.build
+            ],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+pub fn load_health_events(
+    connection: &Connection,
+    environment_id: &str,
+    limit: i64,
+) -> io::Result<Vec<HealthEvent>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT environment_id, observed_at, kind, from_health, to_health, build
+             FROM health_events
+             WHERE environment_id = ?1
+             ORDER BY observed_at ASC
+             LIMIT ?2",
+        )
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![environment_id, limit])
+        .map_err(to_io_error)?;
+    let mut events = Vec::new();
+    while let Some(row) = rows.next().map_err(to_io_error)? {
+        events.push(HealthEvent {
+            environment_id: row.get(0).map_err(to_io_error)?,
+            observed_at: row.get(1).map_err(to_io_error)?,
+            kind: row.get(2).map_err(to_io_error)?,
+            from_health: row.get(3).map_err(to_io_error)?,
+            to_health: row.get(4).map_err(to_io_error)?,
+            build: row.get(5).map_err(to_io_error)?,
+        });
+    }
+    Ok(events)
+}
+
+/// Enforces both bounds: drops events older than 90 days, then keeps only the
+/// newest 500 per Environment. Returns rows deleted.
+pub fn prune_health_events(
+    connection: &Connection,
+    environment_id: &str,
+    now: i64,
+) -> io::Result<usize> {
+    let cutoff = now.saturating_sub(HEALTH_EVENTS_RETENTION_SECS);
+    let mut deleted = connection
+        .execute(
+            "DELETE FROM health_events WHERE environment_id = ?1 AND observed_at < ?2",
+            params![environment_id, cutoff],
+        )
+        .map_err(to_io_error)?;
+    deleted += connection
+        .execute(
+            "DELETE FROM health_events WHERE environment_id = ?1 AND rowid NOT IN (
+                 SELECT rowid FROM health_events
+                 WHERE environment_id = ?1
+                 ORDER BY observed_at DESC
+                 LIMIT ?2
+             )",
+            params![environment_id, HEALTH_EVENTS_MAX_PER_ENV],
+        )
+        .map_err(to_io_error)?;
+    Ok(deleted)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishState {
+    pub last_health: String,
+    pub consecutive: i64,
+    pub previous_health: Option<String>,
+    pub last_build: Option<String>,
+}
+
+pub fn load_publish_state(
+    connection: &Connection,
+    environment_id: &str,
+) -> io::Result<Option<PublishState>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT last_health, consecutive, previous_health, last_build
+             FROM dashboard_publish_state
+             WHERE environment_id = ?1",
+        )
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![environment_id])
+        .map_err(to_io_error)?;
+    let Some(row) = rows.next().map_err(to_io_error)? else {
+        return Ok(None);
+    };
+    Ok(Some(PublishState {
+        last_health: row.get(0).map_err(to_io_error)?,
+        consecutive: row.get(1).map_err(to_io_error)?,
+        previous_health: row.get(2).map_err(to_io_error)?,
+        last_build: row.get(3).map_err(to_io_error)?,
+    }))
+}
+
+pub fn store_publish_state(
+    connection: &Connection,
+    environment_id: &str,
+    state: &PublishState,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "INSERT INTO dashboard_publish_state (
+                environment_id, last_health, consecutive, previous_health, last_build
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(environment_id) DO UPDATE SET
+                last_health = excluded.last_health,
+                consecutive = excluded.consecutive,
+                previous_health = excluded.previous_health,
+                last_build = excluded.last_build",
+            params![
+                environment_id,
+                state.last_health,
+                state.consecutive,
+                state.previous_health,
+                state.last_build
+            ],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
 pub fn prune_signal_samples(connection: &Connection, now: i64) -> io::Result<usize> {
     let cutoff = now.saturating_sub(SAMPLE_RETENTION_SECS);
     connection
@@ -507,5 +664,90 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn health_event(
+        environment_id: &str,
+        observed_at: i64,
+        kind: &str,
+        from_health: Option<&str>,
+        to_health: &str,
+    ) -> HealthEvent {
+        HealthEvent {
+            environment_id: environment_id.into(),
+            observed_at,
+            kind: kind.into(),
+            from_health: from_health.map(str::to_owned),
+            to_health: to_health.into(),
+            build: None,
+        }
+    }
+
+    #[test]
+    fn health_events_round_trip_and_republish_is_idempotent() {
+        let db = TempDb::new("health-events");
+        let connection = db.store().open().unwrap();
+        assert!(table_exists(&connection, "health_events"));
+        assert!(table_exists(&connection, "dashboard_publish_state"));
+
+        let event = health_event("prod", 1_700_000_000, "health", Some("healthy"), "degraded");
+        record_health_event(&connection, &event).unwrap();
+        // Same tick re-published (e.g. daemon restart) must not duplicate.
+        record_health_event(&connection, &event).unwrap();
+
+        let events = load_health_events(&connection, "prod", 100).unwrap();
+        assert_eq!(events, vec![event]);
+        assert!(
+            load_health_events(&connection, "test", 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn prune_health_events_enforces_age_and_count_bounds() {
+        let db = TempDb::new("health-events-prune");
+        let connection = db.store().open().unwrap();
+        let now = 1_700_000_000;
+        record_health_event(
+            &connection,
+            &health_event(
+                "prod",
+                now - HEALTH_EVENTS_RETENTION_SECS - 1,
+                "health",
+                None,
+                "healthy",
+            ),
+        )
+        .unwrap();
+        record_health_event(
+            &connection,
+            &health_event("prod", now, "health", None, "healthy"),
+        )
+        .unwrap();
+        assert_eq!(prune_health_events(&connection, "prod", now).unwrap(), 1);
+        assert_eq!(
+            load_health_events(&connection, "prod", 100).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn publish_state_round_trips_per_environment() {
+        let db = TempDb::new("publish-state");
+        let connection = db.store().open().unwrap();
+        assert!(load_publish_state(&connection, "prod").unwrap().is_none());
+        let state = PublishState {
+            last_health: "degraded".into(),
+            consecutive: 2,
+            previous_health: Some("healthy".into()),
+            last_build: Some("glide-1".into()),
+        };
+        store_publish_state(&connection, "prod", &state).unwrap();
+        assert_eq!(
+            load_publish_state(&connection, "prod").unwrap(),
+            Some(state)
+        );
+        assert!(load_publish_state(&connection, "test").unwrap().is_none());
     }
 }

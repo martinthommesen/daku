@@ -3,18 +3,22 @@
 use anyhow::Context;
 use crossbeam_channel::Sender;
 use daku_protocol::{
-    EnvironmentHealth, EnvironmentSummary, Reachability, SamplePoint, ServerMessage,
-    SignalSnapshotDto, SignalState,
+    EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, Reachability,
+    SamplePoint, ServerMessage, SignalSnapshotDto, SignalState,
 };
 
 use crate::availability::AVAILABILITY_SIGNAL_ID;
 use crate::config::EnvironmentConfig;
 use crate::jobs::JOBS_SIGNAL_ID;
 use crate::last_clone::LAST_CLONE_SIGNAL_ID;
-use crate::persistence::{self, SAMPLE_RETENTION_SECS, StateStore};
+use crate::persistence::{self, HealthEvent, PublishState, SAMPLE_RETENTION_SECS, StateStore};
 use crate::syslog::SYSLOG_SIGNAL_ID;
 
 pub const SERVICENOW_PLATFORM_ID: &str = "servicenow";
+
+/// Health events kept per Environment per publish (the table holds more;
+/// the wire carries what the timeline needs).
+pub const HEALTH_EVENT_PUBLISH_LIMIT: i64 = 100;
 
 pub fn health_rollup(
     reachability: Reachability,
@@ -60,7 +64,12 @@ pub fn publish_dashboard(
     let snapshots = persistence::load_all_signal_snapshots(&connection)?;
     let cutoff = now.saturating_sub(SAMPLE_RETENTION_SECS);
 
-    let mut summaries = Vec::with_capacity(environments.len());
+    struct Published {
+        environment: EnvironmentConfig,
+        summary: EnvironmentSummary,
+    }
+
+    let mut published = Vec::with_capacity(environments.len());
     for environment in environments {
         let env_snaps: Vec<_> = snapshots
             .iter()
@@ -81,21 +90,31 @@ pub fn publish_dashboard(
                 )
             })
             .collect();
-        summaries.push(EnvironmentSummary {
-            id: environment.id.clone(),
-            label: environment.label.clone(),
-            instance_url: environment.instance_url.clone(),
-            platform_id: SERVICENOW_PLATFORM_ID.into(),
-            health: health_rollup(reachability, &votes),
-            reachability,
-            last_observed_at: env_snaps.iter().map(|snapshot| snapshot.observed_at).max(),
+        let health = health_rollup(reachability, &votes);
+        let build = env_snaps
+            .iter()
+            .find(|snapshot| snapshot.signal_id == AVAILABILITY_SIGNAL_ID)
+            .and_then(|snapshot| wire_build(&snapshot.payload_json));
+        record_health_and_build_events(&connection, &environment.id, health, build.clone(), now)?;
+        published.push(Published {
+            summary: EnvironmentSummary {
+                id: environment.id.clone(),
+                label: environment.label.clone(),
+                instance_url: environment.instance_url.clone(),
+                platform_id: SERVICENOW_PLATFORM_ID.into(),
+                health,
+                reachability,
+                last_observed_at: env_snaps.iter().map(|snapshot| snapshot.observed_at).max(),
+            },
+            environment: environment.clone(),
         });
     }
     let _ = sink.send(ServerMessage::EnvironmentsUpdated {
-        environments: summaries,
+        environments: published.iter().map(|item| item.summary.clone()).collect(),
     });
 
-    for environment in environments {
+    for item in &published {
+        let environment = &item.environment;
         let env_snaps: Vec<SignalSnapshotDto> = snapshots
             .iter()
             .filter(|snapshot| snapshot.environment_id == environment.id)
@@ -125,7 +144,139 @@ pub fn publish_dashboard(
                 points,
             });
         }
+        let events = persistence::load_health_events(
+            &connection,
+            &environment.id,
+            HEALTH_EVENT_PUBLISH_LIMIT,
+        )?
+        .into_iter()
+        .filter_map(|event| {
+            Some(HealthEventDto {
+                observed_at: event.observed_at,
+                kind: HealthEventKind::parse(&event.kind)?,
+                from_health: event
+                    .from_health
+                    .as_deref()
+                    .and_then(EnvironmentHealth::parse),
+                to_health: EnvironmentHealth::parse(&event.to_health)?,
+                build: event.build,
+            })
+        })
+        .collect();
+        let _ = sink.send(ServerMessage::HealthEventsUpdated {
+            environment_id: environment.id.clone(),
+            events,
+        });
     }
+    Ok(())
+}
+
+/// Build string from an availability snapshot payload, if the probe read one.
+fn wire_build(payload_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload_json).ok()?;
+    value
+        .get("build")
+        .and_then(|item| item.as_str())
+        .filter(|build| !build.is_empty())
+        .map(str::to_owned)
+}
+
+/// Bounded `health_events` writes for one Environment publish.
+///
+/// * Health: a rollup change becomes an event only after two consecutive
+///   publishes agree, so a single flap is not an event. `previous_health`
+///   carries the value before the current streak as the event's `from`.
+/// * Build: any newly observed build string is an event immediately,
+///   including a bootstrap event (no `from`) on the first build seen.
+///   A build that becomes unreadable updates state silently; its
+///   reappearance then reads as a change.
+fn record_health_and_build_events(
+    connection: &rusqlite::Connection,
+    environment_id: &str,
+    health: EnvironmentHealth,
+    build: Option<String>,
+    now: i64,
+) -> anyhow::Result<()> {
+    let current = health.as_str().to_owned();
+    match persistence::load_publish_state(connection, environment_id)? {
+        None => {
+            persistence::store_publish_state(
+                connection,
+                environment_id,
+                &PublishState {
+                    last_health: current.clone(),
+                    consecutive: 1,
+                    previous_health: None,
+                    last_build: build.clone(),
+                },
+            )?;
+            if let Some(build) = build {
+                persistence::record_health_event(
+                    connection,
+                    &HealthEvent {
+                        environment_id: environment_id.into(),
+                        observed_at: now,
+                        kind: HealthEventKind::Build.as_str().into(),
+                        from_health: None,
+                        to_health: current,
+                        build: Some(build),
+                    },
+                )?;
+            }
+        }
+        Some(state) => {
+            let (consecutive, previous_health) = if current == state.last_health {
+                (
+                    state.consecutive.saturating_add(1),
+                    state.previous_health.clone(),
+                )
+            } else {
+                (1, Some(state.last_health.clone()))
+            };
+            if current == state.last_health
+                && consecutive == 2
+                && previous_health
+                    .as_deref()
+                    .is_some_and(|previous| previous != current.as_str())
+            {
+                persistence::record_health_event(
+                    connection,
+                    &HealthEvent {
+                        environment_id: environment_id.into(),
+                        observed_at: now,
+                        kind: HealthEventKind::Health.as_str().into(),
+                        from_health: previous_health.clone(),
+                        to_health: current.clone(),
+                        build: None,
+                    },
+                )?;
+            }
+            if build.is_some() && build != state.last_build {
+                persistence::record_health_event(
+                    connection,
+                    &HealthEvent {
+                        environment_id: environment_id.into(),
+                        observed_at: now,
+                        kind: HealthEventKind::Build.as_str().into(),
+                        from_health: Some(state.last_health.clone()),
+                        to_health: current.clone(),
+                        build: build.clone(),
+                    },
+                )?;
+            }
+            persistence::store_publish_state(
+                connection,
+                environment_id,
+                &PublishState {
+                    last_health: current,
+                    consecutive,
+                    previous_health,
+                    last_build: build,
+                },
+            )?;
+        }
+    }
+    persistence::prune_health_events(connection, environment_id, now)?;
     Ok(())
 }
 
@@ -215,6 +366,122 @@ mod tests {
             health_rollup(Reachability::Reachable, &[("drift", SignalState::Skipped)]),
             EnvironmentHealth::Healthy
         );
+    }
+
+    /// Snapshots driving `publish_dashboard` event tests: reachable
+    /// availability (optional build) plus a jobs vote that sets the rollup.
+    fn write_votes(
+        connection: &rusqlite::Connection,
+        now: i64,
+        jobs: SignalState,
+        build: Option<&str>,
+    ) {
+        let payload = match build {
+            Some(build) => {
+                format!("{{\"reachability\":\"reachable\",\"rtt_ms\":10,\"build\":\"{build}\"}}")
+            }
+            None => r#"{"reachability":"reachable","rtt_ms":10}"#.to_owned(),
+        };
+        persistence::persist_signal_snapshot(
+            connection,
+            "prod",
+            AVAILABILITY_SIGNAL_ID,
+            now,
+            SignalState::Healthy,
+            &payload,
+        )
+        .unwrap();
+        persistence::persist_signal_snapshot(
+            connection,
+            "prod",
+            JOBS_SIGNAL_ID,
+            now,
+            jobs,
+            r#"{"overdue_ready":0,"error":0}"#,
+        )
+        .unwrap();
+    }
+
+    fn published_health_events(store: &StateStore, now: i64) -> Vec<HealthEventDto> {
+        use crossbeam_channel::unbounded;
+        let (tx, rx) = unbounded();
+        publish_dashboard(&[prod()], store, &tx, now).unwrap();
+        let mut events = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let ServerMessage::HealthEventsUpdated {
+                environment_id,
+                events: list,
+            } = message
+            {
+                assert_eq!(environment_id, "prod");
+                events = list;
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn single_flap_writes_no_health_event() {
+        let db = TempDb::new("health-flap");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        write_votes(&connection, 100, SignalState::Healthy, None);
+        assert!(published_health_events(&store, 100).is_empty());
+        write_votes(&connection, 200, SignalState::Degraded, None);
+        assert!(published_health_events(&store, 200).is_empty());
+        write_votes(&connection, 300, SignalState::Healthy, None);
+        assert!(published_health_events(&store, 300).is_empty());
+    }
+
+    #[test]
+    fn two_consecutive_degraded_writes_one_event_then_stays_quiet() {
+        let db = TempDb::new("health-confirm");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        write_votes(&connection, 100, SignalState::Healthy, None);
+        assert!(published_health_events(&store, 100).is_empty());
+        write_votes(&connection, 200, SignalState::Degraded, None);
+        assert!(published_health_events(&store, 200).is_empty());
+        write_votes(&connection, 300, SignalState::Degraded, None);
+        let events = published_health_events(&store, 300);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, HealthEventKind::Health);
+        assert_eq!(events[0].from_health, Some(EnvironmentHealth::Healthy));
+        assert_eq!(events[0].to_health, EnvironmentHealth::Degraded);
+        // Third consecutive publish must not duplicate the transition.
+        write_votes(&connection, 400, SignalState::Degraded, None);
+        assert_eq!(published_health_events(&store, 400).len(), 1);
+    }
+
+    #[test]
+    fn first_observed_build_writes_a_bootstrap_event() {
+        let db = TempDb::new("health-bootstrap");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        write_votes(&connection, 100, SignalState::Healthy, Some("glide-1"));
+        let events = published_health_events(&store, 100);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, HealthEventKind::Build);
+        assert_eq!(events[0].from_health, None);
+        assert_eq!(events[0].to_health, EnvironmentHealth::Healthy);
+        assert_eq!(events[0].build.as_deref(), Some("glide-1"));
+        // Same tick re-published (daemon restart) stays one row.
+        assert_eq!(published_health_events(&store, 100).len(), 1);
+    }
+
+    #[test]
+    fn build_change_writes_an_event_without_waiting() {
+        let db = TempDb::new("health-build-change");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        write_votes(&connection, 100, SignalState::Healthy, Some("glide-1"));
+        assert_eq!(published_health_events(&store, 100).len(), 1);
+        write_votes(&connection, 200, SignalState::Healthy, Some("glide-2"));
+        let events = published_health_events(&store, 200);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, HealthEventKind::Build);
+        assert_eq!(events[1].from_health, Some(EnvironmentHealth::Healthy));
+        assert_eq!(events[1].build.as_deref(), Some("glide-2"));
     }
 
     #[test]
@@ -315,6 +582,7 @@ mod tests {
         let mut snapshots = None;
         let mut jobs_samples = None;
         let mut syslog_samples = None;
+        let mut health_events = None;
         while let Ok(message) = rx.try_recv() {
             match message {
                 ServerMessage::EnvironmentsUpdated { environments: list } => {
@@ -338,6 +606,13 @@ mod tests {
                     } else if signal_id == SYSLOG_SIGNAL_ID {
                         syslog_samples = Some(points);
                     }
+                }
+                ServerMessage::HealthEventsUpdated {
+                    environment_id,
+                    events,
+                } => {
+                    assert_eq!(environment_id, "prod");
+                    health_events = Some(events);
                 }
                 other => panic!("unexpected {other:?}"),
             }
@@ -364,5 +639,8 @@ mod tests {
                 .expect("syslog SignalSamplesUpdated")
                 .is_empty()
         );
+        // No build in the availability payload, so no bootstrap event — but
+        // the message itself is always published for Hub replay parity.
+        assert!(health_events.expect("HealthEventsUpdated").is_empty());
     }
 }

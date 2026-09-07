@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use daku_protocol::{
-    EnvironmentHealth, EnvironmentSummary, Reachability, SamplePoint, ServerMessage,
-    SignalSnapshotDto, is_supported_instance_url,
+    EnvironmentHealth, EnvironmentSummary, HealthEventDto, Reachability, SamplePoint,
+    ServerMessage, SignalSnapshotDto, is_supported_instance_url,
 };
 
 pub const SIGNAL_IDS: [&str; 7] = [
@@ -117,6 +117,9 @@ pub struct DashboardState {
     selected_card: Option<&'static str>,
     snapshots: HashMap<String, HashMap<String, Snapshot>>,
     samples: HashMap<(String, String), Vec<SamplePoint>>,
+    /// Health-transition + build-change events per Environment, published by
+    /// the daemon (`072`). Rendered by the Recent timeline (`077`).
+    health_events: HashMap<String, Vec<HealthEventDto>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,6 +222,8 @@ impl DashboardState {
                 self.snapshots.retain(|id, _| known.contains(id.as_str()));
                 self.samples
                     .retain(|(id, _), _| known.contains(id.as_str()));
+                self.health_events
+                    .retain(|id, _| known.contains(id.as_str()));
             }
             ServerMessage::SignalSnapshotsUpdated {
                 environment_id,
@@ -249,6 +254,13 @@ impl DashboardState {
             } => {
                 self.samples
                     .insert((environment_id.clone(), signal_id.clone()), points.clone());
+            }
+            ServerMessage::HealthEventsUpdated {
+                environment_id,
+                events,
+            } => {
+                self.health_events
+                    .insert(environment_id.clone(), events.clone());
             }
             _ => {}
         }
@@ -1402,6 +1414,35 @@ mod tests {
         let state = loaded();
         assert_eq!(state.sidebar()[0].health, EnvironmentHealth::Degraded);
         assert!(!state.sidebar()[0].muted);
+    }
+
+    #[test]
+    fn health_events_are_stored_per_environment_and_pruned_with_it() {
+        use daku_protocol::{HealthEventDto, HealthEventKind};
+
+        let mut state = loaded();
+        let events = vec![HealthEventDto {
+            observed_at: 1_700_000_100,
+            kind: HealthEventKind::Health,
+            from_health: Some(EnvironmentHealth::Healthy),
+            to_health: EnvironmentHealth::Degraded,
+            build: None,
+        }];
+        state.apply(&ServerMessage::HealthEventsUpdated {
+            environment_id: "prod".into(),
+            events: events.clone(),
+        });
+        assert_eq!(state.health_events.get("prod"), Some(&events));
+        // Removing the Environment drops its events with its snapshots.
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![env(
+                "test",
+                "Test",
+                EnvironmentHealth::Healthy,
+                Reachability::Reachable,
+            )],
+        });
+        assert!(!state.health_events.contains_key("prod"));
     }
 
     #[test]

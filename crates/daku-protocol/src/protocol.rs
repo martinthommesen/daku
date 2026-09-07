@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::settings::DaemonSettings;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "DAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "DAKU_DAEMON_ADDRESS";
@@ -66,6 +66,25 @@ pub enum Reachability {
     Reachable,
     Unreachable,
     Asleep,
+}
+
+impl EnvironmentHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Down => "down",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "healthy" => Self::Healthy,
+            "degraded" => Self::Degraded,
+            "down" => Self::Down,
+            _ => return None,
+        })
+    }
 }
 
 /// Per-Signal snapshot state. `Skipped` means the Signal deliberately did not
@@ -179,6 +198,44 @@ pub struct SamplePoint {
     pub value_real: Option<f64>,
 }
 
+/// What changed: a rolled-up health transition or a build-string change.
+/// Written by `publish_dashboard`, rendered by the Recent timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthEventKind {
+    Health,
+    Build,
+}
+
+impl HealthEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Health => "health",
+            Self::Build => "build",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "health" => Self::Health,
+            "build" => Self::Build,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthEventDto {
+    pub observed_at: i64,
+    pub kind: HealthEventKind,
+    /// Previous rollup; `None` for the bootstrap build event.
+    pub from_health: Option<EnvironmentHealth>,
+    pub to_health: EnvironmentHealth,
+    /// Build string after the change; `None` for pure health transitions.
+    pub build: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(
     tag = "type",
@@ -209,6 +266,10 @@ pub enum ServerMessage {
         signal_id: String,
         points: Vec<SamplePoint>,
     },
+    HealthEventsUpdated {
+        environment_id: String,
+        events: Vec<HealthEventDto>,
+    },
     ShuttingDown,
 }
 
@@ -227,6 +288,9 @@ impl ServerMessage {
                 signal_id,
                 ..
             } => Some(format!("2:samples:{environment_id}:{signal_id}")),
+            Self::HealthEventsUpdated { environment_id, .. } => {
+                Some(format!("3:health-events:{environment_id}"))
+            }
             _ => None,
         }
     }
@@ -425,7 +489,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_daku_domain() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]
@@ -448,11 +512,58 @@ mod tests {
         }
         .dashboard_cache_key()
         .expect("samples key");
+        let health_events = ServerMessage::HealthEventsUpdated {
+            environment_id: "prod".into(),
+            events: Vec::new(),
+        }
+        .dashboard_cache_key()
+        .expect("health events key");
 
         assert_eq!(environments, "0:environments");
         assert!(environments < snapshots);
         assert!(snapshots < samples);
+        assert!(samples < health_events);
+        assert_eq!(
+            health_events, "3:health-events:prod",
+            "health events replay after samples"
+        );
         assert_eq!(ServerMessage::ShuttingDown.dashboard_cache_key(), None);
+    }
+
+    #[test]
+    fn health_events_updated_round_trips() {
+        let message = ServerMessage::HealthEventsUpdated {
+            environment_id: "prod".into(),
+            events: vec![HealthEventDto {
+                observed_at: 1_700_000_000,
+                kind: HealthEventKind::Health,
+                from_health: Some(EnvironmentHealth::Healthy),
+                to_health: EnvironmentHealth::Degraded,
+                build: None,
+            }],
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["type"], "healthEventsUpdated");
+        assert_eq!(json["environmentId"], "prod");
+        assert_eq!(json["events"][0]["kind"], "health");
+        assert_eq!(json["events"][0]["toHealth"], "degraded");
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ServerMessage::HealthEventsUpdated {
+                environment_id,
+                events,
+            } => {
+                assert_eq!(environment_id, "prod");
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].kind, HealthEventKind::Health);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            HealthEventKind::parse("build"),
+            Some(HealthEventKind::Build)
+        );
+        assert_eq!(HealthEventKind::parse("bogus"), None);
     }
 
     #[test]
