@@ -23,8 +23,8 @@ pub const SERVICENOW_PLATFORM_ID: &str = "servicenow";
 /// the wire carries what the timeline needs).
 pub const HEALTH_EVENT_PUBLISH_LIMIT: i64 = 100;
 
-// Rollup points kept per Environment x Signal per publish: 30 days of hour
-// buckets is a flat 720 points.
+// Rollup points kept per Environment x Signal per publish: 90 days of hour
+// buckets is a flat ~2160 points.
 
 pub fn health_rollup(
     reachability: Reachability,
@@ -157,7 +157,7 @@ pub fn publish_dashboard(
                 points,
             });
             // One idempotent recompute of the current hour bucket, then the
-            // bounded 30-day series. Raw 24 h samples are untouched.
+            // bounded 90-day series. Raw 24 h samples are untouched.
             let hour_start = now - now % ROLLUP_BUCKET_SECS;
             persistence::record_hour_rollup(&connection, &environment.id, signal_id, hour_start)?;
             let rollups = persistence::load_signal_rollups(

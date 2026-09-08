@@ -421,8 +421,8 @@ pub fn load_signal_samples(
 
 pub const SAMPLE_RETENTION_SECS: i64 = 24 * 60 * 60;
 
-/// Hourly roll-up retention: 30 days of hour buckets per Environment × Signal.
-pub const ROLLUP_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+/// Hourly roll-up retention: 90 days of hour buckets per Environment × Signal.
+pub const ROLLUP_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 pub const ROLLUP_BUCKET_SECS: i64 = 60 * 60;
 
 #[derive(Debug, Clone, PartialEq)]

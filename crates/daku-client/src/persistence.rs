@@ -134,6 +134,12 @@ fn configuration_directory() -> PathBuf {
         .join(".daku")
 }
 
+/// Operator exports land here (`ExportSnapshot`): one timestamped directory
+/// per export. Same permissions story as everything else daku writes.
+pub fn export_root() -> PathBuf {
+    configuration_directory().join("exports")
+}
+
 fn default_app_settings_path() -> PathBuf {
     if cfg!(debug_assertions) {
         // Checkout-local so a dev build never shares app.json with an installed Daku.app.

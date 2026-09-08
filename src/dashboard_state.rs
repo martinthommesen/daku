@@ -591,6 +591,93 @@ impl DashboardState {
         lines.join("\n")
     }
 
+    /// Export payloads for the selected Environment: snapshots as pretty
+    /// JSON (signal, state, observed_at, payload), samples and rollups as
+    /// CSV rows. The summary text (`summary_text`) is the Markdown export.
+    /// Pure and unit-tested; the shell writes the three files.
+    pub fn export_snapshots_json(&self) -> String {
+        let Some(environment_id) = self.selected_id.as_deref() else {
+            return "[]".into();
+        };
+        let rows: Vec<serde_json::Value> = self
+            .snapshots
+            .get(environment_id)
+            .map(|map| {
+                let mut rows: Vec<serde_json::Value> = map
+                    .values()
+                    .map(|snapshot| {
+                        serde_json::json!({
+                            "signal_id": snapshot.dto.signal_id,
+                            "state": snapshot.dto.state,
+                            "observed_at": snapshot.dto.observed_at,
+                            "payload": snapshot.payload,
+                        })
+                    })
+                    .collect();
+                rows.sort_by(|a, b| a["signal_id"].as_str().cmp(&b["signal_id"].as_str()));
+                rows
+            })
+            .unwrap_or_default();
+        serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// CSV with a header: `signal_id,observed_at,value`. Samples first, then
+    /// rollup averages (`rollup_avg` kinds carry `hour_start`). Empty when
+    /// the Environment holds no trend points.
+    pub fn export_trends_csv(&self) -> String {
+        let Some(environment_id) = self.selected_id.as_deref() else {
+            return "signal_id,observed_at,value\n".into();
+        };
+        let mut out = String::from("signal_id,observed_at,value\n");
+        let mut signals: Vec<&String> = self
+            .samples
+            .keys()
+            .filter(|(env, _)| env == environment_id)
+            .map(|(_, signal)| signal)
+            .collect();
+        signals.sort();
+        signals.dedup();
+        let mut rollup_signals: Vec<&String> = self
+            .rollups
+            .keys()
+            .filter(|(env, _)| env == environment_id)
+            .map(|(_, signal)| signal)
+            .collect();
+        rollup_signals.sort();
+        rollup_signals.dedup();
+        for signal in signals {
+            if let Some(points) = self
+                .samples
+                .get(&(environment_id.to_owned(), (*signal).clone()))
+            {
+                for point in points {
+                    out.push_str(&format!(
+                        "{},{},{}\n",
+                        signal,
+                        point.observed_at,
+                        point.value_real.map(|v| v.to_string()).unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        for signal in rollup_signals {
+            if let Some(points) = self
+                .rollups
+                .get(&(environment_id.to_owned(), (*signal).clone()))
+            {
+                for point in points {
+                    out.push_str(&format!(
+                        "{},hour {},{}\n",
+                        signal,
+                        point.hour_start,
+                        point.avg_real.map(|v| v.to_string()).unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// Deep link into the ServiceNow list the Signal is measured from, mirroring
     /// the collectors' encoded queries. `None` without a selected Environment.
     pub fn signal_url(&self, signal_id: &str) -> Option<String> {
@@ -1479,7 +1566,7 @@ impl DashboardState {
     }
 
     /// How unusual the latest sample is for a trend Signal: latest raw value
-    /// over the same-weekday-hour baseline mean from the 30-day hourly
+    /// over the same-weekday-hour baseline mean from the 90-day hourly
     /// roll-ups. `Some(factor)` at 2× and above, else `None` (too few
     /// baseline buckets, a zero baseline, no samples, or a non-trend
     /// Signal). Pure read of published history — the daemon sends nothing
@@ -2944,6 +3031,34 @@ mod tests {
                 .unwrap()
                 .contains("(muted)"),
         );
+    }
+
+    #[test]
+    fn export_builders_emit_sorted_json_and_header_csv() {
+        let state = loaded();
+        let snapshots: serde_json::Value =
+            serde_json::from_str(&state.export_snapshots_json()).unwrap();
+        let ids: Vec<&str> = snapshots
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["signal_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 14, "prod fixture carries 14 snapshots");
+        assert!(ids.windows(2).all(|pair| pair[0] <= pair[1]));
+        let csv = state.export_trends_csv();
+        let mut lines = csv.lines();
+        assert_eq!(lines.next(), Some("signal_id,observed_at,value"));
+        // Fixture jobs samples (3) plus rollups render below the header.
+        assert!(lines.count() >= 3);
+        assert!(csv.contains("\njobs,10,1\n"));
+    }
+
+    #[test]
+    fn export_builders_without_selection_emit_empty_shapes() {
+        let state = DashboardState::new();
+        assert_eq!(state.export_snapshots_json(), "[]");
+        assert_eq!(state.export_trends_csv(), "signal_id,observed_at,value\n");
     }
 
     #[test]

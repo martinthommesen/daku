@@ -27,6 +27,7 @@ use crate::AddEnvironment;
 use crate::CloseWindow;
 use crate::CopySummary;
 use crate::DetachSelectedEnvironment;
+use crate::ExportSnapshot;
 use crate::ReloadDaemon;
 use crate::SelectEnvironment;
 use crate::SelectEnvironmentSlot;
@@ -53,6 +54,8 @@ pub struct Daku {
     settings: Arc<Mutex<AppSettings>>,
     /// Copy-summary confirmation, cleared ~2 s after ⌘⇧C.
     copied_flash: bool,
+    /// Export confirmation path, cleared ~4 s after ⌘⇧E.
+    exported_path: Option<String>,
     /// Desktop boot time: health events observed before this record as seen
     /// without firing, so launch/reconnect replays never storm.
     boot_now: i64,
@@ -110,6 +113,7 @@ impl Daku {
                 supervisor,
                 settings,
                 copied_flash: false,
+                exported_path: None,
                 boot_now: unix_now(),
                 notify_seen: HashSet::new(),
                 last_ambient: None,
@@ -685,6 +689,45 @@ impl Daku {
         })
         .detach();
     }
+
+    /// Exports the selected Environment to
+    /// `~/.daku/exports/<id>-<unix>/`: `snapshots.json`, `trends.csv`, and
+    /// `summary.md` (the copy text). No dialog — the footer flashes the
+    /// directory, which keeps the flow headless-testable.
+    fn export_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.state.selected_id().map(str::to_owned) else {
+            return;
+        };
+        let now = unix_now();
+        let dir = export_directory(&id, now);
+        let wrote = std::fs::create_dir_all(&dir)
+            .and_then(|_| {
+                std::fs::write(dir.join("snapshots.json"), self.state.export_snapshots_json())
+            })
+            .and_then(|_| std::fs::write(dir.join("trends.csv"), self.state.export_trends_csv()))
+            .and_then(|_| std::fs::write(dir.join("summary.md"), self.state.summary_text(now)))
+            .is_ok();
+        if wrote {
+            self.exported_path = Some(dir.display().to_string());
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(4))
+                    .await;
+                let _ = this.update(cx, |this: &mut Self, cx| {
+                    this.exported_path = None;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+}
+
+/// Export root for one Environment at one moment. Pure so tests pin the
+/// layout without touching the home directory.
+fn export_directory(environment_id: &str, now: i64) -> std::path::PathBuf {
+    crate::persistence::export_root().join(format!("{environment_id}-{now}"))
 }
 
 fn unix_now() -> i64 {
@@ -905,6 +948,9 @@ impl Render for Daku {
             .on_action(cx.listener(|this, _: &CopySummary, _, cx| {
                 this.copy_summary(cx);
             }))
+            .on_action(cx.listener(|this, _: &ExportSnapshot, _, cx| {
+                this.export_snapshot(cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleNotifications, _, cx| {
                 if let Ok(mut settings) = this.settings.lock() {
                     settings.notifications_enabled = !settings.notifications_enabled;
@@ -1074,6 +1120,8 @@ impl Daku {
             });
         let footer = if self.copied_flash {
             "Copied Environment summary".to_owned()
+        } else if let Some(path) = self.exported_path.as_deref() {
+            format!("Exported to {path}")
         } else {
             format!(
                 "{} \u{b7} v{}",

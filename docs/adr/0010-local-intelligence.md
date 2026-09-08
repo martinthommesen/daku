@@ -11,7 +11,7 @@ surfaces and fixes where each computes:
   `daku-protocol`): the daemon rollup and the desktop explainer can never
   disagree about what voted.
 * **Anomaly strip**: latest raw sample over the same-weekday-hour baseline
-  mean from the 30-day hourly roll-ups, shown in the drill-in at 2× and
+  mean from the 90-day hourly roll-ups, shown in the drill-in at 2× and
   above ("4.0× normal for a Monday 09:00"). Client-side, trend Signals
   only, four-bucket minimum, zero baselines never divide. Threshold
   crossings still own alerting; this is context.

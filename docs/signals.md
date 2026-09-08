@@ -32,8 +32,8 @@ Shared semantics:
 | Signal | Source | Default degrade rule | Trend |
 |--------|--------|----------------------|-------|
 | Availability | `sys_properties` (`glide.war`) | unreachable, or RTT over ceiling | RTT sparkline |
-| Scheduled jobs | `sys_trigger` aggregates | ≥1 overdue (error count off) | backlog, 24 h raw + 30 d hourly |
-| Syslog errors | `syslog` aggregate, level 2, 1 h | ≥1 error | 24 h raw + 30 d hourly |
+| Scheduled jobs | `sys_trigger` aggregates | ≥1 overdue (error count off) | backlog, 24 h raw + 90 d hourly |
+| Syslog errors | `syslog` aggregate, level 2, 1 h | ≥1 error | 24 h raw + 90 d hourly |
 | MID / ECC | `ecc_agent` table + `ecc_queue` aggregates | any unhealthy/error, queue ≥100 | point-in-time |
 | Outbound | `sys_outbound_http_log` aggregate, 4xx+, 1 h | ≥1 failure | point-in-time |
 | Flow errors | `sys_flow_context` aggregate, state ERROR, 1 h | ≥1 error | point-in-time |
@@ -253,7 +253,7 @@ clone found"). **Never votes** in health. Drill-in: one row
 
 - Latest snapshot per Signal × Environment (always).
 - Raw samples 24 h: availability RTT, jobs backlog, syslog errors.
-- Hourly roll-ups 30 d (avg line, max ticks, sample counts) for the same
+- Hourly roll-ups 90 d (avg line, max ticks, sample counts) for the same
   three; drill-in switch 24 h / 7 d / 30 d.
 - Bounded health-event log (90 d / 500 per Environment): rollup changes
   confirmed twice (single flaps are not events) and build changes including
