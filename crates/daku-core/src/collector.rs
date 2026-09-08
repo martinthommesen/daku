@@ -14,6 +14,7 @@ use rusqlite::Connection;
 use crate::availability::{AvailabilityCollector, REACHABILITY_REUSE_SECS, recent_reachability};
 use crate::config::{CredentialStore, EnvironmentConfig, load_environments};
 use crate::drift::DriftCollector;
+use crate::email::EmailCollector;
 use crate::flow::FlowCollector;
 use crate::health::publish_dashboard;
 use crate::jobs::JobsCollector;
@@ -389,6 +390,12 @@ pub fn build_default_loop(
                 store.clone(),
             )),
             Box::new(FlowCollector::new(
+                one.clone(),
+                credentials.clone(),
+                client.clone(),
+                store.clone(),
+            )),
+            Box::new(EmailCollector::new(
                 one,
                 credentials.clone(),
                 client.clone(),
@@ -913,7 +920,7 @@ mod tests {
             ServiceNowClient::new(FixtureTransport, SystemClock),
         );
         assert_eq!(loop_.groups.len(), 2);
-        assert_eq!(loop_.groups[0].len(), 6);
+        assert_eq!(loop_.groups[0].len(), 7);
         assert_eq!(loop_.shared.len(), 2, "drift and last-clone stay shared");
     }
 

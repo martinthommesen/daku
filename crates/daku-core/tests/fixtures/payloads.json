@@ -82,6 +82,31 @@
     "signal_id": "drift",
     "state": "healthy"
   },
+  "email_count": {
+    "payload": {
+      "email_failed_1h": 2,
+      "error_rows": [
+        {
+          "recipients": "owner@example.com",
+          "subject": "Approval requested",
+          "sys_created_on": "2026-01-27 00:12:00",
+          "sys_id": "email-1"
+        }
+      ],
+      "error_rows_truncated": false
+    },
+    "signal_id": "email",
+    "state": "healthy"
+  },
+  "email_zero": {
+    "payload": {
+      "email_failed_1h": 0,
+      "error_rows": [],
+      "error_rows_truncated": false
+    },
+    "signal_id": "email",
+    "state": "healthy"
+  },
   "flow_count": {
     "payload": {
       "error_rows": [

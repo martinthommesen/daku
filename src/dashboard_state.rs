@@ -7,13 +7,14 @@ use daku_protocol::{
     RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
 };
 
-pub const SIGNAL_IDS: [&str; 8] = [
+pub const SIGNAL_IDS: [&str; 9] = [
     "availability",
     "jobs",
     "syslog",
     "mid_ecc",
     "outbound",
     "flow",
+    "email",
     "drift",
     "last_clone",
 ];
@@ -33,6 +34,7 @@ pub fn signal_label(signal_id: &str) -> &'static str {
         "mid_ecc" => "MID / ECC",
         "outbound" => "Outbound",
         "flow" => "Flow errors",
+        "email" => "Email failures",
         "drift" => "Version / plugins",
         "last_clone" => "Last clone",
         _ => "Signal",
@@ -533,6 +535,9 @@ impl DashboardState {
             "flow" => {
                 "/sys_flow_context_list.do?sysparm_query=state=ERROR^sys_updated_on>javascript:gs.hoursAgoStart(1)"
             }
+            "email" => {
+                "/sys_email_list.do?sysparm_query=type=send-failed^sys_created_on>javascript:gs.hoursAgoStart(1)"
+            }
             "drift" => "/v_plugin_list.do",
             "last_clone" => "/clone_instance_list.do",
             _ => return None,
@@ -654,6 +659,9 @@ impl DashboardState {
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "flow" => self
                 .flow_rows(value)
+                .unwrap_or_else(|| self.drill_in_text(signal_id)),
+            "email" => self
+                .email_rows(value)
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "availability" => self.drill_in_trend(signal_id, now),
             _ => self.drill_in_text(signal_id),
@@ -811,6 +819,38 @@ impl DashboardState {
                     DrillInRow {
                         cells: vec![cell(entry, "name"), cell(entry, "sys_updated_on")],
                         link: self.record_url("sys_flow_context", sys_id),
+                    }
+                })
+                .collect(),
+            truncated: value.get("error_rows_truncated") == Some(&serde_json::Value::Bool(true))
+                || list.len() > DRILL_IN_ROW_LIMIT,
+        })
+    }
+
+    /// Email failure rows the daemon fetched while unhealthy. Each row links
+    /// its `sys_email` record.
+    fn email_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let list = value
+            .get("error_rows")
+            .and_then(|item| item.as_array())
+            .filter(|list| !list.is_empty())?;
+        Some(DrillIn::Rows {
+            headers: vec!["Subject", "To", "Time"],
+            rows: list
+                .iter()
+                .take(DRILL_IN_ROW_LIMIT)
+                .map(|entry| {
+                    let sys_id = entry
+                        .get("sys_id")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("");
+                    DrillInRow {
+                        cells: vec![
+                            cell(entry, "subject"),
+                            cell(entry, "recipients"),
+                            cell(entry, "sys_created_on"),
+                        ],
+                        link: self.record_url("sys_email", sys_id),
                     }
                 })
                 .collect(),
@@ -1352,6 +1392,13 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 .and_then(|item| item.as_u64())
                 .unwrap_or(0)
         ),
+        "email" => format!(
+            "{} email failures · last hour",
+            value
+                .get("email_failed_1h")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0)
+        ),
         "drift" => {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
                 "source of truth".into()
@@ -1506,6 +1553,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "mid_ecc_healthy",
                 "outbound_count",
                 "flow_count",
+                "email_count",
                 "drift_source",
             ]
             .map(pinned)
@@ -1520,6 +1568,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "mid_ecc_unhealthy",
                 "down_probe_failed",
                 "flow_zero",
+                "email_zero",
                 "drift_compare",
                 "last_clone_target_completed",
             ]
@@ -1668,7 +1717,7 @@ mod tests {
     /// `card_summary`, `card_detail`). Add a pinned case there and
     /// `pinned_payloads_render` fails until it is listed here — that is the
     /// point of the pin.
-    const RENDERED: [(&str, &str, &str); 29] = [
+    const RENDERED: [(&str, &str, &str); 31] = [
         ("availability_asleep", "142 ms", ""),
         // The build string is shown with the plugin inventory (drift), not
         // under the latency number.
@@ -1701,6 +1750,8 @@ mod tests {
         ("outbound_zero", "0 HTTP failures \u{b7} last hour", ""),
         ("flow_count", "2 flow errors \u{b7} last hour", ""),
         ("flow_zero", "0 flow errors \u{b7} last hour", ""),
+        ("email_count", "2 email failures \u{b7} last hour", ""),
+        ("email_zero", "0 email failures \u{b7} last hour", ""),
         ("skipped_asleep", "", "Environment asleep"),
         ("skipped_clone_source_asleep", "", "clone source asleep"),
         (
@@ -1864,7 +1915,13 @@ mod tests {
                 .any(|line| line.contains("Flow errors: degraded")),
             "{text}"
         );
-        assert_eq!(lines.len(), 10, "{text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Email failures: healthy")),
+            "{text}"
+        );
+        assert_eq!(lines.len(), 11, "{text}");
     }
 
     #[test]
@@ -2057,6 +2114,29 @@ mod tests {
                     cells: vec!["Sync orders".to_owned(), "2026-01-27 00:12:00".to_owned()],
                     link: Some(
                         "https://prod.example.service-now.com/sys_flow_context.do?sys_id=flow-1"
+                            .to_owned()
+                    ),
+                }],
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drill_in_lists_failed_mail_with_record_links() {
+        let state = loaded();
+        assert_eq!(
+            state.drill_in("email", TEST_NOW),
+            DrillIn::Rows {
+                headers: vec!["Subject", "To", "Time"],
+                rows: vec![DrillInRow {
+                    cells: vec![
+                        "Approval requested".to_owned(),
+                        "owner@example.com".to_owned(),
+                        "2026-01-27 00:12:00".to_owned(),
+                    ],
+                    link: Some(
+                        "https://prod.example.service-now.com/sys_email.do?sys_id=email-1"
                             .to_owned()
                     ),
                 }],

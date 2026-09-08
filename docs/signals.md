@@ -1,9 +1,9 @@
 # Signal reference
 
-What the eight Signal cards measure, what makes each amber, what the
+What the nine Signal cards measure, what makes each amber, what the
 Operator can tune, and where each link lands. Code truth lives in
 `crates/daku-core/src/` (`availability.rs`, `jobs.rs`, `syslog.rs`,
-`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `drift.rs`, `last_clone.rs`); rendering truth
+`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `drift.rs`, `last_clone.rs`); rendering truth
 in `src/dashboard_state.rs`. Research hedges live in
 [`docs/research/servicenow-signals.md`](./research/servicenow-signals.md) —
 this page describes what shipped.
@@ -37,6 +37,7 @@ Shared semantics:
 | MID / ECC | `ecc_agent` table + `ecc_queue` aggregates | any unhealthy/error, queue ≥100 | point-in-time |
 | Outbound | `sys_outbound_http_log` aggregate, 4xx+, 1 h | ≥1 failure | point-in-time |
 | Flow errors | `sys_flow_context` aggregate, state ERROR, 1 h | ≥1 error | point-in-time |
+| Email failures | `sys_email` aggregate, send-failed, 1 h | opt-in (`off` by default) | point-in-time |
 | Version / plugins | `sys_plugins` + `sys_store_app` vs clone source | any unexpected mismatch / build differs | point-in-time |
 | Last clone | `clone_instance` on the clone source | never votes (informational) | point-in-time |
 
@@ -115,6 +116,18 @@ Threshold: `flow_error_degraded_at` (1). No samples.
 Rows (only while non-zero, 10, newest first): flow name, last update.
 Each row links its `sys_flow_context` record. Drill-in rows or text. Link:
 filtered flow-context list.
+
+## Email failures — mail that never arrived
+
+Aggregate on `sys_email`: `type=send-failed` created in the last hour.
+Off by default — dev Environments fail mail noisily — so the Operator opts
+in per Environment with `email_failure_degraded_at` (the sheet accepts
+`off` to return to silent). No samples.
+
+Rows (only while non-zero, 10, newest first): subject, recipients, time.
+The error string stays out of the snapshot (it can carry addresses and
+message bodies). Each row links its `sys_email` record. Drill-in rows or
+text. Link: filtered mail list.
 
 ## Version / plugins — drift across Environments
 

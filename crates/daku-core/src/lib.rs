@@ -4,6 +4,7 @@ pub mod availability;
 pub mod collector;
 pub mod config;
 pub mod drift;
+pub mod email;
 pub mod environments;
 pub mod flow;
 pub mod health;
