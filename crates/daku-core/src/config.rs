@@ -31,6 +31,74 @@ pub fn load_environments(path: &Path) -> anyhow::Result<Vec<EnvironmentConfig>> 
     Ok(environments)
 }
 
+/// Repairs what `doctor --fix` may safely touch: the parent directory
+/// (created, `0700` when daku owns it), a missing `environments.json`
+/// (created holding an empty list, `0600`), and lax file modes (`0600`).
+/// Never invents Credentials, never guesses URLs, never rewrites content —
+/// an unparsable file is left for the Operator to fix by hand. Returns a
+/// line per applied fix for the caller to print.
+pub fn repair_environments_setup(path: &Path) -> anyhow::Result<Vec<String>> {
+    use std::io::Write as _;
+
+    let mut fixed = Vec::new();
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        #[cfg(unix)]
+        let existed = parent.exists();
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        #[cfg(unix)]
+        if !existed
+            || parent
+                .file_name()
+                .is_some_and(|name| name == std::ffi::OsStr::new(".daku"))
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("securing {}", parent.display()))?;
+            fixed.push(format!("secured {} to 0700", parent.display()));
+        }
+    }
+    if !path.exists() {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        file.write_all(b"[]\n")
+            .with_context(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("securing {}", path.display()))?;
+        }
+        fixed.push(format!(
+            "created {} holding an empty Environment list — add Environments from the app menu",
+            path.display()
+        ));
+        return Ok(fixed);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != 0o600 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("securing {}", path.display()))?;
+            fixed.push(format!("secured {} to 0600", path.display()));
+        }
+    }
+    Ok(fixed)
+}
+
 /// Environment URLs carry Credentials on every request: https only, no
 /// userinfo, no query/fragment. Trailing `/` is tolerated (`join_url` trims it).
 /// The rules themselves live in `daku_protocol::instance_url_error` so the
@@ -324,6 +392,58 @@ mod tests {
         let environments = load_environments(file.path()).unwrap();
         assert_eq!(environments[0].thresholds, Thresholds::default());
         assert!(environments[0].expected_drift.is_empty());
+    }
+
+    #[test]
+    fn repair_creates_a_missing_file_holding_an_empty_list() {
+        let missing = TempFile::new("repair-missing");
+        assert!(!missing.path().exists());
+        let fixed = repair_environments_setup(missing.path()).unwrap();
+        assert_eq!(load_environments(missing.path()).unwrap(), vec![]);
+        assert!(
+            fixed
+                .iter()
+                .any(|line| line.contains("empty Environment list")),
+            "{fixed:?}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(missing.path()).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn repair_secures_a_lax_mode_and_leaves_content_alone() {
+        let file = write_temp(&one_environment("https://acme.example.service-now.com"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(file.path(), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let fixed = repair_environments_setup(file.path()).unwrap();
+        assert_eq!(load_environments(file.path()).unwrap().len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(file.path()).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(fixed.iter().any(|line| line.contains("0600")), "{fixed:?}");
+    }
+
+    #[test]
+    fn repair_never_rewrites_an_unparsable_file() {
+        let file = write_temp("{not json");
+        let before = fs::read(file.path()).unwrap();
+        let _ = repair_environments_setup(file.path()).unwrap();
+        assert_eq!(fs::read(file.path()).unwrap(), before);
+        assert!(load_environments(file.path()).is_err());
     }
 
     /// Operator-run check for plan 080: an item created by this binary reads

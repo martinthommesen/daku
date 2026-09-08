@@ -13,7 +13,7 @@ fn main() -> anyhow::Result<()> {
         return run_probe_availability();
     }
     if arguments.doctor {
-        return run_doctor_command();
+        return run_doctor_command(arguments.doctor_fix);
     }
     let auth = require_token(std::env::var(DAEMON_TOKEN_ENV))?;
     // The bearer capability belongs only to this server process. Remove it
@@ -123,7 +123,13 @@ fn run_probe_availability() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_doctor_command() -> anyhow::Result<()> {
+fn run_doctor_command(fix: bool) -> anyhow::Result<()> {
+    let environments_path = daku_core::default_environments_path();
+    if fix {
+        for line in daku_core::config::repair_environments_setup(&environments_path)? {
+            println!("fix: {line}");
+        }
+    }
     let settings =
         daku_core::DaemonSettingsStore::open(daku_core::DaemonSettingsStore::default_path())
             .context("could not load daemon settings")?
@@ -161,7 +167,8 @@ fn doctor_exit_code(rows: &[daku_core::DoctorRow]) -> i32 {
 
 fn format_doctor_row(row: &daku_core::DoctorRow) -> String {
     let credential = match (row.credential_present, &row.credential_error) {
-        (true, _) => "credential: present".to_owned(),
+        (true, None) => "credential: present".to_owned(),
+        (true, Some(error)) => format!("credential: present ({error})"),
         (false, None) => "credential: MISSING (Keychain service daku, account = id)".to_owned(),
         (false, Some(error)) => format!("credential: ERROR {error}"),
     };
@@ -203,6 +210,7 @@ struct Arguments {
     allow_non_loopback: bool,
     probe_availability: bool,
     doctor: bool,
+    doctor_fix: bool,
 }
 
 impl Arguments {
@@ -213,6 +221,7 @@ impl Arguments {
         let mut allow_non_loopback = false;
         let mut probe_availability = false;
         let mut doctor = false;
+        let mut doctor_fix = false;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -221,6 +230,9 @@ impl Arguments {
                 }
                 "doctor" => {
                     doctor = true;
+                }
+                "--fix" => {
+                    doctor_fix = true;
                 }
                 "--bind" => {
                     bind = arguments
@@ -248,13 +260,16 @@ impl Arguments {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [probe-availability] [doctor] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]...",
+                        "usage: {} [probe-availability] [doctor [--fix]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]...",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
                 }
                 unknown => bail!("unknown argument {unknown:?}"),
             }
+        }
+        if doctor_fix && !doctor {
+            bail!("--fix requires doctor");
         }
         Ok(Self {
             bind,
@@ -263,6 +278,7 @@ impl Arguments {
             allow_non_loopback,
             probe_availability,
             doctor,
+            doctor_fix,
         })
     }
 }
@@ -340,6 +356,14 @@ mod tests {
     fn parses_doctor() {
         let arguments = Arguments::parse(["doctor".into()]).unwrap();
         assert!(arguments.doctor);
+        assert!(!arguments.doctor_fix);
+    }
+
+    #[test]
+    fn parses_doctor_fix_and_rejects_bare_fix() {
+        let arguments = Arguments::parse(["doctor".into(), "--fix".into()]).unwrap();
+        assert!(arguments.doctor_fix);
+        assert!(Arguments::parse(["--fix".into()]).is_err());
     }
 
     fn doctor_row(credential_present: bool) -> daku_core::DoctorRow {
@@ -372,6 +396,20 @@ mod tests {
             format_doctor_row(&doctor_row(true)).contains("thresholds jobs"),
             "doctor prints effective thresholds"
         );
+    }
+
+    #[test]
+    fn format_doctor_row_shows_shape_problems_without_secrets() {
+        let row = daku_core::DoctorRow {
+            credential_error: Some(
+                "shape: credential does not match its auth method (needs username and password)"
+                    .into(),
+            ),
+            ..doctor_row(true)
+        };
+        let line = format_doctor_row(&row);
+        assert!(line.contains("credential: present (shape:"), "{line}");
+        assert!(!line.contains("client_secret") && !line.contains("password="));
     }
 
     #[test]

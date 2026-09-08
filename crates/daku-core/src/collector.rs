@@ -513,8 +513,17 @@ pub fn run_doctor(
     let rows = environments
         .iter()
         .map(|environment| {
+            // Presence is not health: a blob whose shape does not match
+            // `auth_method` reads as present-with-a-shape-problem, so the row
+            // no longer misleads as `credential: present` plus `unreachable`.
+            // Shape errors never echo the blob (pinned by test).
             let (credential_present, credential_error) = match credentials.get(&environment.id) {
-                Ok(Some(_)) => (true, None),
+                Ok(Some(blob)) => {
+                    match daku_protocol::validate_credential(environment.auth_method, &blob) {
+                        Ok(()) => (true, None),
+                        Err(shape) => (true, Some(format!("shape: {shape}"))),
+                    }
+                }
                 Ok(None) => (false, None),
                 Err(error) => (false, Some(error.to_string())),
             };
@@ -1160,6 +1169,45 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0, "doctor must not write snapshots");
+    }
+
+    #[test]
+    fn doctor_flags_a_credential_whose_shape_mismatches_its_method() {
+        let db = TempDb::new("doctor-shape");
+        let environments = TempFile::with_contents(
+            "doctor-shape",
+            serde_json::to_vec(&[serde_json::json!({
+                "id": "prod",
+                "label": "Production",
+                "instance_url": prod().instance_url,
+                "auth_method": "basic",
+                "sort_order": 0,
+            })])
+            .unwrap(),
+        );
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        // OAuth blob on a basic Environment: present, but the wrong shape.
+        credentials.insert(
+            "prod",
+            r#"{"client_id":"id","client_secret":"s3cr3t-value"}"#,
+        );
+        let row = run_doctor(
+            environments.path(),
+            &DaemonSettings::default(),
+            credentials,
+            ServiceNowClient::new(FixtureTransport, SystemClock),
+            db.store(),
+        )
+        .unwrap()
+        .rows
+        .remove(0);
+        assert!(row.credential_present);
+        let error = row.credential_error.expect("shape problem");
+        assert!(error.contains("username and password"), "{error}");
+        assert!(
+            !error.contains("s3cr3t-value"),
+            "shape errors never echo the blob: {error}"
+        );
     }
     #[test]
     fn start_default_loop_returns_none_for_missing_and_empty_config() {
