@@ -13,6 +13,7 @@ pub mod last_clone;
 pub mod mid_ecc;
 pub mod outbound;
 pub mod persistence;
+pub mod scan;
 pub mod servicenow;
 pub mod sessions;
 pub mod settings;

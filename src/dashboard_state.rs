@@ -7,7 +7,7 @@ use daku_protocol::{
     RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
 };
 
-pub const SIGNAL_IDS: [&str; 14] = [
+pub const SIGNAL_IDS: [&str; 15] = [
     "availability",
     "jobs",
     "syslog",
@@ -20,6 +20,7 @@ pub const SIGNAL_IDS: [&str; 14] = [
     "table_growth",
     "slow_txn",
     "update_sets",
+    "scan",
     "drift",
     "last_clone",
 ];
@@ -45,6 +46,7 @@ pub fn signal_label(signal_id: &str) -> &'static str {
         "table_growth" => "Table growth",
         "slow_txn" => "Slow transactions",
         "update_sets" => "Update sets",
+        "scan" => "Instance Scan",
         "drift" => "Version / plugins",
         "last_clone" => "Last clone",
         _ => "Signal",
@@ -555,6 +557,7 @@ impl DashboardState {
                 "/syslog_transaction_list.do?sysparm_query=sys_created_on>javascript:gs.hoursAgoStart(1)"
             }
             "update_sets" => "/sys_update_set_list.do",
+            "scan" => "/scan_finding_list.do",
             "drift" => "/v_plugin_list.do",
             "last_clone" => "/clone_instance_list.do",
             _ => return None,
@@ -691,6 +694,9 @@ impl DashboardState {
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "update_sets" => self
                 .update_sets_rows(value)
+                .unwrap_or_else(|| self.drill_in_text(signal_id)),
+            "scan" => self
+                .scan_rows(value)
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "availability" => self.drill_in_trend(signal_id, now),
             _ => self.drill_in_text(signal_id),
@@ -1012,6 +1018,37 @@ impl DashboardState {
                 })
                 .collect(),
             truncated: value.get("open_rows_truncated") == Some(&serde_json::Value::Bool(true))
+                || list.len() > DRILL_IN_ROW_LIMIT,
+        })
+    }
+
+    /// Open Instance Scan findings. Each row links its `scan_finding` record.
+    fn scan_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let list = value
+            .get("finding_rows")
+            .and_then(|item| item.as_array())
+            .filter(|list| !list.is_empty())?;
+        Some(DrillIn::Rows {
+            headers: vec!["Priority", "State", "Updated"],
+            rows: list
+                .iter()
+                .take(DRILL_IN_ROW_LIMIT)
+                .map(|entry| {
+                    let sys_id = entry
+                        .get("sys_id")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("");
+                    DrillInRow {
+                        cells: vec![
+                            cell(entry, "priority"),
+                            cell(entry, "state"),
+                            cell(entry, "sys_updated_on"),
+                        ],
+                        link: self.record_url("scan_finding", sys_id),
+                    }
+                })
+                .collect(),
+            truncated: value.get("finding_rows_truncated") == Some(&serde_json::Value::Bool(true))
                 || list.len() > DRILL_IN_ROW_LIMIT,
         })
     }
@@ -1647,6 +1684,23 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 format!("{open} open update sets")
             }
         }
+        "scan" => {
+            let p1 = value
+                .get("p1_open")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0);
+            let p2 = value
+                .get("p2_open")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0);
+            if p1 > 0 {
+                format!("{p1} P1 · {p2} P2")
+            } else if p2 > 0 {
+                format!("{p2} P2 · no P1")
+            } else {
+                "no open findings".into()
+            }
+        }
         "drift" => {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
                 "source of truth".into()
@@ -1710,6 +1764,7 @@ fn detail_from_value(signal_id: &str, value: &serde_json::Value) -> String {
             "clone_source_cannot_list_clones" => "clone source cannot list clones".to_owned(),
             "clone_source_unreachable" => "clone source unreachable".to_owned(),
             "clone_source_asleep" => "clone source asleep".to_owned(),
+            "scan_unavailable" => "Instance Scan unavailable".to_owned(),
             other => other.to_owned(),
         };
     }
@@ -1807,6 +1862,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "table_growth",
                 "txn_slow",
                 "update_sets_open",
+                "scan_open",
                 "drift_source",
             ]
             .map(pinned)
@@ -1827,6 +1883,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "table_growth_quiet",
                 "txn_ok",
                 "update_sets_clean",
+                "scan_clean",
                 "drift_compare",
                 "last_clone_target_completed",
             ]
@@ -1975,7 +2032,7 @@ mod tests {
     /// `card_summary`, `card_detail`). Add a pinned case there and
     /// `pinned_payloads_render` fails until it is listed here — that is the
     /// point of the pin.
-    const RENDERED: [(&str, &str, &str); 41] = [
+    const RENDERED: [(&str, &str, &str); 43] = [
         ("availability_asleep", "142 ms", ""),
         // The build string is shown with the plugin inventory (drift), not
         // under the latency number.
@@ -2020,6 +2077,8 @@ mod tests {
         ("txn_ok", "118 ms avg \u{b7} last hour", ""),
         ("update_sets_open", "2 open update sets", ""),
         ("update_sets_clean", "no open update sets", ""),
+        ("scan_open", "1 P1 \u{b7} 1 P2", ""),
+        ("scan_clean", "no open findings", ""),
         ("skipped_asleep", "", "Environment asleep"),
         ("skipped_clone_source_asleep", "", "clone source asleep"),
         (
@@ -2215,7 +2274,13 @@ mod tests {
                 .any(|line| line.contains("Update sets: degraded")),
             "{text}"
         );
-        assert_eq!(lines.len(), 16, "{text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Instance Scan: degraded")),
+            "{text}"
+        );
+        assert_eq!(lines.len(), 17, "{text}");
     }
 
     #[test]
@@ -2569,6 +2634,42 @@ mod tests {
                         cells: vec!["Fix flow".to_owned(), "2026-01-26 00:12:00".to_owned(),],
                         link: Some(
                             "https://prod.example.service-now.com/sys_update_set.do?sys_id=us-2"
+                                .to_owned()
+                        ),
+                    },
+                ],
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drill_in_lists_open_findings_with_record_links() {
+        let state = loaded();
+        assert_eq!(
+            state.drill_in("scan", TEST_NOW),
+            DrillIn::Rows {
+                headers: vec!["Priority", "State", "Updated"],
+                rows: vec![
+                    DrillInRow {
+                        cells: vec![
+                            "P1".to_owned(),
+                            "Open".to_owned(),
+                            "2026-01-27 00:12:00".to_owned(),
+                        ],
+                        link: Some(
+                            "https://prod.example.service-now.com/scan_finding.do?sys_id=scan-1"
+                                .to_owned()
+                        ),
+                    },
+                    DrillInRow {
+                        cells: vec![
+                            "P2".to_owned(),
+                            "Open".to_owned(),
+                            "2026-01-26 00:12:00".to_owned(),
+                        ],
+                        link: Some(
+                            "https://prod.example.service-now.com/scan_finding.do?sys_id=scan-2"
                                 .to_owned()
                         ),
                     },

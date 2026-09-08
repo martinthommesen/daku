@@ -1135,6 +1135,11 @@ impl Daku {
                             cx,
                         ))
                         .child(EnvSheet::field_row(
+                            "Scan P1 findings ≥",
+                            &sheet.threshold_scan,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
                             "Unhealthy MIDs ≥",
                             &sheet.threshold_mid,
                             cx,

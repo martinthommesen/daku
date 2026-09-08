@@ -26,6 +26,7 @@ use crate::last_clone::{
 use crate::mid_ecc::{MID_ECC_SIGNAL_ID, MidEccCollector};
 use crate::outbound::{OUTBOUND_SIGNAL_ID, OutboundCollector};
 use crate::persistence;
+use crate::scan::{SCAN_SIGNAL_ID, ScanCollector};
 use crate::servicenow::{HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock};
 use crate::sessions::{SESSIONS_SIGNAL_ID, SessionsCollector};
 use crate::syslog::{SYSLOG_SIGNAL_ID, SyslogCollector};
@@ -178,6 +179,18 @@ impl HttpTransport for ContractTransport {
             } else {
                 r#"{"result":[
                     {"sys_id":"us-3","name":"Shipped","state":"Complete","sys_updated_on":"2026-01-20 00:12:00"}
+                ]}"#
+            }
+        } else if url.contains("/api/now/table/scan_finding") {
+            if source {
+                r#"{"result":[
+                    {"sys_id":"scan-1","priority":"1","state":"Open","sys_updated_on":"2026-01-27 00:12:00"},
+                    {"sys_id":"scan-2","priority":"2 - High","state":"Open","sys_updated_on":"2026-01-26 00:12:00"},
+                    {"sys_id":"scan-3","priority":"1","state":"Fixed","sys_updated_on":"2026-01-20 00:12:00"}
+                ]}"#
+            } else {
+                r#"{"result":[
+                    {"sys_id":"scan-3","priority":"1","state":"Closed","sys_updated_on":"2026-01-20 00:12:00"}
                 ]}"#
             }
         } else if url.contains("/api/now/table/v_user_session") {
@@ -360,6 +373,12 @@ fn generate() -> BTreeMap<String, Value> {
             client(),
             db.store(),
         )),
+        Box::new(ScanCollector::new(
+            environments.clone(),
+            store.clone(),
+            client(),
+            db.store(),
+        )),
         Box::new(MidEccCollector::new(
             environments.clone(),
             store.clone(),
@@ -391,6 +410,8 @@ fn generate() -> BTreeMap<String, Value> {
         ("txn_ok", "test", TRANSACTION_SIGNAL_ID),
         ("update_sets_open", "prod", UPDATE_SETS_SIGNAL_ID),
         ("update_sets_clean", "test", UPDATE_SETS_SIGNAL_ID),
+        ("scan_open", "prod", SCAN_SIGNAL_ID),
+        ("scan_clean", "test", SCAN_SIGNAL_ID),
         ("mid_ecc_healthy", "prod", MID_ECC_SIGNAL_ID),
         ("mid_ecc_unhealthy", "test", MID_ECC_SIGNAL_ID),
     ] {
@@ -566,7 +587,7 @@ fn every_known_signal_has_a_pinned_case() {
     use crate::update_sets::UPDATE_SETS_SIGNAL_ID;
     use crate::upgrade::UPGRADE_SIGNAL_ID;
 
-    const KNOWN: [&str; 14] = [
+    const KNOWN: [&str; 15] = [
         AVAILABILITY_SIGNAL_ID,
         JOBS_SIGNAL_ID,
         SYSLOG_SIGNAL_ID,
@@ -579,6 +600,7 @@ fn every_known_signal_has_a_pinned_case() {
         TABLE_GROWTH_SIGNAL_ID,
         TRANSACTION_SIGNAL_ID,
         UPDATE_SETS_SIGNAL_ID,
+        SCAN_SIGNAL_ID,
         DRIFT_SIGNAL_ID,
         LAST_CLONE_SIGNAL_ID,
     ];

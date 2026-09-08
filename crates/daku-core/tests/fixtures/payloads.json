@@ -264,6 +264,39 @@
     "signal_id": "outbound",
     "state": "healthy"
   },
+  "scan_clean": {
+    "payload": {
+      "finding_rows": [],
+      "finding_rows_truncated": false,
+      "p1_open": 0,
+      "p2_open": 0
+    },
+    "signal_id": "scan",
+    "state": "healthy"
+  },
+  "scan_open": {
+    "payload": {
+      "finding_rows": [
+        {
+          "priority": "P1",
+          "state": "Open",
+          "sys_id": "scan-1",
+          "sys_updated_on": "2026-01-27 00:12:00"
+        },
+        {
+          "priority": "P2",
+          "state": "Open",
+          "sys_id": "scan-2",
+          "sys_updated_on": "2026-01-26 00:12:00"
+        }
+      ],
+      "finding_rows_truncated": false,
+      "p1_open": 1,
+      "p2_open": 1
+    },
+    "signal_id": "scan",
+    "state": "degraded"
+  },
   "sessions_count": {
     "payload": {
       "active_sessions": 3,

@@ -51,6 +51,7 @@ pub struct Thresholds {
     pub upgrade_failed_degraded_at: u64,
     pub transaction_avg_degraded_ms: Option<u64>,
     pub update_sets_open_degraded_at: u64,
+    pub scan_p1_degraded_at: u64,
     pub mid_unhealthy_degraded_at: u64,
     pub ecc_error_degraded_at: u64,
     pub ecc_output_ready_degraded_at: u64,
@@ -75,6 +76,7 @@ impl Default for Thresholds {
             // the backlog Signal is opt-in like email: `u64::MAX` never votes
             // until the Operator sets a ceiling.
             update_sets_open_degraded_at: u64::MAX,
+            scan_p1_degraded_at: 1,
             // Transaction slowness varies wildly per instance (PDI hardware vs
             // prod), so this Signal is opt-in like the availability RTT
             // ceiling: `None` never votes until the Operator sets a ceiling.
@@ -137,7 +139,7 @@ impl Thresholds {
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "off".to_owned());
         format!(
-            "jobs≥{}/err≥{} syslog≥{} outbound≥{} flow≥{} email≥{} upgrade≥{} updates≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{} txn>{}",
+            "jobs≥{}/err≥{} syslog≥{} outbound≥{} flow≥{} email≥{} upgrade≥{} updates≥{} scan≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{} txn>{}",
             self.jobs_overdue_degraded_at,
             off(self.jobs_error_degraded_at),
             self.syslog_error_degraded_at,
@@ -146,6 +148,7 @@ impl Thresholds {
             off(self.email_failure_degraded_at),
             self.upgrade_failed_degraded_at,
             off(self.update_sets_open_degraded_at),
+            self.scan_p1_degraded_at,
             self.mid_unhealthy_degraded_at,
             self.ecc_error_degraded_at,
             self.ecc_output_ready_degraded_at,

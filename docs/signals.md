@@ -1,9 +1,9 @@
 # Signal reference
 
-What the fourteen Signal cards measure, what makes each amber, what the
+What the fifteen Signal cards measure, what makes each amber, what the
 Operator can tune, and where each link lands. Code truth lives in
 `crates/daku-core/src/` (`availability.rs`, `jobs.rs`, `syslog.rs`,
-`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `sessions.rs`, `table_growth.rs`, `transaction.rs`, `update_sets.rs`, `drift.rs`, `last_clone.rs`); rendering truth
+`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `sessions.rs`, `table_growth.rs`, `transaction.rs`, `update_sets.rs`, `scan.rs`, `drift.rs`, `last_clone.rs`); rendering truth
 in `src/dashboard_state.rs`. Research hedges live in
 [`docs/research/servicenow-signals.md`](./research/servicenow-signals.md) —
 this page describes what shipped.
@@ -43,6 +43,7 @@ Shared semantics:
 | Table growth | whole-table Aggregate counts, 5 tables | never votes (informational) | point-in-time |
 | Slow transactions | `syslog_transaction` avg response time, 1 h | opt-in (`off` by default) | point-in-time |
 | Update sets | `sys_update_set` newest rows, open states | opt-in (`off` by default) | point-in-time |
+| Instance Scan | `scan_finding` newest rows, open P1/P2 | ≥1 P1 open | point-in-time |
 | Version / plugins | `sys_plugins` + `sys_store_app` vs clone source | any unexpected mismatch / build differs | point-in-time |
 | Last clone | `clone_instance` on the clone source | never votes (informational) | point-in-time |
 
@@ -205,6 +206,19 @@ sets"). Drill-in lists them with links into each record. Conflict
 detection via the CI/CD preview API is future work — previews are
 expensive, role-gated reads that do not belong in a 2-minute poll. Link:
 update-set list.
+
+## Instance Scan — outstanding P1/P2 findings
+
+The 50 newest `scan_finding` rows with the open ones counted by priority
+(P1 outstanding at its ceiling degrades, default 1; P2 is counted and
+listed but never votes alone). "Open" excludes closed/fixed/resolved/
+dismissed/ignored states; an empty state counts as open. Priority takes
+the leading digit (`1` and `1 - Critical` both read P1).
+
+Instances without the plugin read `skipped` ("Instance Scan unavailable"),
+not `down`: there is nothing to observe, and a permanent red card with no
+opt-out would be noise. A 403 still reads `down` — the table exists but
+the monitoring account cannot read it. No samples. Link: findings list.
 
 ## Version / plugins — drift across Environments
 
