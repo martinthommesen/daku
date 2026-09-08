@@ -12,9 +12,7 @@ use daku_protocol::{Reachability, ServerMessage, SignalState};
 use rusqlite::Connection;
 
 use crate::availability::{AvailabilityCollector, REACHABILITY_REUSE_SECS, recent_reachability};
-use crate::config::{
-    CredentialStore, EnvironmentConfig, KeychainCredentialStore, load_environments,
-};
+use crate::config::{CredentialStore, EnvironmentConfig, load_environments};
 use crate::drift::DriftCollector;
 use crate::health::publish_dashboard;
 use crate::jobs::JobsCollector;
@@ -414,6 +412,25 @@ pub fn start_default_loop(
     settings: &DaemonSettings,
     shutdown: Arc<AtomicBool>,
 ) -> Option<Receiver<ServerMessage>> {
+    start_default_loop_with_store(
+        environments_path,
+        store,
+        settings,
+        shutdown,
+        crate::config::default_credential_store(),
+    )
+}
+
+/// Same as [`start_default_loop`] with an explicit `CredentialStore`.
+/// Tests and `--credential-store file` pass their store here; production
+/// passes the Keychain store via [`start_default_loop`]'s default.
+pub fn start_default_loop_with_store(
+    environments_path: &Path,
+    store: StateStore,
+    settings: &DaemonSettings,
+    shutdown: Arc<AtomicBool>,
+    credentials: Arc<dyn CredentialStore>,
+) -> Option<Receiver<ServerMessage>> {
     let environments = match load_environments(environments_path) {
         Ok(environments) => environments,
         Err(error) => {
@@ -436,7 +453,7 @@ pub fn start_default_loop(
     let dashboard_store = store.clone();
     let loop_ = build_default_loop(
         environments,
-        Arc::new(KeychainCredentialStore),
+        credentials,
         store,
         Duration::from_secs(poll_interval_secs(settings)),
         ServiceNowClient::new(UreqTransport::default(), SystemClock),
@@ -456,10 +473,22 @@ pub fn start_default_loop(
 }
 
 pub fn probe_availability_once(environments_path: &Path, store: StateStore) -> anyhow::Result<()> {
+    probe_availability_once_with_store(
+        environments_path,
+        store,
+        crate::config::default_credential_store(),
+    )
+}
+
+pub fn probe_availability_once_with_store(
+    environments_path: &Path,
+    store: StateStore,
+    credentials: Arc<dyn CredentialStore>,
+) -> anyhow::Result<()> {
     let environments = load_environments(environments_path)?;
     let loop_ = build_default_loop(
         environments,
-        Arc::new(KeychainCredentialStore),
+        credentials,
         store,
         Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS),
         ServiceNowClient::new(UreqTransport::default(), SystemClock),

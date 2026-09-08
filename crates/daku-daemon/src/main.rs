@@ -10,10 +10,10 @@ use daku_protocol::{DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION};
 fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse(std::env::args().skip(1))?;
     if arguments.probe_availability {
-        return run_probe_availability();
+        return run_probe_availability(&arguments);
     }
     if arguments.doctor {
-        return run_doctor_command(arguments.doctor_fix);
+        return run_doctor_command(arguments.doctor_fix, &arguments);
     }
     let auth = require_token(std::env::var(DAEMON_TOKEN_ENV))?;
     // The bearer capability belongs only to this server process. Remove it
@@ -58,11 +58,12 @@ fn main() -> anyhow::Result<()> {
     let settings =
         daku_core::DaemonSettingsStore::open(daku_core::DaemonSettingsStore::default_path())
             .context("could not load daemon settings")?;
-    let dashboard_events = daku_core::start_default_loop(
+    let dashboard_events = daku_core::start_default_loop_with_store(
         &daku_core::default_environments_path(),
         store,
         &settings.get(),
         shutdown.clone(),
+        resolve_credential_store(&arguments),
     );
     daku_core::serve(
         listener,
@@ -71,7 +72,7 @@ fn main() -> anyhow::Result<()> {
             settings: daku_core::SettingsBackend::new(settings),
             environments: daku_core::environments::EnvironmentsBackend::new(
                 daku_core::default_environments_path(),
-                Arc::new(daku_core::config::KeychainCredentialStore),
+                resolve_credential_store(&arguments),
                 Arc::new(daku_core::servicenow::ServiceNowClient::new(
                     daku_core::servicenow::UreqTransport::default(),
                     daku_core::servicenow::SystemClock,
@@ -114,16 +115,41 @@ impl daku_core::Backend for CombinedBackend {
     }
 }
 
-fn run_probe_availability() -> anyhow::Result<()> {
+fn run_probe_availability(arguments: &Arguments) -> anyhow::Result<()> {
     let store = daku_core::persistence::StateStore::daemon(
         daku_core::persistence::StateStore::default_path(),
     );
-    daku_core::probe_availability_once(&daku_core::default_environments_path(), store)?;
+    daku_core::probe_availability_once_with_store(
+        &daku_core::default_environments_path(),
+        store,
+        resolve_credential_store(arguments),
+    )?;
     println!("availability probe complete");
     Ok(())
 }
 
-fn run_doctor_command(fix: bool) -> anyhow::Result<()> {
+fn resolve_credential_store(arguments: &Arguments) -> Arc<dyn daku_core::config::CredentialStore> {
+    let wants_file = arguments
+        .credential_store
+        .as_deref()
+        .is_some_and(|value| value == "file")
+        || (arguments.credential_store.is_none()
+            && matches!(
+                std::env::var(daku_core::CREDENTIAL_STORE_ENV).as_deref(),
+                Ok("file")
+            ));
+    if wants_file {
+        let path = arguments
+            .credential_file
+            .clone()
+            .unwrap_or_else(daku_core::default_credential_file_path);
+        Arc::new(daku_core::FileCredentialStore::new(path))
+    } else {
+        Arc::new(daku_core::config::KeychainCredentialStore)
+    }
+}
+
+fn run_doctor_command(fix: bool, arguments: &Arguments) -> anyhow::Result<()> {
     let environments_path = daku_core::default_environments_path();
     if fix {
         for line in daku_core::config::repair_environments_setup(&environments_path)? {
@@ -138,7 +164,7 @@ fn run_doctor_command(fix: bool) -> anyhow::Result<()> {
     let report = daku_core::run_doctor(
         &environments_path,
         &settings,
-        Arc::new(daku_core::config::KeychainCredentialStore),
+        resolve_credential_store(arguments),
         daku_core::servicenow::ServiceNowClient::new(
             daku_core::servicenow::UreqTransport::default(),
             daku_core::servicenow::SystemClock,
@@ -219,6 +245,8 @@ struct Arguments {
     probe_availability: bool,
     doctor: bool,
     doctor_fix: bool,
+    credential_store: Option<String>,
+    credential_file: Option<std::path::PathBuf>,
 }
 
 impl Arguments {
@@ -230,6 +258,8 @@ impl Arguments {
         let mut probe_availability = false;
         let mut doctor = false;
         let mut doctor_fix = false;
+        let mut credential_store = None;
+        let mut credential_file = None;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -246,6 +276,21 @@ impl Arguments {
                     bind = arguments
                         .next()
                         .ok_or_else(|| anyhow!("--bind requires an address"))?;
+                }
+                "--credential-store" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| anyhow!("--credential-store requires keychain or file"))?;
+                    if value != "keychain" && value != "file" {
+                        bail!("--credential-store must be keychain or file, got {value:?}");
+                    }
+                    credential_store = Some(value);
+                }
+                "--credential-file" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| anyhow!("--credential-file requires a path"))?;
+                    credential_file = Some(std::path::PathBuf::from(value));
                 }
                 "--parent-pid" => {
                     parent_pid = Some(
@@ -268,7 +313,7 @@ impl Arguments {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [probe-availability] [doctor [--fix]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]...",
+                        "usage: {} [probe-availability] [doctor [--fix]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -279,6 +324,9 @@ impl Arguments {
         if doctor_fix && !doctor {
             bail!("--fix requires doctor");
         }
+        if credential_file.is_some() && credential_store.as_deref() != Some("file") {
+            bail!("--credential-file requires --credential-store file");
+        }
         Ok(Self {
             bind,
             parent_pid,
@@ -287,6 +335,8 @@ impl Arguments {
             probe_availability,
             doctor,
             doctor_fix,
+            credential_store,
+            credential_file,
         })
     }
 }
@@ -372,6 +422,57 @@ mod tests {
         let arguments = Arguments::parse(["doctor".into(), "--fix".into()]).unwrap();
         assert!(arguments.doctor_fix);
         assert!(Arguments::parse(["--fix".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_credential_store_flags() {
+        let arguments = Arguments::parse([
+            "--credential-store".into(),
+            "file".into(),
+            "--credential-file".into(),
+            "/tmp/daku-creds.json".into(),
+        ])
+        .unwrap();
+        assert_eq!(arguments.credential_store.as_deref(), Some("file"));
+        assert_eq!(
+            arguments.credential_file,
+            Some(std::path::PathBuf::from("/tmp/daku-creds.json"))
+        );
+        assert!(Arguments::parse(["--credential-store".into(), "vault".into()]).is_err());
+        assert!(
+            Arguments::parse(["--credential-file".into(), "/tmp/x.json".into(),]).is_err(),
+            "--credential-file without --credential-store file is rejected"
+        );
+        let keychain_with_file = Arguments::parse([
+            "--credential-store".into(),
+            "keychain".into(),
+            "--credential-file".into(),
+            "/tmp/x.json".into(),
+        ]);
+        assert!(keychain_with_file.is_err());
+    }
+
+    #[test]
+    fn resolve_credential_store_prefers_explicit_flag_over_env() {
+        let path = std::env::temp_dir().join(format!("daku-resolve-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let file = Arguments::parse([
+            "--credential-store".into(),
+            "file".into(),
+            "--credential-file".into(),
+            path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let store = resolve_credential_store(&file);
+        store
+            .set("prod", r#"{"username":"u","password":"p"}"#)
+            .unwrap();
+        assert_eq!(
+            store.get("prod").unwrap().as_deref(),
+            Some(r#"{"username":"u","password":"p"}"#)
+        );
+        assert!(path.exists(), "file store writes to the flagged path");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn doctor_row(credential_present: bool) -> daku_core::DoctorRow {

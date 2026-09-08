@@ -1739,6 +1739,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fixture_events_cover_every_signal_id() {
+        use std::collections::HashSet;
+        let mut covered = HashSet::new();
+        for event in fixture_events() {
+            if let ServerMessage::SignalSnapshotsUpdated { snapshots, .. } = event {
+                for snapshot in snapshots {
+                    covered.insert(snapshot.signal_id.clone());
+                }
+            }
+        }
+        for signal_id in SIGNAL_IDS {
+            assert!(
+                covered.contains(signal_id),
+                "fixture_events() has no snapshot for {signal_id} — extend it alongside payloads.json"
+            );
+        }
+    }
+
     fn loaded() -> DashboardState {
         let mut state = DashboardState::new();
         state.set_connected(true);

@@ -106,7 +106,10 @@ release-time variables.
 | `DAKU_DAEMON_ADDRESS` | app (`src/daemon.rs`) | `host:port` or `ws://` URL of a daemon you run yourself; attach instead of spawning. Must be set together with `DAKU_DAEMON_TOKEN`. |
 | `DAKU_DAEMON_PATH` | app (`src/daemon.rs`), set by `scripts/dev.ts` | Path to the `daku-daemon` binary the app spawns. |
 | `DAKU_APP_EXECUTABLE` | set by the app for its daemon child (`crates/daku-client`) | Internal — not for Operators. |
-| `DAKU_DB_PATH` | `crates/daku-core` persistence | SQLite path override (default `~/.daku/app.db`). |
+| `DAKU_DB_PATH` | `crates/daku-core` persistence | SQLite path override (default `~/.daku/app.db`, or `DAKU_HOME/app.db`). |
+| `DAKU_HOME` | `crates/daku-core` config/persistence/settings | Home override for automation: every default daemon path (`environments.json`, `credentials.json`, `app.db`, `settings.json`) resolves under this dir instead of `~/.daku/`. |
+| `DAKU_CREDENTIAL_STORE` | daemon (`crates/daku-daemon`), `crates/daku-core` config | `file` selects the file store (`~/.daku/credentials.json`, `0600`); anything else selects the macOS Keychain (default). Test/automation and non-macOS hosts. |
+| `DAKU_CREDENTIAL_FILE` | `crates/daku-core` config | Path override for the file credential store (implies file-store use with `--credential-store file`; also honoured via `--credential-file`). |
 | `DAKU_UI_FIXTURE` | app (`src/dashboard_state.rs`) | `=1` loads fixture dashboard events; no ServiceNow calls. |
 | `DAKU_CHANNEL` | app (`src/updater.rs`) | `homebrew` disables Sparkle at runtime. |
 | `DAKU_FORCE_UPDATER` | app (`src/updater.rs`, debug builds) | `=1` runs the real Sparkle flow from a debug bundle. |

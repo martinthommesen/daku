@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, anyhow};
 
@@ -11,13 +11,46 @@ use daku_protocol::identity::DATA_DIRECTORY_NAME;
 
 pub const KEYCHAIN_SERVICE: &str = "daku";
 
-pub use daku_protocol::{AuthMethod, EnvironmentConfig, Thresholds};
+/// Env override for test/automation use: `DAKU_CREDENTIAL_STORE=file`
+/// selects the file store; any other value (or unset) selects the Keychain.
+pub const CREDENTIAL_STORE_ENV: &str = "DAKU_CREDENTIAL_STORE";
+/// Path override for the file store: `DAKU_CREDENTIAL_FILE`.
+pub const CREDENTIAL_FILE_ENV: &str = "DAKU_CREDENTIAL_FILE";
+/// Home override for tests/automation: `DAKU_HOME=<dir>` makes every default
+/// daemon path resolve under `<dir>` instead of `~/.daku/`, so `doctor` and
+/// the collector never touch the Operator's real home.
+pub const HOME_ENV: &str = "DAKU_HOME";
+/// File name for file-backed Credentials under `~/.daku/`.
+pub const CREDENTIAL_FILE_NAME: &str = "credentials.json";
 
-pub fn default_environments_path() -> PathBuf {
+/// Operator data directory: `DAKU_HOME` when set and non-empty, else
+/// `~/.daku/`.
+pub fn daku_home_dir() -> PathBuf {
+    if let Ok(path) = std::env::var(HOME_ENV)
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
     dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(format!(".{DATA_DIRECTORY_NAME}"))
-        .join("environments.json")
+}
+
+pub use daku_protocol::{AuthMethod, EnvironmentConfig, Thresholds};
+
+pub fn default_environments_path() -> PathBuf {
+    daku_home_dir().join("environments.json")
+}
+
+/// Default path for file-backed Credentials: `DAKU_CREDENTIAL_FILE` when set,
+/// else `<home>/credentials.json` (which itself respects `DAKU_HOME`).
+pub fn default_credential_file_path() -> PathBuf {
+    if let Ok(path) = std::env::var(CREDENTIAL_FILE_ENV)
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    daku_home_dir().join(CREDENTIAL_FILE_NAME)
 }
 
 pub fn load_environments(path: &Path) -> anyhow::Result<Vec<EnvironmentConfig>> {
@@ -159,6 +192,106 @@ impl CredentialStore for MemoryCredentialStore {
             .expect("credential map")
             .remove(environment_id);
         Ok(())
+    }
+}
+
+/// File-backed `CredentialStore` for tests, automation, and non-macOS hosts.
+///
+/// Holds the same per-Environment JSON blobs the Keychain store holds
+/// (`{"client_id","client_secret"}` for OAuth, `{"username","password"}` for
+/// basic), as a JSON object `{ "<id>": "<blob>", … }` at
+/// `~/.daku/credentials.json` (`0600`, parent `0700` when daku creates it).
+/// A missing file reads as empty; malformed JSON is an error naming the path
+/// (never the secret). Writes are atomic (tmp + rename).
+///
+/// Production default stays `KeychainCredentialStore`; select this store with
+/// `DAKU_CREDENTIAL_STORE=file` (plus optional `DAKU_CREDENTIAL_FILE`), or
+/// with the daemon's `--credential-store file [--credential-file <path>]`.
+pub struct FileCredentialStore {
+    path: PathBuf,
+}
+
+impl FileCredentialStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn read_map(&self) -> anyhow::Result<HashMap<String, String>> {
+        match fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {}", self.path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(error) => Err(anyhow!("reading {}: {error}", self.path.display())),
+        }
+    }
+
+    fn write_map(&self, map: &HashMap<String, String>) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let data = serde_json::to_vec_pretty(map).context("encoding credentials file")?;
+        let temporary = self.path.with_extension("json.tmp");
+        {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temporary)
+                .with_context(|| format!("writing {}", temporary.display()))?;
+            use std::io::Write as _;
+            file.write_all(&data)
+                .with_context(|| format!("writing {}", temporary.display()))?;
+        }
+        fs::rename(&temporary, &self.path)
+            .with_context(|| format!("replacing {}", self.path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("securing {}", self.path.display()))?;
+        }
+        Ok(())
+    }
+}
+
+impl CredentialStore for FileCredentialStore {
+    fn get(&self, environment_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.read_map()?.get(environment_id).cloned())
+    }
+
+    fn set(&self, environment_id: &str, secret: &str) -> anyhow::Result<()> {
+        let mut map = self.read_map()?;
+        map.insert(environment_id.to_owned(), secret.to_owned());
+        self.write_map(&map)
+            .with_context(|| format!("storing credential for {environment_id}"))
+    }
+
+    fn delete(&self, environment_id: &str) -> anyhow::Result<()> {
+        let mut map = self.read_map()?;
+        if map.remove(environment_id).is_none() {
+            return Ok(());
+        }
+        self.write_map(&map)
+            .with_context(|| format!("deleting credential for {environment_id}"))
+    }
+}
+
+/// Selects the daemon's `CredentialStore` from the environment:
+/// `DAKU_CREDENTIAL_STORE=file` (plus optional `DAKU_CREDENTIAL_FILE`)
+/// selects the file store; anything else selects the macOS Keychain store.
+pub fn default_credential_store() -> Arc<dyn CredentialStore> {
+    if matches!(std::env::var(CREDENTIAL_STORE_ENV).as_deref(), Ok("file")) {
+        Arc::new(FileCredentialStore::new(default_credential_file_path()))
+    } else {
+        Arc::new(KeychainCredentialStore)
     }
 }
 
@@ -494,5 +627,104 @@ mod tests {
             "environment test: instance_url must not contain a query or fragment"
         );
         assert!(validate_instance_url("test", "https://x.example.com/").is_ok());
+    }
+
+    fn file_store() -> (TempFile, FileCredentialStore) {
+        let file = TempFile::new("credentials");
+        let store = FileCredentialStore::new(file.path().to_path_buf());
+        (file, store)
+    }
+
+    #[test]
+    fn file_store_missing_file_reads_as_empty() {
+        let (_file, store) = file_store();
+        assert_eq!(store.get("prod").unwrap(), None);
+        // Deleting a missing id is not an error.
+        store.delete("prod").unwrap();
+    }
+
+    #[test]
+    fn file_store_round_trips_set_get_delete() {
+        let (_file, store) = file_store();
+        let basic = r#"{"username":"reader","password":"secret"}"#;
+        let oauth = r#"{"client_id":"id","client_secret":"secret"}"#;
+        store.set("dev", basic).unwrap();
+        store.set("prod", oauth).unwrap();
+        assert_eq!(store.get("dev").unwrap().as_deref(), Some(basic));
+        assert_eq!(store.get("prod").unwrap().as_deref(), Some(oauth));
+        // Rotation overwrites.
+        store.set("dev", oauth).unwrap();
+        assert_eq!(store.get("dev").unwrap().as_deref(), Some(oauth));
+        store.delete("dev").unwrap();
+        assert_eq!(store.get("dev").unwrap(), None);
+        assert_eq!(store.get("prod").unwrap().as_deref(), Some(oauth));
+        // A second handle on the same path sees the same data.
+        let reopened = FileCredentialStore::new(store.path().to_path_buf());
+        assert_eq!(reopened.get("prod").unwrap().as_deref(), Some(oauth));
+    }
+
+    #[test]
+    fn file_store_writes_0600_and_malformed_json_errors_without_secrets() {
+        let (_file, store) = file_store();
+        let secret = r#"{"username":"reader","password":"hunter2-unique"}"#;
+        store.set("dev", secret).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(store.path()).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "credential file must be owner-only"
+            );
+        }
+        std::fs::write(store.path(), "{not json").unwrap();
+        let error = format!("{:#}", store.get("dev").unwrap_err());
+        assert!(error.contains("parsing"), "{error}");
+        assert!(
+            !error.contains("hunter2-unique"),
+            "credential errors never echo the blob: {error}"
+        );
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn default_credential_file_path_respects_env_override() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let override_path = "/tmp/daku-test-credentials-override.json";
+        // SAFETY: serialized by ENV_LOCK; restored before returning.
+        unsafe { std::env::set_var(CREDENTIAL_FILE_ENV, override_path) };
+        unsafe { std::env::remove_var(HOME_ENV) };
+        assert_eq!(default_credential_file_path(), PathBuf::from(override_path));
+        unsafe { std::env::remove_var(CREDENTIAL_FILE_ENV) };
+        assert!(default_credential_file_path().ends_with(format!(".daku/{CREDENTIAL_FILE_NAME}")));
+    }
+
+    #[test]
+    fn daku_home_redirects_every_default_path() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let sandbox = std::env::temp_dir().join(format!("daku-home-{}", uuid::Uuid::new_v4()));
+        // SAFETY: serialized by ENV_LOCK; restored before returning.
+        unsafe { std::env::remove_var(CREDENTIAL_FILE_ENV) };
+        unsafe { std::env::set_var(HOME_ENV, &sandbox) };
+        assert_eq!(daku_home_dir(), sandbox);
+        assert_eq!(
+            default_environments_path(),
+            sandbox.join("environments.json")
+        );
+        assert_eq!(
+            default_credential_file_path(),
+            sandbox.join(CREDENTIAL_FILE_NAME)
+        );
+        assert_eq!(
+            crate::persistence::StateStore::default_path(),
+            sandbox.join("app.db")
+        );
+        assert_eq!(
+            crate::DaemonSettingsStore::default_path(),
+            sandbox.join("settings.json")
+        );
+        unsafe { std::env::remove_var(HOME_ENV) };
+        let _ = std::fs::remove_dir_all(sandbox);
     }
 }

@@ -386,3 +386,37 @@ fn pinned_payloads_match_what_the_collectors_write() {
         assert_eq!(pinned.get(name), Some(case), "{name}: {stale}");
     }
 }
+
+/// Every known Signal must have at least one pinned case, so a new Signal
+/// cannot land without fixture data for the desktop's `fixture_events()`.
+#[test]
+fn every_known_signal_has_a_pinned_case() {
+    use crate::availability::AVAILABILITY_SIGNAL_ID;
+    use crate::drift::DRIFT_SIGNAL_ID;
+    use crate::jobs::JOBS_SIGNAL_ID;
+    use crate::last_clone::LAST_CLONE_SIGNAL_ID;
+    use crate::mid_ecc::MID_ECC_SIGNAL_ID;
+    use crate::outbound::OUTBOUND_SIGNAL_ID;
+    use crate::syslog::SYSLOG_SIGNAL_ID;
+
+    const KNOWN: [&str; 7] = [
+        AVAILABILITY_SIGNAL_ID,
+        JOBS_SIGNAL_ID,
+        SYSLOG_SIGNAL_ID,
+        MID_ECC_SIGNAL_ID,
+        OUTBOUND_SIGNAL_ID,
+        DRIFT_SIGNAL_ID,
+        LAST_CLONE_SIGNAL_ID,
+    ];
+    let generated = generate();
+    let covered: std::collections::HashSet<&str> = generated
+        .values()
+        .filter_map(|case| case.get("signal_id")?.as_str())
+        .collect();
+    for signal_id in KNOWN {
+        assert!(
+            covered.contains(signal_id),
+            "no pinned payload case for signal {signal_id:?} — add one in generate()"
+        );
+    }
+}

@@ -11,7 +11,6 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use rusqlite::{Connection, TransactionBehavior, params};
 
 use daku_protocol::SignalState;
-use daku_protocol::identity::DATA_DIRECTORY_NAME;
 
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
@@ -127,17 +126,15 @@ pub struct StateStore {
 }
 
 impl StateStore {
-    /// Default DB path: `DAKU_DB_PATH`, else `~/.daku/app.db`.
+    /// Default DB path: `DAKU_DB_PATH`, else `<home>/app.db` where `<home>`
+    /// is `DAKU_HOME` when set, else `~/.daku/`.
     pub fn default_path() -> PathBuf {
         if let Ok(path) = std::env::var(DAKU_DB_PATH_ENV)
             && !path.is_empty()
         {
             return PathBuf::from(path);
         }
-        dirs::home_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join(format!(".{DATA_DIRECTORY_NAME}"))
-            .join("app.db")
+        crate::config::daku_home_dir().join("app.db")
     }
 
     pub fn daemon(path: PathBuf) -> Self {

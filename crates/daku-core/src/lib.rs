@@ -25,9 +25,14 @@ mod payload_contract;
 pub(crate) mod test_support;
 
 pub use collector::{
-    DoctorReport, DoctorRow, probe_availability_once, run_doctor, start_default_loop,
+    DoctorReport, DoctorRow, probe_availability_once, probe_availability_once_with_store,
+    run_doctor, start_default_loop, start_default_loop_with_store,
 };
-pub use config::default_environments_path;
+pub use config::{
+    CREDENTIAL_FILE_ENV, CREDENTIAL_FILE_NAME, CREDENTIAL_STORE_ENV, FileCredentialStore, HOME_ENV,
+    daku_home_dir, default_credential_file_path, default_credential_store,
+    default_environments_path,
+};
 pub use daku_protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, MAX_WIRE_MESSAGE_BYTES,

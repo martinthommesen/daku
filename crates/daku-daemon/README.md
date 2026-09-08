@@ -6,12 +6,12 @@ startup. Prints one JSON readiness record to stdout (address, protocol
 version, pid).
 
 ```text
-DAKU_DAEMON_TOKEN=<secret> daku-daemon --bind 127.0.0.1:0 [--parent-pid PID] [--allow-origin ORIGIN]...
-daku-daemon probe-availability
-daku-daemon doctor
+DAKU_DAEMON_TOKEN=<secret> daku-daemon --bind 127.0.0.1:0 [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]
+daku-daemon probe-availability [--credential-store file --credential-file PATH]
+daku-daemon doctor [--credential-store file --credential-file PATH]
 ```
 
-`probe-availability` loads `~/.daku/environments.json`, resolves Credentials from the macOS Keychain (service `daku`), and writes an Availability snapshot. It does not need `DAKU_DAEMON_TOKEN`.
+`probe-availability` loads `~/.daku/environments.json` (or `DAKU_HOME` when set), resolves Credentials from the macOS Keychain (service `daku`) or — with `--credential-store file` / `DAKU_CREDENTIAL_STORE=file` — from the file store (`~/.daku/credentials.json`, `0600`; override with `--credential-file` / `DAKU_CREDENTIAL_FILE`), and writes an Availability snapshot. It does not need `DAKU_DAEMON_TOKEN`.
 
 `doctor` prints one line per Environment (config, Credential presence — never the value —, reachability, build) and exits 1 if any Environment lacks a Credential or is unreachable. It writes nothing.
 

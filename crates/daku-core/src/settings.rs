@@ -18,12 +18,10 @@ pub struct DaemonSettingsStore {
 }
 
 impl DaemonSettingsStore {
-    /// `~/.daku/settings.json` (ADR-0007 data directory).
+    /// `<home>/settings.json` where `<home>` is `DAKU_HOME` when set, else
+    /// `~/.daku/` (ADR-0007 data directory).
     pub fn default_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join(format!(".{}", daku_protocol::identity::DATA_DIRECTORY_NAME))
-            .join("settings.json")
+        crate::config::daku_home_dir().join("settings.json")
     }
 
     pub fn open(path: PathBuf) -> io::Result<Self> {
