@@ -387,6 +387,9 @@ impl Daku {
     }
 
     fn test_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.env_sheet.as_ref().is_some_and(|sheet| sheet.busy) {
+            return;
+        }
         let Some((config, blob)) = self.validate_sheet(cx) else {
             cx.notify();
             return;
@@ -431,6 +434,9 @@ impl Daku {
     }
 
     fn save_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.env_sheet.as_ref().is_some_and(|sheet| sheet.busy) {
+            return;
+        }
         let Some((config, blob)) = self.validate_sheet(cx) else {
             cx.notify();
             return;
@@ -474,6 +480,9 @@ impl Daku {
     }
 
     fn delete_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.env_sheet.as_ref().is_some_and(|sheet| sheet.busy) {
+            return;
+        }
         let Some(sheet) = self.env_sheet.as_ref() else {
             return;
         };
