@@ -86,8 +86,11 @@ pub fn run() {
     };
     // Desktop preferences (mutes). Missing file mints defaults; a corrupt
     // file is fatal here so a mute is never silently dropped.
-    let settings = crate::persistence::load_or_create_app_settings()
-        .unwrap_or_else(|error| panic!("failed to load daku app settings: {error:#}"));
+    // Shared across windows so a mute set in one window appears in the other.
+    let settings = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::persistence::load_or_create_app_settings()
+            .unwrap_or_else(|error| panic!("failed to load daku app settings: {error:#}")),
+    ));
     // Notification click router (105): the delegate lives process-wide, the
     // shell pumps the receiver for Environment ids.
     let notify_clicks = crate::notifications::install_click_router();
@@ -129,7 +132,7 @@ pub fn run() {
             open_daku_window(
                 cx,
                 daemon,
-                &settings,
+                settings.clone(),
                 notify_clicks.clone(),
                 None,
                 WindowBounds::Windowed(Bounds::centered(
@@ -150,7 +153,7 @@ pub fn run() {
 pub(crate) fn open_daku_window(
     cx: &mut App,
     supervisor: Option<daku_client::DaemonSupervisor>,
-    settings: &crate::persistence::AppSettings,
+    settings: std::sync::Arc<std::sync::Mutex<crate::persistence::AppSettings>>,
     notify_clicks: Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<String>>>>,
     detached: Option<String>,
     window_bounds: WindowBounds,

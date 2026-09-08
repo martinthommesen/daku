@@ -47,7 +47,7 @@ const SIDEBAR_WIDTH: f32 = 220.0;
 pub struct Daku {
     state: DashboardState,
     supervisor: Option<DaemonSupervisor>,
-    settings: AppSettings,
+    settings: Arc<Mutex<AppSettings>>,
     /// Copy-summary confirmation, cleared ~2 s after ⌘⇧C.
     copied_flash: bool,
     /// Desktop boot time: health events observed before this record as seen
@@ -76,7 +76,7 @@ impl Daku {
         window: &mut Window,
         cx: &mut App,
         supervisor: Option<DaemonSupervisor>,
-        settings: AppSettings,
+        settings: Arc<Mutex<AppSettings>>,
         notify_clicks: Option<Arc<Mutex<mpsc::Receiver<String>>>>,
         detached: Option<String>,
     ) -> Entity<Self> {
@@ -84,7 +84,7 @@ impl Daku {
         let pinned = detached.clone();
         let entity = cx.new(|cx| {
             let mut state = DashboardState::new();
-            state.apply_mutes(&settings.mutes, unix_now());
+            state.apply_mutes(&settings.lock().expect("app settings").mutes, unix_now());
             if ui_fixture_enabled() {
                 state.set_connected(true);
                 state.apply_all(&fixture_events());
@@ -124,7 +124,9 @@ impl Daku {
         if let Some(id) = self.state.selected_id().map(str::to_owned) {
             let until = now.saturating_add(secs);
             self.state.set_mute(&id, until);
-            self.settings.mute_until(&id, until);
+            if let Ok(mut settings) = self.settings.lock() {
+                settings.mute_until(&id, until);
+            }
             self.persist_settings();
         }
         cx.notify();
@@ -133,15 +135,31 @@ impl Daku {
     fn unmute_selected(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.state.selected_id().map(str::to_owned) {
             self.state.clear_mute(&id);
-            self.settings.unmute(&id);
+            if let Ok(mut settings) = self.settings.lock() {
+                settings.unmute(&id);
+            }
             self.persist_settings();
         }
         cx.notify();
     }
 
     fn persist_settings(&self) {
-        if let Err(error) = save_app_settings(&self.settings) {
+        let snapshot = self
+            .settings
+            .lock()
+            .map(|settings| settings.clone())
+            .unwrap_or_default();
+        if let Err(error) = save_app_settings(&snapshot) {
             eprintln!("could not save daku app settings: {error:#}");
+        }
+    }
+
+    /// Re-reads the shared desktop preferences into this window's state.
+    /// Windows share one `Arc<Mutex<AppSettings>>`, so a mute set in one
+    /// window appears in the other on its next render or freshness tick.
+    fn sync_shared_settings(&mut self) {
+        if let Ok(settings) = self.settings.lock() {
+            self.state.apply_mutes(&settings.mutes, unix_now());
         }
     }
 
@@ -156,7 +174,12 @@ impl Daku {
         let (record, fire) = select_notification(env_id, events, &self.notify_seen, self.boot_now);
         self.notify_seen.extend(record);
         let Some(event) = fire else { return };
-        if !self.settings.notifications_enabled {
+        let notifications_enabled = self
+            .settings
+            .lock()
+            .map(|settings| settings.notifications_enabled)
+            .unwrap_or(true);
+        if !notifications_enabled {
             return;
         }
         if self.state.is_muted(env_id, unix_now()) {
@@ -636,6 +659,7 @@ fn listen_dashboard(supervisor: &DaemonSupervisor, pinned: Option<String>, cx: &
 
 impl Render for Daku {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_shared_settings();
         self.reflect_ambient();
         // A detached window whose Environment was deleted shows a tombstone
         // instead of silently following the dashboard's auto-reselect.
@@ -728,7 +752,9 @@ impl Render for Daku {
                 this.copy_summary(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleNotifications, _, cx| {
-                this.settings.notifications_enabled = !this.settings.notifications_enabled;
+                if let Ok(mut settings) = this.settings.lock() {
+                    settings.notifications_enabled = !settings.notifications_enabled;
+                }
                 this.persist_settings();
                 cx.notify();
             }))
@@ -746,7 +772,7 @@ impl Render for Daku {
                     gpui::size(gpui::px(1100.0), gpui::px(800.0)),
                     cx,
                 ));
-                let _ = crate::open_daku_window(cx, supervisor, &settings, None, Some(id), bounds);
+                let _ = crate::open_daku_window(cx, supervisor, settings, None, Some(id), bounds);
             }))
             .child(
                 TitleBar::new()
