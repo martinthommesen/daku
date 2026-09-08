@@ -7,7 +7,7 @@ use daku_protocol::{
     RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
 };
 
-pub const SIGNAL_IDS: [&str; 9] = [
+pub const SIGNAL_IDS: [&str; 10] = [
     "availability",
     "jobs",
     "syslog",
@@ -15,6 +15,7 @@ pub const SIGNAL_IDS: [&str; 9] = [
     "outbound",
     "flow",
     "email",
+    "upgrade",
     "drift",
     "last_clone",
 ];
@@ -35,6 +36,7 @@ pub fn signal_label(signal_id: &str) -> &'static str {
         "outbound" => "Outbound",
         "flow" => "Flow errors",
         "email" => "Email failures",
+        "upgrade" => "Upgrades",
         "drift" => "Version / plugins",
         "last_clone" => "Last clone",
         _ => "Signal",
@@ -538,6 +540,7 @@ impl DashboardState {
             "email" => {
                 "/sys_email_list.do?sysparm_query=type=send-failed^sys_created_on>javascript:gs.hoursAgoStart(1)"
             }
+            "upgrade" => "/sys_upgrade_history_list.do",
             "drift" => "/v_plugin_list.do",
             "last_clone" => "/clone_instance_list.do",
             _ => return None,
@@ -662,6 +665,9 @@ impl DashboardState {
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "email" => self
                 .email_rows(value)
+                .unwrap_or_else(|| self.drill_in_text(signal_id)),
+            "upgrade" => self
+                .upgrade_rows(value)
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "availability" => self.drill_in_trend(signal_id, now),
             _ => self.drill_in_text(signal_id),
@@ -855,6 +861,37 @@ impl DashboardState {
                 })
                 .collect(),
             truncated: value.get("error_rows_truncated") == Some(&serde_json::Value::Bool(true))
+                || list.len() > DRILL_IN_ROW_LIMIT,
+        })
+    }
+
+    /// Upgrade history rows. Each row links its `sys_upgrade_history` record.
+    fn upgrade_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let list = value
+            .get("upgrades")
+            .and_then(|item| item.as_array())
+            .filter(|list| !list.is_empty())?;
+        Some(DrillIn::Rows {
+            headers: vec!["From", "To", "Finished"],
+            rows: list
+                .iter()
+                .take(DRILL_IN_ROW_LIMIT)
+                .map(|entry| {
+                    let sys_id = entry
+                        .get("sys_id")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("");
+                    DrillInRow {
+                        cells: vec![
+                            cell(entry, "from_version"),
+                            cell(entry, "to_version"),
+                            cell(entry, "upgrade_finished"),
+                        ],
+                        link: self.record_url("sys_upgrade_history", sys_id),
+                    }
+                })
+                .collect(),
+            truncated: value.get("upgrades_truncated") == Some(&serde_json::Value::Bool(true))
                 || list.len() > DRILL_IN_ROW_LIMIT,
         })
     }
@@ -1399,6 +1436,22 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 .and_then(|item| item.as_u64())
                 .unwrap_or(0)
         ),
+        "upgrade" => {
+            if let Some(failed) = value.get("failed_7d").and_then(|item| item.as_u64())
+                && failed > 0
+            {
+                format!("{failed} failed · last 7d")
+            } else if let Some(to) = value.get("last_to").and_then(|item| item.as_str()) {
+                match value.get("last_age_days").and_then(|item| item.as_i64()) {
+                    Some(0) => format!("{to} · today"),
+                    Some(1) => format!("{to} · 1 day ago"),
+                    Some(days) => format!("{to} · {days} days ago"),
+                    None => to.to_owned(),
+                }
+            } else {
+                "no upgrades found".into()
+            }
+        }
         "drift" => {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
                 "source of truth".into()
@@ -1554,6 +1607,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "outbound_count",
                 "flow_count",
                 "email_count",
+                "upgrade_failed",
                 "drift_source",
             ]
             .map(pinned)
@@ -1569,6 +1623,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "down_probe_failed",
                 "flow_zero",
                 "email_zero",
+                "upgrade_clean",
                 "drift_compare",
                 "last_clone_target_completed",
             ]
@@ -1717,7 +1772,7 @@ mod tests {
     /// `card_summary`, `card_detail`). Add a pinned case there and
     /// `pinned_payloads_render` fails until it is listed here — that is the
     /// point of the pin.
-    const RENDERED: [(&str, &str, &str); 31] = [
+    const RENDERED: [(&str, &str, &str); 33] = [
         ("availability_asleep", "142 ms", ""),
         // The build string is shown with the plugin inventory (drift), not
         // under the latency number.
@@ -1752,6 +1807,8 @@ mod tests {
         ("flow_zero", "0 flow errors \u{b7} last hour", ""),
         ("email_count", "2 email failures \u{b7} last hour", ""),
         ("email_zero", "0 email failures \u{b7} last hour", ""),
+        ("upgrade_failed", "1 failed \u{b7} last 7d", ""),
+        ("upgrade_clean", "Zurich P1 \u{b7} today", ""),
         ("skipped_asleep", "", "Environment asleep"),
         ("skipped_clone_source_asleep", "", "clone source asleep"),
         (
@@ -1921,7 +1978,11 @@ mod tests {
                 .any(|line| line.contains("Email failures: healthy")),
             "{text}"
         );
-        assert_eq!(lines.len(), 11, "{text}");
+        assert!(
+            lines.iter().any(|line| line.contains("Upgrades: degraded")),
+            "{text}"
+        );
+        assert_eq!(lines.len(), 12, "{text}");
     }
 
     #[test]
@@ -2140,6 +2201,42 @@ mod tests {
                             .to_owned()
                     ),
                 }],
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drill_in_lists_upgrades_with_record_links() {
+        let state = loaded();
+        assert_eq!(
+            state.drill_in("upgrade", TEST_NOW),
+            DrillIn::Rows {
+                headers: vec!["From", "To", "Finished"],
+                rows: vec![
+                    DrillInRow {
+                        cells: vec![
+                            "Zurich P0".to_owned(),
+                            "Zurich P1".to_owned(),
+                            "2099-01-01 02:00:00".to_owned(),
+                        ],
+                        link: Some(
+                            "https://prod.example.service-now.com/sys_upgrade_history.do?sys_id=up-1"
+                                .to_owned()
+                        ),
+                    },
+                    DrillInRow {
+                        cells: vec![
+                            "Yokohama".to_owned(),
+                            "Zurich".to_owned(),
+                            "2020-01-01 02:00:00".to_owned(),
+                        ],
+                        link: Some(
+                            "https://prod.example.service-now.com/sys_upgrade_history.do?sys_id=up-0"
+                                .to_owned()
+                        ),
+                    },
+                ],
                 truncated: false,
             }
         );

@@ -1120,6 +1120,11 @@ impl Daku {
                             cx,
                         ))
                         .child(EnvSheet::field_row(
+                            "Failed upgrades ≥",
+                            &sheet.threshold_upgrade,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
                             "Unhealthy MIDs ≥",
                             &sheet.threshold_mid,
                             cx,

@@ -31,6 +31,7 @@ pub struct EnvSheet {
     pub threshold_outbound: Entity<InputState>,
     pub threshold_flow: Entity<InputState>,
     pub threshold_email: Entity<InputState>,
+    pub threshold_upgrade: Entity<InputState>,
     pub threshold_mid: Entity<InputState>,
     pub threshold_ecc_error: Entity<InputState>,
     pub threshold_ecc_queue: Entity<InputState>,
@@ -98,6 +99,12 @@ impl EnvSheet {
                 window,
                 cx,
                 &format_u64_threshold(defaults.email_failure_degraded_at),
+                false,
+            ),
+            threshold_upgrade: Self::field(
+                window,
+                cx,
+                &format_u64_threshold(defaults.upgrade_failed_degraded_at),
                 false,
             ),
             threshold_mid: Self::field(
@@ -183,6 +190,12 @@ impl EnvSheet {
                 &format_u64_threshold(env.thresholds.email_failure_degraded_at),
                 false,
             ),
+            threshold_upgrade: Self::field(
+                window,
+                cx,
+                &format_u64_threshold(env.thresholds.upgrade_failed_degraded_at),
+                false,
+            ),
             threshold_mid: Self::field(
                 window,
                 cx,
@@ -236,7 +249,7 @@ impl EnvSheet {
         }
     }
 
-    /// Parses the eleven threshold fields into effective values. Empty means
+    /// Parses the twelve threshold fields into effective values. Empty means
     /// default; `jobs_error`, `email` and `rtt` also accept `off`.
     pub fn thresholds_result(&self, cx: &App) -> Result<Thresholds, String> {
         parse_thresholds(&ThresholdTexts {
@@ -246,6 +259,7 @@ impl EnvSheet {
             outbound: self.threshold_outbound.read(cx).value().to_string(),
             flow: self.threshold_flow.read(cx).value().to_string(),
             email: self.threshold_email.read(cx).value().to_string(),
+            upgrade: self.threshold_upgrade.read(cx).value().to_string(),
             mid: self.threshold_mid.read(cx).value().to_string(),
             ecc_error: self.threshold_ecc_error.read(cx).value().to_string(),
             ecc_queue: self.threshold_ecc_queue.read(cx).value().to_string(),
@@ -324,7 +338,7 @@ fn parse_count_field(
         .map_err(|_| format!("{caption} must be a whole number or empty"))
 }
 
-/// The eleven threshold fields as edited text. One struct instead of eleven
+/// The twelve threshold fields as edited text. One struct instead of twelve
 /// positional arguments.
 pub struct ThresholdTexts {
     pub jobs_overdue: String,
@@ -333,6 +347,7 @@ pub struct ThresholdTexts {
     pub outbound: String,
     pub flow: String,
     pub email: String,
+    pub upgrade: String,
     pub mid: String,
     pub ecc_error: String,
     pub ecc_queue: String,
@@ -350,6 +365,7 @@ impl ThresholdTexts {
             outbound: String::new(),
             flow: String::new(),
             email: String::new(),
+            upgrade: String::new(),
             mid: String::new(),
             ecc_error: String::new(),
             ecc_queue: String::new(),
@@ -359,7 +375,7 @@ impl ThresholdTexts {
     }
 }
 
-/// Parses the eleven threshold fields. Empty means default; `jobs_error`,
+/// Parses the twelve threshold fields. Empty means default; `jobs_error`,
 /// `email` and `rtt` also accept `off` (never vote).
 pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
     let defaults = Thresholds::default();
@@ -410,6 +426,12 @@ pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
             &texts.email,
             defaults.email_failure_degraded_at,
             Some(u64::MAX),
+        )?,
+        upgrade_failed_degraded_at: parse_count_field(
+            "Failed upgrades",
+            &texts.upgrade,
+            defaults.upgrade_failed_degraded_at,
+            None,
         )?,
         mid_unhealthy_degraded_at: parse_count_field(
             "Unhealthy MIDs",
@@ -618,6 +640,7 @@ mod tests {
             outbound: "5".into(),
             flow: "4".into(),
             email: "3".into(),
+            upgrade: "2".into(),
             mid: "3".into(),
             ecc_error: "2".into(),
             ecc_queue: "500".into(),
@@ -630,6 +653,7 @@ mod tests {
         assert_eq!(parsed.syslog_error_degraded_at, 10);
         assert_eq!(parsed.flow_error_degraded_at, 4);
         assert_eq!(parsed.email_failure_degraded_at, 3);
+        assert_eq!(parsed.upgrade_failed_degraded_at, 2);
         assert_eq!(parsed.availability_rtt_degraded_ms, None);
         let rtt = ThresholdTexts {
             rtt: "500".into(),
@@ -670,6 +694,7 @@ mod tests {
             outbound: format_u64_threshold(tuned.outbound_failures_degraded_at),
             flow: format_u64_threshold(tuned.flow_error_degraded_at),
             email: format_u64_threshold(tuned.email_failure_degraded_at),
+            upgrade: format_u64_threshold(tuned.upgrade_failed_degraded_at),
             mid: format_u64_threshold(tuned.mid_unhealthy_degraded_at),
             ecc_error: format_u64_threshold(tuned.ecc_error_degraded_at),
             ecc_queue: format_u64_threshold(tuned.ecc_output_ready_degraded_at),

@@ -1,9 +1,9 @@
 # Signal reference
 
-What the nine Signal cards measure, what makes each amber, what the
+What the ten Signal cards measure, what makes each amber, what the
 Operator can tune, and where each link lands. Code truth lives in
 `crates/daku-core/src/` (`availability.rs`, `jobs.rs`, `syslog.rs`,
-`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `drift.rs`, `last_clone.rs`); rendering truth
+`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `drift.rs`, `last_clone.rs`); rendering truth
 in `src/dashboard_state.rs`. Research hedges live in
 [`docs/research/servicenow-signals.md`](./research/servicenow-signals.md) —
 this page describes what shipped.
@@ -38,6 +38,7 @@ Shared semantics:
 | Outbound | `sys_outbound_http_log` aggregate, 4xx+, 1 h | ≥1 failure | point-in-time |
 | Flow errors | `sys_flow_context` aggregate, state ERROR, 1 h | ≥1 error | point-in-time |
 | Email failures | `sys_email` aggregate, send-failed, 1 h | opt-in (`off` by default) | point-in-time |
+| Upgrades | `sys_upgrade_history` newest rows | ≥1 failed in 7 d | point-in-time |
 | Version / plugins | `sys_plugins` + `sys_store_app` vs clone source | any unexpected mismatch / build differs | point-in-time |
 | Last clone | `clone_instance` on the clone source | never votes (informational) | point-in-time |
 
@@ -128,6 +129,21 @@ Rows (only while non-zero, 10, newest first): subject, recipients, time.
 The error string stays out of the snapshot (it can carry addresses and
 message bodies). Each row links its `sys_email` record. Drill-in rows or
 text. Link: filtered mail list.
+
+## Upgrades — patch history with failure detection
+
+Newest `sys_upgrade_history` rows (10): from/to versions, state,
+start/finish. An unnoticed upgrade explains drift and new errors; a failed
+one needs action.
+
+Threshold: `upgrade_failed_degraded_at` (1) counts upgrades in the last 7
+days whose state reads as failed (`fail`/`error`/`cancel`/`abort`
+substring — exact choice values vary by release). Unknown states never
+vote; unreadable timestamps count fail-loud. No samples.
+
+Summary names the last target build with its age ("Zurich P1 · 3 days
+ago"), or "1 failed · last 7d", or "no upgrades found". Drill-in lists the
+rows with links into the history table. Link: upgrade-history list.
 
 ## Version / plugins — drift across Environments
 

@@ -337,5 +337,57 @@
     },
     "signal_id": "syslog",
     "state": "healthy"
+  },
+  "upgrade_clean": {
+    "payload": {
+      "failed_7d": 0,
+      "last_age_days": 0,
+      "last_finished": "2099-01-01 02:00:00",
+      "last_from": "Zurich P0",
+      "last_to": "Zurich P1",
+      "upgrades": [
+        {
+          "from_version": "Zurich P0",
+          "state": "Completed",
+          "sys_id": "up-1",
+          "to_version": "Zurich P1",
+          "upgrade_finished": "2099-01-01 02:00:00",
+          "upgrade_started": "2099-01-01 01:00:00"
+        }
+      ],
+      "upgrades_truncated": false
+    },
+    "signal_id": "upgrade",
+    "state": "healthy"
+  },
+  "upgrade_failed": {
+    "payload": {
+      "failed_7d": 1,
+      "last_age_days": 0,
+      "last_finished": "2099-01-01 02:00:00",
+      "last_from": "Zurich P0",
+      "last_to": "Zurich P1",
+      "upgrades": [
+        {
+          "from_version": "Zurich P0",
+          "state": "Failed",
+          "sys_id": "up-1",
+          "to_version": "Zurich P1",
+          "upgrade_finished": "2099-01-01 02:00:00",
+          "upgrade_started": "2099-01-01 01:00:00"
+        },
+        {
+          "from_version": "Yokohama",
+          "state": "Completed",
+          "sys_id": "up-0",
+          "to_version": "Zurich",
+          "upgrade_finished": "2020-01-01 02:00:00",
+          "upgrade_started": "2020-01-01 01:00:00"
+        }
+      ],
+      "upgrades_truncated": false
+    },
+    "signal_id": "upgrade",
+    "state": "degraded"
   }
 }

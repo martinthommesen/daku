@@ -101,8 +101,9 @@ fn first_label(host: &str) -> &str {
 /// Whole days between the clone and `observed_at`, comparing **date parts
 /// only** — the two clocks are different machines and hours of skew are
 /// irrelevant at day granularity. `None` when `completed` is not
-/// `YYYY-MM-DD HH:MM:SS`.
-fn age_days(completed: &str, observed_at: i64) -> Option<i64> {
+/// `YYYY-MM-DD HH:MM:SS`. Shared with the upgrade-history Signal, which ages
+/// `upgrade_finished` the same way.
+pub(crate) fn age_days(completed: &str, observed_at: i64) -> Option<i64> {
     let mut parts = completed.split(' ').next()?.split('-');
     let year = parts.next()?.parse::<i64>().ok()?;
     let month = parts.next()?.parse::<i64>().ok()?;
@@ -115,7 +116,7 @@ fn age_days(completed: &str, observed_at: i64) -> Option<i64> {
 
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
 /// `days_from_civil`).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let year_of_era = year - era * 400;

@@ -17,6 +17,7 @@ pub mod servicenow;
 pub mod settings;
 pub mod settings_backend;
 pub mod syslog;
+pub mod upgrade;
 
 mod server;
 

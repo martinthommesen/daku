@@ -48,6 +48,7 @@ pub struct Thresholds {
     pub outbound_failures_degraded_at: u64,
     pub flow_error_degraded_at: u64,
     pub email_failure_degraded_at: u64,
+    pub upgrade_failed_degraded_at: u64,
     pub mid_unhealthy_degraded_at: u64,
     pub ecc_error_degraded_at: u64,
     pub ecc_output_ready_degraded_at: u64,
@@ -67,6 +68,7 @@ impl Default for Thresholds {
             // notifications), so this Signal is opt-in: `u64::MAX` never
             // votes until the Operator sets a ceiling.
             email_failure_degraded_at: u64::MAX,
+            upgrade_failed_degraded_at: 1,
             mid_unhealthy_degraded_at: 1,
             ecc_error_degraded_at: 1,
             ecc_output_ready_degraded_at: 100,
@@ -121,13 +123,14 @@ impl Thresholds {
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "off".to_owned());
         format!(
-            "jobs≥{}/err≥{} syslog≥{} outbound≥{} flow≥{} email≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{}",
+            "jobs≥{}/err≥{} syslog≥{} outbound≥{} flow≥{} email≥{} upgrade≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{}",
             self.jobs_overdue_degraded_at,
             off(self.jobs_error_degraded_at),
             self.syslog_error_degraded_at,
             self.outbound_failures_degraded_at,
             self.flow_error_degraded_at,
             off(self.email_failure_degraded_at),
+            self.upgrade_failed_degraded_at,
             self.mid_unhealthy_degraded_at,
             self.ecc_error_degraded_at,
             self.ecc_output_ready_degraded_at,

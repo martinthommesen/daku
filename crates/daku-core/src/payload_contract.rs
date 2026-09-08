@@ -29,6 +29,7 @@ use crate::persistence;
 use crate::servicenow::{HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock};
 use crate::syslog::{SYSLOG_SIGNAL_ID, SyslogCollector};
 use crate::test_support::{TempDb, prod};
+use crate::upgrade::{UPGRADE_SIGNAL_ID, UpgradeCollector};
 
 const PINNED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/payloads.json");
 
@@ -109,6 +110,17 @@ impl HttpTransport for ContractTransport {
             r#"{"result":[
                 {"sys_id":"email-1","subject":"Approval requested","recipients":"owner@example.com","error_string":"SMTP 550","sys_created_on":"2026-01-27 00:12:00"}
             ]}"#
+        } else if url.contains("/api/now/table/sys_upgrade_history") {
+            if source {
+                r#"{"result":[
+                    {"sys_id":"up-1","from_version":"Zurich P0","to_version":"Zurich P1","state":"Failed","upgrade_started":"2099-01-01 01:00:00","upgrade_finished":"2099-01-01 02:00:00"},
+                    {"sys_id":"up-0","from_version":"Yokohama","to_version":"Zurich","state":"Completed","upgrade_started":"2020-01-01 01:00:00","upgrade_finished":"2020-01-01 02:00:00"}
+                ]}"#
+            } else {
+                r#"{"result":[
+                    {"sys_id":"up-1","from_version":"Zurich P0","to_version":"Zurich P1","state":"Completed","upgrade_started":"2099-01-01 01:00:00","upgrade_finished":"2099-01-01 02:00:00"}
+                ]}"#
+            }
         } else if url.contains("/api/now/table/ecc_agent") {
             if source {
                 include_str!("../tests/fixtures/mid_ecc/agents_healthy.json")
@@ -248,6 +260,12 @@ fn generate() -> BTreeMap<String, Value> {
             client(),
             db.store(),
         )),
+        Box::new(UpgradeCollector::new(
+            environments.clone(),
+            store.clone(),
+            client(),
+            db.store(),
+        )),
         Box::new(MidEccCollector::new(
             environments.clone(),
             store.clone(),
@@ -269,6 +287,8 @@ fn generate() -> BTreeMap<String, Value> {
         ("flow_zero", "test", FLOW_SIGNAL_ID),
         ("email_count", "prod", EMAIL_SIGNAL_ID),
         ("email_zero", "test", EMAIL_SIGNAL_ID),
+        ("upgrade_failed", "prod", UPGRADE_SIGNAL_ID),
+        ("upgrade_clean", "test", UPGRADE_SIGNAL_ID),
         ("mid_ecc_healthy", "prod", MID_ECC_SIGNAL_ID),
         ("mid_ecc_unhealthy", "test", MID_ECC_SIGNAL_ID),
     ] {
@@ -438,8 +458,9 @@ fn every_known_signal_has_a_pinned_case() {
     use crate::mid_ecc::MID_ECC_SIGNAL_ID;
     use crate::outbound::OUTBOUND_SIGNAL_ID;
     use crate::syslog::SYSLOG_SIGNAL_ID;
+    use crate::upgrade::UPGRADE_SIGNAL_ID;
 
-    const KNOWN: [&str; 9] = [
+    const KNOWN: [&str; 10] = [
         AVAILABILITY_SIGNAL_ID,
         JOBS_SIGNAL_ID,
         SYSLOG_SIGNAL_ID,
@@ -447,6 +468,7 @@ fn every_known_signal_has_a_pinned_case() {
         OUTBOUND_SIGNAL_ID,
         FLOW_SIGNAL_ID,
         EMAIL_SIGNAL_ID,
+        UPGRADE_SIGNAL_ID,
         DRIFT_SIGNAL_ID,
         LAST_CLONE_SIGNAL_ID,
     ];
