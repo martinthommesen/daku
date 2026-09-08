@@ -40,8 +40,9 @@ impl Backend for SettingsBackend {
             Command::SaveEnvironment { .. }
             | Command::DeleteEnvironment { .. }
             | Command::TestEnvironment { .. }
-            | Command::GetDigest { .. } => {
-                anyhow::bail!("environment management is served by EnvironmentsBackend")
+            | Command::GetDigest { .. }
+            | Command::AddHealthEventNote { .. } => {
+                anyhow::bail!("command is served by another backend")
             }
         }
     }

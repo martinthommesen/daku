@@ -12,6 +12,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Sizable as _, TitleBar, h_flex,
+    input::{Input, InputState},
     separator::Separator,
     sidebar::{
         Sidebar, SidebarCollapsible, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu,
@@ -37,8 +38,8 @@ use crate::ToggleSignalNotify;
 use crate::ToggleWeeklyDigest;
 use crate::dashboard_state::{
     DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase,
-    fixture_events, format_health_event, freshness, is_trend_signal, mute_remaining_label,
-    signal_label, ui_fixture_enabled,
+    fixture_events, freshness, is_trend_signal, mute_remaining_label, signal_label,
+    ui_fixture_enabled,
 };
 use crate::env_sheet::{EnvSheet, auth_label, build_config, credential_blob, credential_captions};
 use crate::notifications::{
@@ -56,6 +57,14 @@ pub struct Daku {
     copied_flash: bool,
     /// Export confirmation path, cleared ~4 s after ⌘⇧E.
     exported_path: Option<String>,
+    /// Recent-timeline search text. Read during render, so keystrokes
+    /// re-render through the input entity.
+    timeline_filter: Entity<InputState>,
+    /// Note editor input for the annotated timeline event, if any.
+    note_input: Entity<InputState>,
+    /// Health event awaiting annotation: (environment, observed_at, kind).
+    /// Signal rows take no notes.
+    note_target: Option<(String, i64, String)>,
     /// Desktop boot time: health events observed before this record as seen
     /// without firing, so launch/reconnect replays never storm.
     boot_now: i64,
@@ -100,6 +109,8 @@ impl Daku {
             if let Some(pinned) = pinned.as_deref() {
                 state.select(pinned);
             }
+            let timeline_filter = cx.new(|cx| InputState::new(window, cx).default_value(""));
+            let note_input = cx.new(|cx| InputState::new(window, cx).default_value(""));
             tick_freshness(cx);
             // Detached windows never pump clicks or post: the main window
             // owns notifications, so a second window cannot double-fire.
@@ -114,6 +125,9 @@ impl Daku {
                 settings,
                 copied_flash: false,
                 exported_path: None,
+                timeline_filter,
+                note_input,
+                note_target: None,
                 boot_now: unix_now(),
                 notify_seen: HashSet::new(),
                 last_ambient: None,
@@ -702,7 +716,10 @@ impl Daku {
         let dir = export_directory(&id, now);
         let wrote = std::fs::create_dir_all(&dir)
             .and_then(|_| {
-                std::fs::write(dir.join("snapshots.json"), self.state.export_snapshots_json())
+                std::fs::write(
+                    dir.join("snapshots.json"),
+                    self.state.export_snapshots_json(),
+                )
             })
             .and_then(|_| std::fs::write(dir.join("trends.csv"), self.state.export_trends_csv()))
             .and_then(|_| std::fs::write(dir.join("summary.md"), self.state.summary_text(now)))
@@ -1635,36 +1652,153 @@ impl Daku {
 
     /// Recent health/build transitions under the Signal cards. Omitted
     /// entirely without events — a fresh Environment shows no empty box.
-    fn recent_block(&self, cx: &App) -> Option<gpui::AnyElement> {
+    fn recent_block(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let now = unix_now();
-        let lines: Vec<String> = self
-            .state
-            .recent_events(5)
-            .iter()
-            .map(|event| format_health_event(event, now))
-            .collect();
-        if lines.is_empty() {
+        let query = self.timeline_filter.read(cx).value().to_string();
+        let entries = self.state.timeline(now, 20, &query);
+        let has_history = !self.state.timeline(now, 1, "").is_empty();
+        if !has_history && query.trim().is_empty() && self.note_target.is_none() {
             return None;
         }
-        Some(
-            v_flex()
-                .mx(px(22.0))
-                .mb(px(16.0))
-                .gap(px(2.0))
+        let mut block = v_flex().mx(px(22.0)).mb(px(16.0)).gap(px(2.0)).child(
+            h_flex()
+                .items_center()
+                .gap(px(8.0))
                 .child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child("Recent"),
                 )
-                .children(lines.into_iter().map(|line| {
+                .child(
                     div()
-                        .text_sm()
+                        .w(px(180.0))
+                        .child(Input::new(&self.timeline_filter).small()),
+                ),
+        );
+        for entry in entries {
+            let line = div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(entry.text.clone());
+            match entry.note_key.clone() {
+                Some((observed_at, kind)) => {
+                    let env_id = self.state.selected_id().unwrap_or_default().to_owned();
+                    let target = (env_id, observed_at, kind);
+                    block = block.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "timeline-{}-{}",
+                                observed_at, target.2
+                            )))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.note_target = Some(target.clone());
+                                cx.notify();
+                            }))
+                            .child(line),
+                    );
+                }
+                None => {
+                    block = block.child(line);
+                }
+            }
+        }
+        if let Some((env_id, observed_at, kind)) = self.note_target.clone() {
+            let label = format!("Note for {kind} event {}:", observed_at);
+            block = block
+                .child(
+                    div()
+                        .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(line)
-                }))
-                .into_any_element(),
-        )
+                        .child(label),
+                )
+                .child(Input::new(&self.note_input).small())
+                .child(
+                    h_flex()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .id("note-save")
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.save_note(
+                                        env_id.clone(),
+                                        observed_at,
+                                        kind.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }))
+                                .child("Save note"),
+                        )
+                        .child(
+                            div()
+                                .id("note-cancel")
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.note_target = None;
+                                    cx.notify();
+                                }))
+                                .child("Cancel"),
+                        ),
+                );
+        }
+        Some(block.into_any_element())
+    }
+
+    /// Saves the note editor as an annotation over the loopback RPC, then
+    /// clears the editor. Empty saves clear the annotation.
+    fn save_note(
+        &mut self,
+        env_id: String,
+        observed_at: i64,
+        kind: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let note = self.note_input.read(cx).value().to_string();
+        // The editor clears optimistically: rebuilding it needs the window,
+        // which does not outlive this call. An RPC failure logs to stderr
+        // and the next publish restores the un-annotated row.
+        self.note_target = None;
+        self.note_input = cx.new(|cx| InputState::new(window, cx).default_value(""));
+        cx.notify();
+        let Some(client) = self
+            .supervisor
+            .as_ref()
+            .map(|supervisor| supervisor.client())
+        else {
+            return;
+        };
+        let kind_parse = match kind.as_str() {
+            "health" => daku_protocol::HealthEventKind::Health,
+            _ => daku_protocol::HealthEventKind::Build,
+        };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    client.request(daku_protocol::Command::AddHealthEventNote {
+                        environment_id: env_id,
+                        observed_at,
+                        kind: kind_parse,
+                        note,
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |_, cx| {
+                if let Err(error) = result {
+                    eprintln!("daku note save failed: {error:#}");
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn render_detail(
@@ -1673,7 +1807,7 @@ impl Daku {
         drill_in: Option<gpui::AnyElement>,
         mute_controls: Option<gpui::AnyElement>,
         compare: Option<gpui::AnyElement>,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let selected = self.state.selected().cloned();
         div()
@@ -1998,6 +2132,17 @@ impl Daku {
                         }))
                         .child(label)
                 }))
+                .when_some(
+                    self.state.week_delta_label(signal_id, unix_now()),
+                    |element, delta| {
+                        element.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(delta),
+                        )
+                    },
+                )
                 .into_any_element(),
         )
     }

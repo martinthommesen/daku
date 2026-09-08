@@ -76,6 +76,8 @@ export const healthEvents = sqliteTable(
     toHealth: text("to_health").notNull(),
     /** Build string after the change; null for pure health transitions. */
     build: text("build"),
+    /** Operator annotation (Wave 5); null when unannotated. */
+    note: text("note"),
   },
   (table) => [
     primaryKey({
@@ -134,4 +136,52 @@ export const dashboardPublishState = sqliteTable(
     lastBuild: text("last_build"),
   },
   (table) => [primaryKey({ columns: [table.environmentId] })],
+);
+
+/**
+ * Per-Signal flap history (Wave 5): state transitions per Environment ×
+ * Signal, confirmed over two consecutive publishes like health events.
+ * Skipped ticks leave the streak untouched. Bounded like `healthEvents`.
+ */
+export const signalEvents = sqliteTable(
+  "signal_events",
+  {
+    environmentId: text("environment_id").notNull(),
+    signalId: text("signal_id").notNull(),
+    /** Event time, unix seconds. */
+    observedAt: integer("observed_at").notNull(),
+    /** State before the streak; null when the prior state is unknown. */
+    fromState: text("from_state"),
+    toState: text("to_state").notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.environmentId, table.signalId, table.observedAt],
+    }),
+    index("signal_events_by_env_signal_time").on(
+      table.environmentId,
+      table.signalId,
+      table.observedAt,
+    ),
+  ],
+);
+
+/**
+ * Last-published state per Environment × Signal, backing the two-publish
+ * confirmation for `signalEvents`. One row per pair, bounded.
+ */
+export const signalPublishState = sqliteTable(
+  "signal_publish_state",
+  {
+    environmentId: text("environment_id").notNull(),
+    signalId: text("signal_id").notNull(),
+    lastState: text("last_state").notNull(),
+    /** Consecutive publishes agreeing with `lastState`. */
+    consecutive: integer("consecutive").notNull(),
+    /** Value before the current streak; the `from_state` of the next event. */
+    previousState: text("previous_state"),
+  },
+  (table) => [
+    primaryKey({ columns: [table.environmentId, table.signalId] }),
+  ],
 );

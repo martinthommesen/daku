@@ -22,6 +22,13 @@
       "when": 1788773890851,
       "tag": "0002_lazy_vampiro",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1788862944694,
+      "tag": "0003_big_sister_grimm",
+      "breakpoints": true
     }
   ]
 }

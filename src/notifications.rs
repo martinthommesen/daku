@@ -335,6 +335,7 @@ mod tests {
             from_health: Some(from),
             to_health: to,
             build: None,
+            note: None,
         }
     }
 
@@ -345,6 +346,7 @@ mod tests {
             from_health: None,
             to_health: EnvironmentHealth::Healthy,
             build: Some("glide-1".into()),
+            note: None,
         }
     }
 

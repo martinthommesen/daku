@@ -127,6 +127,30 @@ impl daku_core::Backend for CombinedBackend {
                     days,
                 )?,
             }),
+            Command::AddHealthEventNote {
+                environment_id,
+                observed_at,
+                kind,
+                note,
+            } => {
+                // Notes are plain text, capped: the timeline renders one
+                // line, not an essay. Empty clears.
+                let note: String = note.chars().take(500).collect();
+                let updated = {
+                    let connection = self.digest_store.open()?;
+                    daku_core::persistence::annotate_health_event(
+                        &connection,
+                        &environment_id,
+                        observed_at,
+                        kind.as_str(),
+                        note.trim(),
+                    )?
+                };
+                if updated == 0 {
+                    anyhow::bail!("unknown health event for {environment_id}");
+                }
+                Ok(daku_protocol::ResponsePayload::Ack)
+            }
         }
     }
 }

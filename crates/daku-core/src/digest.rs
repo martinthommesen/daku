@@ -186,6 +186,7 @@ mod tests {
                     from_health: from.map(str::to_owned),
                     to_health: to.into(),
                     build: build.map(str::to_owned),
+                    note: None,
                 },
             )
             .unwrap();

@@ -49,7 +49,7 @@ pub use daku_protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, MAX_WIRE_MESSAGE_BYTES,
     PROTOCOL_VERSION, Reachability, Request, ResponseOutcome, ResponsePayload, RollupPoint,
-    RpcError, SamplePoint, ServerMessage, SignalSnapshotDto, SignalState,
+    RpcError, SamplePoint, ServerMessage, SignalEventDto, SignalSnapshotDto, SignalState,
 };
 pub use server::{Backend, ServerOptions, serve};
 pub use settings::{DaemonSettings, DaemonSettingsStore};

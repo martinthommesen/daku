@@ -99,6 +99,9 @@ impl Backend for EnvironmentsBackend {
             Command::GetDigest { .. } => {
                 bail!("digests are served by the digest handler")
             }
+            Command::AddHealthEventNote { .. } => {
+                bail!("notes are served by the digest handler")
+            }
         }
     }
 }

@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::environment::{AuthMethod, EnvironmentConfig, Thresholds};
 use crate::settings::DaemonSettings;
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "DAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "DAKU_DAEMON_ADDRESS";
@@ -84,6 +84,15 @@ pub enum Command {
         environment_id: String,
         /// Window in days, clamped to 1–90 by the handler.
         days: i64,
+    },
+    /// Attaches an Operator annotation to one health event (or clears it
+    /// with an empty note). Capped at 500 chars by the handler.
+    AddHealthEventNote {
+        environment_id: String,
+        observed_at: i64,
+        /// `health` or `build`.
+        kind: HealthEventKind,
+        note: String,
     },
 }
 
@@ -288,6 +297,20 @@ pub struct HealthEventDto {
     pub to_health: EnvironmentHealth,
     /// Build string after the change; `None` for pure health transitions.
     pub build: Option<String>,
+    /// Operator annotation; `None` when unannotated.
+    pub note: Option<String>,
+}
+
+/// One per-Signal state transition, confirmed over two consecutive
+/// publishes like health events.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalEventDto {
+    pub signal_id: String,
+    pub observed_at: i64,
+    /// State before the streak; `None` when the prior state is unknown.
+    pub from_state: Option<SignalState>,
+    pub to_state: SignalState,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -324,6 +347,10 @@ pub enum ServerMessage {
         environment_id: String,
         events: Vec<HealthEventDto>,
     },
+    SignalEventsUpdated {
+        environment_id: String,
+        events: Vec<SignalEventDto>,
+    },
     SignalRollupsUpdated {
         environment_id: String,
         signal_id: String,
@@ -349,6 +376,9 @@ impl ServerMessage {
             } => Some(format!("2:samples:{environment_id}:{signal_id}")),
             Self::HealthEventsUpdated { environment_id, .. } => {
                 Some(format!("3:health-events:{environment_id}"))
+            }
+            Self::SignalEventsUpdated { environment_id, .. } => {
+                Some(format!("3:signal-events:{environment_id}"))
             }
             Self::SignalRollupsUpdated {
                 environment_id,
@@ -572,7 +602,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_daku_domain() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]
@@ -640,6 +670,15 @@ mod tests {
         .expect("rollups key");
         assert_eq!(rollups, "4:rollups:prod:jobs");
         assert!(health_events < rollups);
+        let signal_events = ServerMessage::SignalEventsUpdated {
+            environment_id: "prod".into(),
+            events: Vec::new(),
+        }
+        .dashboard_cache_key()
+        .expect("signal events key");
+        assert_eq!(signal_events, "3:signal-events:prod");
+        assert!(health_events < signal_events);
+        assert!(signal_events < rollups);
         assert_eq!(ServerMessage::ShuttingDown.dashboard_cache_key(), None);
     }
 
@@ -653,6 +692,7 @@ mod tests {
                 from_health: Some(EnvironmentHealth::Healthy),
                 to_health: EnvironmentHealth::Degraded,
                 build: None,
+                note: Some("looking".into()),
             }],
         };
         let json = serde_json::to_value(&message).unwrap();
@@ -660,6 +700,7 @@ mod tests {
         assert_eq!(json["environmentId"], "prod");
         assert_eq!(json["events"][0]["kind"], "health");
         assert_eq!(json["events"][0]["toHealth"], "degraded");
+        assert_eq!(json["events"][0]["note"], "looking");
         let back: ServerMessage = serde_json::from_value(json).unwrap();
         match back {
             ServerMessage::HealthEventsUpdated {
@@ -677,6 +718,40 @@ mod tests {
             Some(HealthEventKind::Build)
         );
         assert_eq!(HealthEventKind::parse("bogus"), None);
+    }
+
+    #[test]
+    fn signal_events_updated_round_trips() {
+        let message = ServerMessage::SignalEventsUpdated {
+            environment_id: "prod".into(),
+            events: vec![SignalEventDto {
+                signal_id: "jobs".into(),
+                observed_at: 1_700_000_000,
+                from_state: Some(SignalState::Healthy),
+                to_state: SignalState::Degraded,
+            }],
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["type"], "signalEventsUpdated");
+        assert_eq!(json["events"][0]["signalId"], "jobs");
+        assert_eq!(json["events"][0]["fromState"], "healthy");
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, ServerMessage::SignalEventsUpdated { .. }));
+    }
+
+    #[test]
+    fn add_note_command_round_trips() {
+        let command = Command::AddHealthEventNote {
+            environment_id: "prod".into(),
+            observed_at: 1_700_000_000,
+            kind: HealthEventKind::Build,
+            note: "deploys".into(),
+        };
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["type"], "addHealthEventNote");
+        assert_eq!(json["note"], "deploys");
+        let back: Command = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, Command::AddHealthEventNote { .. }));
     }
 
     #[test]

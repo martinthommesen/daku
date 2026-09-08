@@ -4,7 +4,7 @@ use anyhow::Context;
 use crossbeam_channel::Sender;
 use daku_protocol::{
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, Reachability,
-    RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, SignalState,
+    RollupPoint, SamplePoint, ServerMessage, SignalEventDto, SignalSnapshotDto, SignalState,
 };
 
 use crate::availability::AVAILABILITY_SIGNAL_ID;
@@ -104,6 +104,7 @@ pub fn publish_dashboard(
             .find(|snapshot| snapshot.signal_id == AVAILABILITY_SIGNAL_ID)
             .and_then(|snapshot| wire_build(&snapshot.payload_json));
         record_health_and_build_events(&connection, &environment.id, health, build.clone(), now)?;
+        record_signal_events(&connection, &environment.id, &votes, now)?;
         published.push(Published {
             summary: EnvironmentSummary {
                 id: environment.id.clone(),
@@ -197,12 +198,32 @@ pub fn publish_dashboard(
                     .and_then(EnvironmentHealth::parse),
                 to_health: EnvironmentHealth::parse(&event.to_health)?,
                 build: event.build,
+                note: event.note.filter(|note| !note.trim().is_empty()),
             })
         })
         .collect();
         let _ = sink.send(ServerMessage::HealthEventsUpdated {
             environment_id: environment.id.clone(),
             events,
+        });
+        let signal_events = persistence::load_signal_events(
+            &connection,
+            &environment.id,
+            HEALTH_EVENT_PUBLISH_LIMIT,
+        )?
+        .into_iter()
+        .filter_map(|event| {
+            Some(SignalEventDto {
+                signal_id: event.signal_id,
+                observed_at: event.observed_at,
+                from_state: event.from_state.as_deref().and_then(SignalState::parse),
+                to_state: SignalState::parse(&event.to_state)?,
+            })
+        })
+        .collect();
+        let _ = sink.send(ServerMessage::SignalEventsUpdated {
+            environment_id: environment.id.clone(),
+            events: signal_events,
         });
     }
     Ok(())
@@ -257,6 +278,7 @@ fn record_health_and_build_events(
                         from_health: None,
                         to_health: current,
                         build: Some(build),
+                        note: None,
                     },
                 )?;
             }
@@ -285,6 +307,7 @@ fn record_health_and_build_events(
                         from_health: previous_health.clone(),
                         to_health: current.clone(),
                         build: None,
+                        note: None,
                     },
                 )?;
             }
@@ -298,6 +321,7 @@ fn record_health_and_build_events(
                         from_health: Some(state.last_health.clone()),
                         to_health: current.clone(),
                         build: build.clone(),
+                        note: None,
                     },
                 )?;
             }
@@ -314,6 +338,81 @@ fn record_health_and_build_events(
         }
     }
     persistence::prune_health_events(connection, environment_id, now)?;
+    Ok(())
+}
+
+/// Bounded per-Signal transition writes for one Environment publish.
+///
+/// Each non-skipped Signal gets the health treatment at its own grain: a
+/// state change becomes an event only after two consecutive publishes
+/// agree, so a single flap is not history. Skipped ticks leave the streak
+/// untouched, so an asleep Environment neither confirms nor breaks one.
+/// `previous_state` carries the value before the current streak as the
+/// event's `from`.
+fn record_signal_events(
+    connection: &rusqlite::Connection,
+    environment_id: &str,
+    votes: &[(&str, SignalState)],
+    now: i64,
+) -> anyhow::Result<()> {
+    for &(signal_id, state) in votes {
+        if state == SignalState::Skipped {
+            continue;
+        }
+        let current = state.as_str().to_owned();
+        match persistence::load_signal_publish_state(connection, environment_id, signal_id)? {
+            None => {
+                persistence::store_signal_publish_state(
+                    connection,
+                    environment_id,
+                    signal_id,
+                    &persistence::SignalPublishState {
+                        last_state: current,
+                        consecutive: 1,
+                        previous_state: None,
+                    },
+                )?;
+            }
+            Some(stored) => {
+                let (consecutive, previous_state) = if current == stored.last_state {
+                    (
+                        stored.consecutive.saturating_add(1),
+                        stored.previous_state.clone(),
+                    )
+                } else {
+                    (1, Some(stored.last_state.clone()))
+                };
+                if current == stored.last_state
+                    && consecutive == 2
+                    && previous_state
+                        .as_deref()
+                        .is_some_and(|previous| previous != current.as_str())
+                {
+                    persistence::record_signal_event(
+                        connection,
+                        &persistence::SignalEvent {
+                            environment_id: environment_id.into(),
+                            signal_id: signal_id.into(),
+                            observed_at: now,
+                            from_state: previous_state.clone(),
+                            to_state: current.clone(),
+                        },
+                    )?;
+                }
+                persistence::store_signal_publish_state(
+                    connection,
+                    environment_id,
+                    signal_id,
+                    &persistence::SignalPublishState {
+                        last_state: current,
+                        consecutive,
+                        previous_state,
+                    },
+                )?;
+            }
+        }
+    }
+    persistence::prune_signal_events(connection, environment_id, now)?;
     Ok(())
 }
 
@@ -500,6 +599,61 @@ mod tests {
         assert_eq!(published_health_events(&store, 400).len(), 1);
     }
 
+    /// Drives one Signal through healthy → degraded → degraded and returns
+    /// its published signal events, exercising the shared per-signal
+    /// two-publish confirmation (and the skipped-tick blind spot).
+    fn publish_signal(
+        store: &StateStore,
+        signal_id: &str,
+        state: SignalState,
+        now: i64,
+    ) -> Vec<persistence::SignalEvent> {
+        let connection = store.open().unwrap();
+        let votes = vec![("jobs", SignalState::Healthy), (signal_id, state)];
+        record_signal_events(&connection, "prod", &votes, now).unwrap();
+        let connection = store.open().unwrap();
+        persistence::load_signal_events(&connection, "prod", 100).unwrap()
+    }
+
+    #[test]
+    fn signal_events_confirm_over_two_publishes_and_skip_skipped_ticks() {
+        let db = TempDb::new("signal-confirm");
+        let store = db.store();
+        assert!(publish_signal(&store, "syslog", SignalState::Healthy, 100).is_empty());
+        // First degraded publish: streak starts, nothing recorded.
+        assert!(publish_signal(&store, "syslog", SignalState::Degraded, 200).is_empty());
+        // Second agreeing publish: one event naming the turn.
+        let events = publish_signal(&store, "syslog", SignalState::Degraded, 300);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].signal_id, "syslog");
+        assert_eq!(events[0].from_state.as_deref(), Some("healthy"));
+        assert_eq!(events[0].to_state, "degraded");
+        // A skipped tick leaves the streak untouched: no duplicate, and the
+        // recovery below still confirms against the streak.
+        assert_eq!(
+            publish_signal(&store, "syslog", SignalState::Skipped, 400).len(),
+            1
+        );
+        assert_eq!(
+            publish_signal(&store, "syslog", SignalState::Healthy, 500).len(),
+            1,
+            "single healthy publish after the skip is only streak-start"
+        );
+        let events = publish_signal(&store, "syslog", SignalState::Healthy, 600);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].from_state.as_deref(), Some("degraded"));
+        assert_eq!(events[1].to_state, "healthy");
+    }
+
+    #[test]
+    fn signal_flap_writes_no_signal_event() {
+        let db = TempDb::new("signal-flap");
+        let store = db.store();
+        assert!(publish_signal(&store, "syslog", SignalState::Healthy, 100).is_empty());
+        assert!(publish_signal(&store, "syslog", SignalState::Degraded, 200).is_empty());
+        assert!(publish_signal(&store, "syslog", SignalState::Healthy, 300).is_empty());
+    }
+
     #[test]
     fn first_observed_build_writes_a_bootstrap_event() {
         let db = TempDb::new("health-bootstrap");
@@ -661,6 +815,16 @@ mod tests {
                 } => {
                     assert_eq!(environment_id, "prod");
                     health_events = Some(events);
+                }
+                ServerMessage::SignalEventsUpdated {
+                    environment_id,
+                    events,
+                } => {
+                    assert_eq!(environment_id, "prod");
+                    assert!(
+                        events.is_empty(),
+                        "first publish only seeds per-signal streaks"
+                    );
                 }
                 ServerMessage::SignalRollupsUpdated {
                     environment_id,

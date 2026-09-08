@@ -41,7 +41,11 @@ A desktop preference (not daemon state) that silences attention surfaces for one
 _Avoid_: silence (verb), snooze, acknowledge (implies on-call semantics daku does not have)
 
 **Health event**:
-A bounded, persisted record that an Environment's rolled-up health changed (for two consecutive publishes, so a single flap is not an event) or that its build string changed, including a bootstrap event on the first build observed. Written by `publish_dashboard`, published as its own `ServerMessage`, replayed to late subscribers. Rendered in the Recent timeline.
+A bounded, persisted record that an Environment's rolled-up health changed (for two consecutive publishes, so a single flap is not an event) or that its build string changed, including a bootstrap event on the first build observed. Written by `publish_dashboard`, published as its own `ServerMessage`, replayed to late subscribers. Rendered in the Recent timeline. Carries one optional Operator annotation.
+_Avoid_: alert, incident, audit log
+
+**Signal event**:
+A bounded, persisted record that one Signal changed state, confirmed over two consecutive publishes like a health event. Skipped ticks leave streaks untouched. Merged into the Recent timeline beside health events.
 _Avoid_: alert, incident, audit log
 
 **Roll-up**:

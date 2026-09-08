@@ -236,6 +236,7 @@ mod tests {
                     from_health: Some("healthy".into()),
                     to_health: (*to).into(),
                     build: (*kind == "build").then(|| "glide-9".into()),
+                    note: None,
                 },
             )
             .unwrap();

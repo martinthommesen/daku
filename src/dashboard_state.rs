@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use daku_protocol::{
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, NON_VOTING_SIGNALS,
-    Reachability, RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto,
+    Reachability, RollupPoint, SamplePoint, ServerMessage, SignalEventDto, SignalSnapshotDto,
     is_supported_instance_url,
 };
 
@@ -187,6 +187,9 @@ pub struct DashboardState {
     /// Health-transition + build-change events per Environment, published by
     /// the daemon (`072`). Rendered by the Recent timeline (`077`).
     health_events: HashMap<String, Vec<HealthEventDto>>,
+    /// Per-Signal transitions per Environment (`signal_events`). Merged into
+    /// the Recent timeline beside health events.
+    signal_events: HashMap<String, Vec<SignalEventDto>>,
     /// Operator mutes: Environment id → unix seconds the attention surfaces
     /// stay silent. Mirrors `AppSettings::mutes`; the daemon keeps collecting.
     mutes: HashMap<String, i64>,
@@ -240,6 +243,16 @@ pub struct PlatformGroup {
     pub id: String,
     pub label: String,
     pub rows: Vec<SidebarRow>,
+}
+
+/// One merged Recent-timeline row. `note_key` is `(observed_at, kind)` for
+/// health events — the annotation target — and `None` for per-Signal rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineEntry {
+    pub observed_at: i64,
+    pub text: String,
+    pub note_key: Option<(i64, String)>,
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,6 +339,55 @@ impl DashboardState {
         events.iter().rev().take(limit).rev().cloned().collect()
     }
 
+    /// One merged Recent-timeline row: a health/build event or a per-Signal
+    /// transition, with its rendered text. `key` identifies the health event
+    /// for annotations (`None` for signal rows, which take none).
+    pub fn timeline(&self, now: i64, limit: usize, query: &str) -> Vec<TimelineEntry> {
+        let Some(id) = self.selected_id.as_deref() else {
+            return Vec::new();
+        };
+        let mut rows: Vec<TimelineEntry> = Vec::new();
+        for event in self.recent_events(usize::MAX) {
+            let mut text = format_health_event(&event, now);
+            if let Some(note) = event.note.as_deref().filter(|note| !note.trim().is_empty()) {
+                text.push_str(&format!(" · note: {note}"));
+            }
+            rows.push(TimelineEntry {
+                observed_at: event.observed_at,
+                text,
+                note_key: Some((event.observed_at, event.kind.as_str().to_owned())),
+                note: event.note.filter(|note| !note.trim().is_empty()),
+            });
+        }
+        if let Some(events) = self.signal_events.get(id) {
+            rows.extend(events.iter().map(|event| {
+                let from = event.from_state.map(|state| state.as_str()).unwrap_or("?");
+                TimelineEntry {
+                    observed_at: event.observed_at,
+                    text: format!(
+                        "{} {} → {}, {} ago",
+                        signal_label(&event.signal_id),
+                        from,
+                        event.to_state.as_str(),
+                        age_phrase(now.saturating_sub(event.observed_at))
+                    ),
+                    note_key: None,
+                    note: None,
+                }
+            }));
+        }
+        rows.sort_by_key(|row| row.observed_at);
+        let query = query.trim().to_lowercase();
+        let mut rows: Vec<TimelineEntry> = rows
+            .into_iter()
+            .filter(|row| query.is_empty() || row.text.to_lowercase().contains(&query))
+            .collect();
+        rows.reverse();
+        rows.truncate(limit);
+        rows.reverse();
+        rows
+    }
+
     /// The selected Environment's current build plus when daku first saw this
     /// build string (latest matching build event). `None` without a known
     /// build or without events yet — the header omits the line then.
@@ -403,6 +465,8 @@ impl DashboardState {
                     .retain(|(id, _), _| known.contains(id.as_str()));
                 self.health_events
                     .retain(|id, _| known.contains(id.as_str()));
+                self.signal_events
+                    .retain(|id, _| known.contains(id.as_str()));
                 self.rollups
                     .retain(|(id, _), _| known.contains(id.as_str()));
             }
@@ -441,6 +505,13 @@ impl DashboardState {
                 events,
             } => {
                 self.health_events
+                    .insert(environment_id.clone(), events.clone());
+            }
+            ServerMessage::SignalEventsUpdated {
+                environment_id,
+                events,
+            } => {
+                self.signal_events
                     .insert(environment_id.clone(), events.clone());
             }
             ServerMessage::SignalRollupsUpdated {
@@ -1619,6 +1690,52 @@ impl DashboardState {
         ))
     }
 
+    /// Week-over-week means over hourly roll-ups: trailing-7d average vs
+    /// the prior 7d, trend Signals only. Each side needs a day of hourly
+    /// buckets (24) or the comparison stays quiet — sparse history is not
+    /// a trend. `None` without enough data or a non-positive baseline.
+    pub fn week_over_week(&self, signal_id: &str, now: i64) -> Option<(f64, f64)> {
+        const MIN_BUCKETS: usize = 24;
+        const WEEK_SECS: i64 = 7 * 86_400;
+        if !is_trend_signal(signal_id) {
+            return None;
+        }
+        let environment_id = self.selected_id.as_deref()?;
+        let mut current = Vec::new();
+        let mut prior = Vec::new();
+        for point in self
+            .rollups
+            .get(&(environment_id.to_owned(), signal_id.to_owned()))?
+        {
+            let Some(avg) = point.avg_real else {
+                continue;
+            };
+            let age = now.saturating_sub(point.hour_start);
+            if (0..WEEK_SECS).contains(&age) {
+                current.push(avg);
+            } else if (WEEK_SECS..2 * WEEK_SECS).contains(&age) {
+                prior.push(avg);
+            }
+        }
+        if current.len() < MIN_BUCKETS || prior.len() < MIN_BUCKETS {
+            return None;
+        }
+        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+        let (current, prior) = (mean(&current), mean(&prior));
+        if prior <= 0.0 {
+            return None;
+        }
+        Some((current, prior))
+    }
+
+    /// One-line week comparison for the trend switch ("3.1 avg · +24% vs
+    /// prior 7d"). `None` mirrors `week_over_week`.
+    pub fn week_delta_label(&self, signal_id: &str, now: i64) -> Option<String> {
+        let (current, prior) = self.week_over_week(signal_id, now)?;
+        let pct = (current - prior) / prior * 100.0;
+        Some(format!("{current:.1} avg · {pct:+.0}% vs prior 7d"))
+    }
+
     /// The worst health across observed, unmuted Environments — what the
     /// menu-bar dot, Dock badge and notifications consult. `None` when
     /// disconnected, nothing polled yet, or everything muted.
@@ -2333,6 +2450,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                     from_health: None,
                     to_health: EnvironmentHealth::Degraded,
                     build: Some("glide-zurich-12-18-2025__patch0-hotfix1".into()),
+                    note: Some("patch Tuesday".into()),
                 },
                 HealthEventDto {
                     observed_at: 1_699_996_400,
@@ -2340,6 +2458,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                     from_health: Some(EnvironmentHealth::Healthy),
                     to_health: EnvironmentHealth::Degraded,
                     build: None,
+                    note: None,
                 },
             ],
         },
@@ -3019,6 +3138,86 @@ mod tests {
         assert_eq!(DashboardState::new().anomaly_note("jobs", MONDAY_9AM), None);
     }
 
+    /// Two dense weeks of hourly jobs rollups: 4.0 trailing, 2.0 prior.
+    fn two_week_state() -> DashboardState {
+        let mut state = DashboardState::new();
+        state.set_connected(true);
+        state.apply_all(&[ServerMessage::EnvironmentsUpdated {
+            environments: vec![env(
+                "e",
+                "E",
+                EnvironmentHealth::Healthy,
+                Reachability::Reachable,
+            )],
+        }]);
+        state.select("e");
+        let points: Vec<RollupPoint> = (0..336)
+            .map(|hours_ago| RollupPoint {
+                hour_start: MONDAY_9AM - hours_ago * 3600,
+                avg_real: Some(if hours_ago < 168 { 4.0 } else { 2.0 }),
+                max_real: Some(4.0),
+                sample_count: 30,
+            })
+            .collect();
+        state.apply_all(&[ServerMessage::SignalRollupsUpdated {
+            environment_id: "e".into(),
+            signal_id: "jobs".into(),
+            points,
+        }]);
+        state
+    }
+
+    #[test]
+    fn week_delta_compares_trailing_weeks() {
+        let state = two_week_state();
+        assert_eq!(state.week_over_week("jobs", MONDAY_9AM), Some((4.0, 2.0)));
+        assert_eq!(
+            state.week_delta_label("jobs", MONDAY_9AM).as_deref(),
+            Some("4.0 avg · +100% vs prior 7d")
+        );
+    }
+
+    #[test]
+    fn week_delta_stays_quiet_without_two_dense_weeks() {
+        // Sparse history: one bucket per side is noise, not a trend.
+        let mut state = DashboardState::new();
+        state.set_connected(true);
+        state.apply_all(&[ServerMessage::EnvironmentsUpdated {
+            environments: vec![env(
+                "e",
+                "E",
+                EnvironmentHealth::Healthy,
+                Reachability::Reachable,
+            )],
+        }]);
+        state.select("e");
+        state.apply_all(&[ServerMessage::SignalRollupsUpdated {
+            environment_id: "e".into(),
+            signal_id: "jobs".into(),
+            points: vec![
+                RollupPoint {
+                    hour_start: MONDAY_9AM - 3600,
+                    avg_real: Some(9.0),
+                    max_real: Some(9.0),
+                    sample_count: 30,
+                },
+                RollupPoint {
+                    hour_start: MONDAY_9AM - 8 * 86_400,
+                    avg_real: Some(1.0),
+                    max_real: Some(1.0),
+                    sample_count: 30,
+                },
+            ],
+        }]);
+        assert_eq!(state.week_over_week("jobs", MONDAY_9AM), None);
+        assert_eq!(state.week_delta_label("jobs", MONDAY_9AM), None);
+        // Non-trend Signals have no rollup series worth comparing.
+        assert_eq!(
+            two_week_state().week_delta_label("outbound", MONDAY_9AM),
+            None
+        );
+    }
+
     #[test]
     fn summary_text_marks_muted_environments() {
         let mut state = loaded();
@@ -3541,6 +3740,7 @@ mod tests {
             from_health: Some(EnvironmentHealth::Healthy),
             to_health: EnvironmentHealth::Degraded,
             build: None,
+            note: None,
         }];
         state.apply(&ServerMessage::HealthEventsUpdated {
             environment_id: "prod".into(),
@@ -3557,6 +3757,63 @@ mod tests {
             )],
         });
         assert!(!state.health_events.contains_key("prod"));
+    }
+
+    #[test]
+    fn timeline_merges_signal_flaps_with_health_events_oldest_first() {
+        use daku_protocol::{SignalEventDto, SignalState};
+        let mut state = loaded();
+        state.apply(&ServerMessage::SignalEventsUpdated {
+            environment_id: "prod".into(),
+            events: vec![SignalEventDto {
+                signal_id: "jobs".into(),
+                observed_at: 1_699_950_000,
+                from_state: Some(SignalState::Healthy),
+                to_state: SignalState::Degraded,
+            }],
+        });
+        let rows = state.timeline(TEST_NOW, 10, "");
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].text.starts_with("build glide-"), "{}", rows[0].text);
+        assert!(
+            rows[0].text.contains("note: patch Tuesday"),
+            "{}",
+            rows[0].text
+        );
+        assert_eq!(rows[0].note_key, Some((1_699_913_600, "build".to_owned())));
+        assert_eq!(rows[1].text, "Scheduled jobs healthy → degraded, 13 h ago");
+        assert_eq!(rows[1].note_key, None);
+        assert_eq!(rows[2].text, "healthy → degraded, 1 h ago");
+    }
+
+    #[test]
+    fn timeline_search_filters_case_insensitively_and_limits() {
+        use daku_protocol::{SignalEventDto, SignalState};
+        let mut state = loaded();
+        state.apply(&ServerMessage::SignalEventsUpdated {
+            environment_id: "prod".into(),
+            events: vec![SignalEventDto {
+                signal_id: "jobs".into(),
+                observed_at: 1_699_950_000,
+                from_state: Some(SignalState::Healthy),
+                to_state: SignalState::Degraded,
+            }],
+        });
+        assert_eq!(state.timeline(TEST_NOW, 10, "patch").len(), 1);
+        assert_eq!(state.timeline(TEST_NOW, 10, "JOBS").len(), 1);
+        assert_eq!(state.timeline(TEST_NOW, 10, "degraded").len(), 2);
+        assert!(state.timeline(TEST_NOW, 10, "zzz").is_empty());
+        assert_eq!(state.timeline(TEST_NOW, 1, "").len(), 1);
+        // Removing the Environment drops signal events with everything else.
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![env(
+                "test",
+                "Test",
+                EnvironmentHealth::Healthy,
+                Reachability::Reachable,
+            )],
+        });
+        assert!(state.timeline(TEST_NOW, 10, "").is_empty());
     }
 
     #[test]

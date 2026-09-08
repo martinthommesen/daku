@@ -254,7 +254,13 @@ clone found"). **Never votes** in health. Drill-in: one row
 - Latest snapshot per Signal × Environment (always).
 - Raw samples 24 h: availability RTT, jobs backlog, syslog errors.
 - Hourly roll-ups 90 d (avg line, max ticks, sample counts) for the same
-  three; drill-in switch 24 h / 7 d / 30 d.
+  three; drill-in switch 24 h / 7 d / 30 d, plus a trailing-7d vs prior-7d
+  delta beside the switch.
 - Bounded health-event log (90 d / 500 per Environment): rollup changes
   confirmed twice (single flaps are not events) and build changes including
-  bootstrap. Rendered as the Recent timeline; feeds notifications.
+  bootstrap. Rendered as the Recent timeline; feeds notifications. Each
+  event takes one Operator annotation (click the row, Save note).
+- Bounded per-Signal flap log (same bounds): every Signal's transitions,
+  confirmed twice, merged into the same timeline with a text search box.
+- Export (`⌘⇧E`): `snapshots.json` + `trends.csv` + `summary.md` under
+  `~/.daku/exports/<id>-<unix>/`.

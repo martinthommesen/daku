@@ -519,10 +519,13 @@ pub struct HealthEvent {
     pub from_health: Option<String>,
     pub to_health: String,
     pub build: Option<String>,
+    /// Operator annotation; `None` when unannotated.
+    pub note: Option<String>,
 }
 
 /// Idempotent: re-publishing the same tick (same env/observed_at/kind) is a
-/// no-op, so a restarted daemon cannot duplicate events.
+/// no-op, so a restarted daemon cannot duplicate events. Annotations ride
+/// alongside, never as identity: re-recording never overwrites a note.
 pub fn record_health_event(connection: &Connection, event: &HealthEvent) -> io::Result<()> {
     connection
         .execute(
@@ -543,6 +546,26 @@ pub fn record_health_event(connection: &Connection, event: &HealthEvent) -> io::
     Ok(())
 }
 
+/// Attaches (or clears, with an empty note) the Operator annotation on one
+/// health event. Returns rows updated: 0 names an unknown event.
+pub fn annotate_health_event(
+    connection: &Connection,
+    environment_id: &str,
+    observed_at: i64,
+    kind: &str,
+    note: &str,
+) -> io::Result<usize> {
+    let note = note.trim();
+    let note: Option<&str> = if note.is_empty() { None } else { Some(note) };
+    connection
+        .execute(
+            "UPDATE health_events SET note = ?1
+              WHERE environment_id = ?2 AND observed_at = ?3 AND kind = ?4",
+            params![note, environment_id, observed_at, kind],
+        )
+        .map_err(to_io_error)
+}
+
 pub fn load_health_events(
     connection: &Connection,
     environment_id: &str,
@@ -550,7 +573,7 @@ pub fn load_health_events(
 ) -> io::Result<Vec<HealthEvent>> {
     let mut statement = connection
         .prepare(
-            "SELECT environment_id, observed_at, kind, from_health, to_health, build
+            "SELECT environment_id, observed_at, kind, from_health, to_health, build, note
              FROM health_events
              WHERE environment_id = ?1
              ORDER BY observed_at ASC
@@ -569,6 +592,7 @@ pub fn load_health_events(
             from_health: row.get(3).map_err(to_io_error)?,
             to_health: row.get(4).map_err(to_io_error)?,
             build: row.get(5).map_err(to_io_error)?,
+            note: row.get(6).map_err(to_io_error)?,
         });
     }
     Ok(events)
@@ -608,6 +632,153 @@ pub struct PublishState {
     pub consecutive: i64,
     pub previous_health: Option<String>,
     pub last_build: Option<String>,
+}
+
+/// One per-Signal state transition, confirmed over two consecutive
+/// publishes. Bounds mirror `health_events`: 90 days, 500 per Environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalEvent {
+    pub environment_id: String,
+    pub signal_id: String,
+    pub observed_at: i64,
+    pub from_state: Option<String>,
+    pub to_state: String,
+}
+
+/// Idempotent like `record_health_event`: same tick re-published is a no-op.
+pub fn record_signal_event(connection: &Connection, event: &SignalEvent) -> io::Result<()> {
+    connection
+        .execute(
+            "INSERT INTO signal_events (
+                environment_id, signal_id, observed_at, from_state, to_state
+              ) VALUES (?1, ?2, ?3, ?4, ?5)
+              ON CONFLICT(environment_id, signal_id, observed_at) DO NOTHING",
+            params![
+                event.environment_id,
+                event.signal_id,
+                event.observed_at,
+                event.from_state,
+                event.to_state
+            ],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+pub fn load_signal_events(
+    connection: &Connection,
+    environment_id: &str,
+    limit: i64,
+) -> io::Result<Vec<SignalEvent>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT environment_id, signal_id, observed_at, from_state, to_state
+              FROM signal_events
+              WHERE environment_id = ?1
+              ORDER BY observed_at ASC
+              LIMIT ?2",
+        )
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![environment_id, limit])
+        .map_err(to_io_error)?;
+    let mut events = Vec::new();
+    while let Some(row) = rows.next().map_err(to_io_error)? {
+        events.push(SignalEvent {
+            environment_id: row.get(0).map_err(to_io_error)?,
+            signal_id: row.get(1).map_err(to_io_error)?,
+            observed_at: row.get(2).map_err(to_io_error)?,
+            from_state: row.get(3).map_err(to_io_error)?,
+            to_state: row.get(4).map_err(to_io_error)?,
+        });
+    }
+    Ok(events)
+}
+
+/// Enforces both bounds per Environment. Returns rows deleted.
+pub fn prune_signal_events(
+    connection: &Connection,
+    environment_id: &str,
+    now: i64,
+) -> io::Result<usize> {
+    let cutoff = now.saturating_sub(HEALTH_EVENTS_RETENTION_SECS);
+    let mut deleted = connection
+        .execute(
+            "DELETE FROM signal_events WHERE environment_id = ?1 AND observed_at < ?2",
+            params![environment_id, cutoff],
+        )
+        .map_err(to_io_error)?;
+    deleted += connection
+        .execute(
+            "DELETE FROM signal_events WHERE environment_id = ?1 AND rowid NOT IN (
+                  SELECT rowid FROM signal_events
+                  WHERE environment_id = ?1
+                  ORDER BY observed_at DESC
+                  LIMIT ?2
+              )",
+            params![environment_id, HEALTH_EVENTS_MAX_PER_ENV],
+        )
+        .map_err(to_io_error)?;
+    Ok(deleted)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalPublishState {
+    pub last_state: String,
+    pub consecutive: i64,
+    pub previous_state: Option<String>,
+}
+
+pub fn load_signal_publish_state(
+    connection: &Connection,
+    environment_id: &str,
+    signal_id: &str,
+) -> io::Result<Option<SignalPublishState>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT last_state, consecutive, previous_state
+              FROM signal_publish_state
+              WHERE environment_id = ?1 AND signal_id = ?2",
+        )
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![environment_id, signal_id])
+        .map_err(to_io_error)?;
+    let Some(row) = rows.next().map_err(to_io_error)? else {
+        return Ok(None);
+    };
+    Ok(Some(SignalPublishState {
+        last_state: row.get(0).map_err(to_io_error)?,
+        consecutive: row.get(1).map_err(to_io_error)?,
+        previous_state: row.get(2).map_err(to_io_error)?,
+    }))
+}
+
+pub fn store_signal_publish_state(
+    connection: &Connection,
+    environment_id: &str,
+    signal_id: &str,
+    state: &SignalPublishState,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "INSERT INTO signal_publish_state (
+                environment_id, signal_id, last_state, consecutive, previous_state
+              ) VALUES (?1, ?2, ?3, ?4, ?5)
+              ON CONFLICT(environment_id, signal_id) DO UPDATE SET
+                 last_state = excluded.last_state,
+                 consecutive = excluded.consecutive,
+                 previous_state = excluded.previous_state",
+            params![
+                environment_id,
+                signal_id,
+                state.last_state,
+                state.consecutive,
+                state.previous_state
+            ],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
 }
 
 pub fn load_publish_state(
@@ -735,6 +906,7 @@ mod tests {
                 from_health: Some("healthy".into()),
                 to_health: "degraded".into(),
                 build: None,
+                note: None,
             },
         )
         .unwrap();
@@ -868,6 +1040,7 @@ mod tests {
             from_health: from_health.map(str::to_owned),
             to_health: to_health.into(),
             build: None,
+            note: None,
         }
     }
 
@@ -973,5 +1146,107 @@ mod tests {
             Some(state)
         );
         assert!(load_publish_state(&connection, "test").unwrap().is_none());
+    }
+
+    #[test]
+    fn annotations_attach_clear_and_report_unknown_events() {
+        let db = TempDb::new("notes");
+        let connection = db.store().open().unwrap();
+        let mut event = health_event("prod", 1_700_000_000, "health", Some("healthy"), "degraded");
+        event.note = None;
+        record_health_event(&connection, &event).unwrap();
+        assert_eq!(
+            annotate_health_event(
+                &connection,
+                "prod",
+                1_700_000_000,
+                "health",
+                "  bad deploy  "
+            )
+            .unwrap(),
+            1
+        );
+        let events = load_health_events(&connection, "prod", 100).unwrap();
+        assert_eq!(
+            events[0].note.as_deref(),
+            Some("bad deploy"),
+            "notes trim on write"
+        );
+        // Re-recording the tick must not wipe the note.
+        record_health_event(&connection, &event).unwrap();
+        assert_eq!(
+            load_health_events(&connection, "prod", 100).unwrap()[0]
+                .note
+                .as_deref(),
+            Some("bad deploy")
+        );
+        assert_eq!(
+            annotate_health_event(&connection, "prod", 1_700_000_000, "health", "   ").unwrap(),
+            1,
+            "empty clears"
+        );
+        assert_eq!(
+            load_health_events(&connection, "prod", 100).unwrap()[0].note,
+            None
+        );
+        assert_eq!(
+            annotate_health_event(&connection, "prod", 9, "health", "x").unwrap(),
+            0,
+            "unknown events report zero rows"
+        );
+    }
+
+    #[test]
+    fn signal_events_round_trip_republish_and_prune() {
+        let db = TempDb::new("signal-events");
+        let connection = db.store().open().unwrap();
+        let event = SignalEvent {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            observed_at: 1_700_000_000,
+            from_state: Some("healthy".into()),
+            to_state: "degraded".into(),
+        };
+        record_signal_event(&connection, &event).unwrap();
+        record_signal_event(&connection, &event).unwrap();
+        let events = load_signal_events(&connection, "prod", 100).unwrap();
+        assert_eq!(events, vec![event]);
+        assert!(
+            load_signal_events(&connection, "test", 100)
+                .unwrap()
+                .is_empty()
+        );
+
+        let state = SignalPublishState {
+            last_state: "degraded".into(),
+            consecutive: 2,
+            previous_state: Some("healthy".into()),
+        };
+        store_signal_publish_state(&connection, "prod", "jobs", &state).unwrap();
+        assert_eq!(
+            load_signal_publish_state(&connection, "prod", "jobs").unwrap(),
+            Some(state)
+        );
+        assert!(
+            load_signal_publish_state(&connection, "prod", "syslog")
+                .unwrap()
+                .is_none()
+        );
+
+        // Age bound drops the old row.
+        assert_eq!(
+            prune_signal_events(
+                &connection,
+                "prod",
+                1_700_000_000 + HEALTH_EVENTS_RETENTION_SECS + 1
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            load_signal_events(&connection, "prod", 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
