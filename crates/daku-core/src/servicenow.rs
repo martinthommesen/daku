@@ -295,6 +295,40 @@ pub fn fetch_aggregate_count(
     parse_aggregate_count(response.body.as_bytes())
 }
 
+/// Average-only Aggregate API body: `{ "result": { "stats": { "avg": {
+/// "response_time": "123.5" } } } }`. The average is a string in the
+/// documented envelope; a JSON number is also accepted. `field` is the
+/// `sysparm_avg_fields` name the caller asked for.
+pub fn parse_aggregate_avg(body: &[u8], field: &str) -> anyhow::Result<f64> {
+    let value: serde_json::Value = serde_json::from_slice(body)?;
+    let average = value
+        .pointer(&format!("/result/stats/avg/{field}"))
+        .ok_or_else(|| anyhow!("aggregate response missing result.stats.avg.{field}"))?;
+    match average {
+        serde_json::Value::String(text) => text
+            .parse()
+            .with_context(|| format!("aggregate avg {text:?}")),
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .ok_or_else(|| anyhow!("aggregate avg {number} is not a number")),
+        other => Err(anyhow!("aggregate avg {other} is not a string or number")),
+    }
+}
+
+pub fn fetch_aggregate_avg(
+    client: &ServiceNowClient,
+    environment: &EnvironmentConfig,
+    credentials: &dyn CredentialStore,
+    path: &str,
+    field: &str,
+) -> anyhow::Result<f64> {
+    let response = client.request(environment, credentials, "GET", path, None)?;
+    if response.status != 200 {
+        anyhow::bail!("HTTP {}", response.status);
+    }
+    parse_aggregate_avg(response.body.as_bytes(), field)
+}
+
 fn urlencode(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -435,6 +469,18 @@ mod tests {
         let two = include_bytes!("../tests/fixtures/jobs/count_2.json");
         assert_eq!(parse_aggregate_count(zero).unwrap(), 0);
         assert_eq!(parse_aggregate_count(two).unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_aggregate_avg_reads_stats_avg_field_as_string_or_number() {
+        let string = br#"{"result":{"stats":{"avg":{"response_time":"842.5"}}}}"#;
+        assert_eq!(parse_aggregate_avg(string, "response_time").unwrap(), 842.5);
+        let number = br#"{"result":{"stats":{"avg":{"response_time":118}}}}"#;
+        assert_eq!(parse_aggregate_avg(number, "response_time").unwrap(), 118.0);
+        let missing = br#"{"result":{"stats":{"count":"3"}}}"#;
+        assert!(parse_aggregate_avg(missing, "response_time").is_err());
+        let wrong_field = br#"{"result":{"stats":{"avg":{"sql_count":"4"}}}}"#;
+        assert!(parse_aggregate_avg(wrong_field, "response_time").is_err());
     }
 
     struct ScriptedTransport {

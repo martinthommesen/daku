@@ -49,6 +49,7 @@ pub struct Thresholds {
     pub flow_error_degraded_at: u64,
     pub email_failure_degraded_at: u64,
     pub upgrade_failed_degraded_at: u64,
+    pub transaction_avg_degraded_ms: Option<u64>,
     pub mid_unhealthy_degraded_at: u64,
     pub ecc_error_degraded_at: u64,
     pub ecc_output_ready_degraded_at: u64,
@@ -69,6 +70,10 @@ impl Default for Thresholds {
             // votes until the Operator sets a ceiling.
             email_failure_degraded_at: u64::MAX,
             upgrade_failed_degraded_at: 1,
+            // Transaction slowness varies wildly per instance (PDI hardware vs
+            // prod), so this Signal is opt-in like the availability RTT
+            // ceiling: `None` never votes until the Operator sets a ceiling.
+            transaction_avg_degraded_ms: None,
             mid_unhealthy_degraded_at: 1,
             ecc_error_degraded_at: 1,
             ecc_output_ready_degraded_at: 100,
@@ -122,8 +127,12 @@ impl Thresholds {
             .availability_rtt_degraded_ms
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "off".to_owned());
+        let txn = self
+            .transaction_avg_degraded_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "off".to_owned());
         format!(
-            "jobs≥{}/err≥{} syslog≥{} outbound≥{} flow≥{} email≥{} upgrade≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{}",
+            "jobs≥{}/err≥{} syslog≥{} outbound≥{} flow≥{} email≥{} upgrade≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{} txn>{}",
             self.jobs_overdue_degraded_at,
             off(self.jobs_error_degraded_at),
             self.syslog_error_degraded_at,
@@ -136,6 +145,7 @@ impl Thresholds {
             self.ecc_output_ready_degraded_at,
             self.drift_mismatches_degraded_at,
             rtt,
+            txn,
         )
     }
 }

@@ -19,6 +19,7 @@ pub mod settings;
 pub mod settings_backend;
 pub mod syslog;
 pub mod table_growth;
+pub mod transaction;
 pub mod upgrade;
 
 mod server;

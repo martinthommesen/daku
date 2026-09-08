@@ -7,7 +7,7 @@ use daku_protocol::{
     RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
 };
 
-pub const SIGNAL_IDS: [&str; 12] = [
+pub const SIGNAL_IDS: [&str; 13] = [
     "availability",
     "jobs",
     "syslog",
@@ -18,6 +18,7 @@ pub const SIGNAL_IDS: [&str; 12] = [
     "upgrade",
     "sessions",
     "table_growth",
+    "slow_txn",
     "drift",
     "last_clone",
 ];
@@ -41,6 +42,7 @@ pub fn signal_label(signal_id: &str) -> &'static str {
         "upgrade" => "Upgrades",
         "sessions" => "Sessions",
         "table_growth" => "Table growth",
+        "slow_txn" => "Slow transactions",
         "drift" => "Version / plugins",
         "last_clone" => "Last clone",
         _ => "Signal",
@@ -547,6 +549,9 @@ impl DashboardState {
             "upgrade" => "/sys_upgrade_history_list.do",
             "sessions" => "/v_user_session_list.do",
             "table_growth" => "/sys_db_object_list.do",
+            "slow_txn" => {
+                "/syslog_transaction_list.do?sysparm_query=sys_created_on>javascript:gs.hoursAgoStart(1)"
+            }
             "drift" => "/v_plugin_list.do",
             "last_clone" => "/clone_instance_list.do",
             _ => return None,
@@ -677,6 +682,9 @@ impl DashboardState {
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "table_growth" => self
                 .table_rows(value)
+                .unwrap_or_else(|| self.drill_in_text(signal_id)),
+            "slow_txn" => self
+                .slow_txn_rows(value)
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "availability" => self.drill_in_trend(signal_id, now),
             _ => self.drill_in_text(signal_id),
@@ -946,6 +954,31 @@ impl DashboardState {
                 })
                 .collect(),
             truncated: false,
+        })
+    }
+
+    /// Slowest transactions the daemon fetched while degraded.
+    fn slow_txn_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let list = value
+            .get("slow_rows")
+            .and_then(|item| item.as_array())
+            .filter(|list| !list.is_empty())?;
+        Some(DrillIn::Rows {
+            headers: vec!["Time", "URL", "Ms"],
+            rows: list
+                .iter()
+                .take(DRILL_IN_ROW_LIMIT)
+                .map(|entry| DrillInRow {
+                    cells: vec![
+                        cell(entry, "sys_created_on"),
+                        url_host(cell(entry, "url")),
+                        cell(entry, "response_time"),
+                    ],
+                    link: None,
+                })
+                .collect(),
+            truncated: value.get("slow_rows_truncated") == Some(&serde_json::Value::Bool(true))
+                || list.len() > DRILL_IN_ROW_LIMIT,
         })
     }
 
@@ -1559,6 +1592,14 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 .unwrap_or(0);
             format!("{tables} tables · {} rows", compact_count(total))
         }
+        "slow_txn" => format!(
+            "{} ms avg · last hour",
+            value
+                .get("transaction_avg_ms")
+                .and_then(|item| item.as_f64())
+                .map(|ms| ms.round() as u64)
+                .unwrap_or(0)
+        ),
         "drift" => {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
                 "source of truth".into()
@@ -1717,6 +1758,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "upgrade_failed",
                 "sessions_count",
                 "table_growth",
+                "txn_slow",
                 "drift_source",
             ]
             .map(pinned)
@@ -1735,6 +1777,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "upgrade_clean",
                 "sessions_zero",
                 "table_growth_quiet",
+                "txn_ok",
                 "drift_compare",
                 "last_clone_target_completed",
             ]
@@ -1883,7 +1926,7 @@ mod tests {
     /// `card_summary`, `card_detail`). Add a pinned case there and
     /// `pinned_payloads_render` fails until it is listed here — that is the
     /// point of the pin.
-    const RENDERED: [(&str, &str, &str); 37] = [
+    const RENDERED: [(&str, &str, &str); 39] = [
         ("availability_asleep", "142 ms", ""),
         // The build string is shown with the plugin inventory (drift), not
         // under the latency number.
@@ -1924,6 +1967,8 @@ mod tests {
         ("sessions_zero", "0 active sessions", ""),
         ("table_growth", "5 tables \u{b7} 211.3K rows", ""),
         ("table_growth_quiet", "5 tables \u{b7} 12K rows", ""),
+        ("txn_slow", "842 ms avg \u{b7} last hour", ""),
+        ("txn_ok", "118 ms avg \u{b7} last hour", ""),
         ("skipped_asleep", "", "Environment asleep"),
         ("skipped_clone_source_asleep", "", "clone source asleep"),
         (
@@ -2107,7 +2152,13 @@ mod tests {
                 .any(|line| line.contains("Table growth: healthy")),
             "{text}"
         );
-        assert_eq!(lines.len(), 14, "{text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Slow transactions: degraded")),
+            "{text}"
+        );
+        assert_eq!(lines.len(), 15, "{text}");
     }
 
     #[test]
@@ -2420,6 +2471,26 @@ mod tests {
         assert_eq!(compact_count(211_300), "211.3K");
         assert_eq!(compact_count(1_250_000), "1.3M");
         assert_eq!(compact_count(2_000_000), "2M");
+    }
+
+    #[test]
+    fn drill_in_lists_slowest_transactions() {
+        let state = loaded();
+        assert_eq!(
+            state.drill_in("slow_txn", TEST_NOW),
+            DrillIn::Rows {
+                headers: vec!["Time", "URL", "Ms"],
+                rows: vec![DrillInRow {
+                    cells: vec![
+                        "2026-01-27 00:12:00".to_owned(),
+                        "partner.example.com".to_owned(),
+                        "5200".to_owned(),
+                    ],
+                    link: None,
+                }],
+                truncated: false,
+            }
+        );
     }
 
     #[test]

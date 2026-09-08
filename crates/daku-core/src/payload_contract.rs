@@ -31,6 +31,7 @@ use crate::sessions::{SESSIONS_SIGNAL_ID, SessionsCollector};
 use crate::syslog::{SYSLOG_SIGNAL_ID, SyslogCollector};
 use crate::table_growth::{TABLE_GROWTH_SIGNAL_ID, TableGrowthCollector};
 use crate::test_support::{TempDb, prod};
+use crate::transaction::{TRANSACTION_SIGNAL_ID, TransactionCollector};
 use crate::upgrade::{UPGRADE_SIGNAL_ID, UpgradeCollector};
 
 const PINNED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/payloads.json");
@@ -95,6 +96,14 @@ impl HttpTransport for ContractTransport {
             } else {
                 include_str!("../tests/fixtures/jobs/count_0.json")
             }
+        } else if url.contains("/api/now/stats/syslog_transaction") {
+            // Before the syslog arm below: "syslog_transaction" contains
+            // "syslog" and would otherwise read the error-count fixture.
+            if source {
+                r#"{"result":{"stats":{"avg":{"response_time":"842"}}}}"#
+            } else {
+                r#"{"result":{"stats":{"avg":{"response_time":118}}}}"#
+            }
         } else if url.contains("/api/now/stats/syslog") {
             if source {
                 include_str!("../tests/fixtures/syslog/count_4.json")
@@ -104,6 +113,12 @@ impl HttpTransport for ContractTransport {
         } else if url.contains("/api/now/table/sys_trigger") {
             r#"{"result":[
                 {"sys_id":"job-1","name":"Nightly sync","state":"0","next_action":"2026-01-27 02:00:00"}
+            ]}"#
+        } else if url.contains("/api/now/table/syslog_transaction") {
+            // Before the syslog arm below ("syslog_transaction" contains
+            // "syslog"): the slowest transactions for a degraded tick.
+            r#"{"result":[
+                {"sys_id":"txn-1","url":"https://partner.example.com/page","response_time":5200,"sys_created_on":"2026-01-27 00:12:00"}
             ]}"#
         } else if url.contains("/api/now/table/syslog") {
             r#"{"result":[
@@ -259,10 +274,14 @@ fn generate() -> BTreeMap<String, Value> {
     }
     drop(connection);
 
-    // The four counting Signals, through their real collectors, over two
-    // Environments so both a loaded and a quiet reading get pinned.
+    // The counting Signals, through their real collectors, over two
+    // Environments so both a loaded and a quiet reading get pinned. Prod opts
+    // into the transaction ceiling so the slow case pins degraded-with-rows;
+    // test keeps the default-off ceiling and pins healthy.
     let db = TempDb::new("payload-counts");
-    let environments = vec![prod(), env("test", "acme-test", false)];
+    let mut contract_prod = prod();
+    contract_prod.thresholds.transaction_avg_degraded_ms = Some(500);
+    let environments = vec![contract_prod, env("test", "acme-test", false)];
     let store = credentials(&["prod", "test"]);
     for collector in [
         Box::new(JobsCollector::new(
@@ -313,6 +332,12 @@ fn generate() -> BTreeMap<String, Value> {
             client(),
             db.store(),
         )),
+        Box::new(TransactionCollector::new(
+            environments.clone(),
+            store.clone(),
+            client(),
+            db.store(),
+        )),
         Box::new(MidEccCollector::new(
             environments.clone(),
             store.clone(),
@@ -340,6 +365,8 @@ fn generate() -> BTreeMap<String, Value> {
         ("sessions_zero", "test", SESSIONS_SIGNAL_ID),
         ("table_growth", "prod", TABLE_GROWTH_SIGNAL_ID),
         ("table_growth_quiet", "test", TABLE_GROWTH_SIGNAL_ID),
+        ("txn_slow", "prod", TRANSACTION_SIGNAL_ID),
+        ("txn_ok", "test", TRANSACTION_SIGNAL_ID),
         ("mid_ecc_healthy", "prod", MID_ECC_SIGNAL_ID),
         ("mid_ecc_unhealthy", "test", MID_ECC_SIGNAL_ID),
     ] {
@@ -511,9 +538,10 @@ fn every_known_signal_has_a_pinned_case() {
     use crate::sessions::SESSIONS_SIGNAL_ID;
     use crate::syslog::SYSLOG_SIGNAL_ID;
     use crate::table_growth::TABLE_GROWTH_SIGNAL_ID;
+    use crate::transaction::TRANSACTION_SIGNAL_ID;
     use crate::upgrade::UPGRADE_SIGNAL_ID;
 
-    const KNOWN: [&str; 12] = [
+    const KNOWN: [&str; 13] = [
         AVAILABILITY_SIGNAL_ID,
         JOBS_SIGNAL_ID,
         SYSLOG_SIGNAL_ID,
@@ -524,6 +552,7 @@ fn every_known_signal_has_a_pinned_case() {
         UPGRADE_SIGNAL_ID,
         SESSIONS_SIGNAL_ID,
         TABLE_GROWTH_SIGNAL_ID,
+        TRANSACTION_SIGNAL_ID,
         DRIFT_SIGNAL_ID,
         LAST_CLONE_SIGNAL_ID,
     ];

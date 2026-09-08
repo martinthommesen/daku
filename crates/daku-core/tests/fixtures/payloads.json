@@ -410,6 +410,31 @@
     "signal_id": "table_growth",
     "state": "healthy"
   },
+  "txn_ok": {
+    "payload": {
+      "slow_rows": [],
+      "slow_rows_truncated": false,
+      "transaction_avg_ms": 118.0
+    },
+    "signal_id": "slow_txn",
+    "state": "healthy"
+  },
+  "txn_slow": {
+    "payload": {
+      "slow_rows": [
+        {
+          "response_time": "5200",
+          "sys_created_on": "2026-01-27 00:12:00",
+          "sys_id": "txn-1",
+          "url": "https://partner.example.com/page"
+        }
+      ],
+      "slow_rows_truncated": false,
+      "transaction_avg_ms": 842.0
+    },
+    "signal_id": "slow_txn",
+    "state": "degraded"
+  },
   "upgrade_clean": {
     "payload": {
       "failed_7d": 0,

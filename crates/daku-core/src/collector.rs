@@ -26,6 +26,7 @@ use crate::servicenow::{Clock, ServiceNowClient, SystemClock, UreqTransport};
 use crate::sessions::SessionsCollector;
 use crate::syslog::SyslogCollector;
 use crate::table_growth::TableGrowthCollector;
+use crate::transaction::TransactionCollector;
 use crate::upgrade::UpgradeCollector;
 
 pub use daku_protocol::settings::DEFAULT_POLL_INTERVAL_SECS;
@@ -417,6 +418,12 @@ pub fn build_default_loop(
                 store.clone(),
             )),
             Box::new(TableGrowthCollector::new(
+                one.clone(),
+                credentials.clone(),
+                client.clone(),
+                store.clone(),
+            )),
+            Box::new(TransactionCollector::new(
                 one,
                 credentials.clone(),
                 client.clone(),
@@ -941,7 +948,7 @@ mod tests {
             ServiceNowClient::new(FixtureTransport, SystemClock),
         );
         assert_eq!(loop_.groups.len(), 2);
-        assert_eq!(loop_.groups[0].len(), 10);
+        assert_eq!(loop_.groups[0].len(), 11);
         assert_eq!(loop_.shared.len(), 2, "drift and last-clone stay shared");
     }
 

@@ -24,7 +24,7 @@ pub struct EnvSheet {
     pub secret_a: Entity<InputState>,
     pub secret_b: Entity<InputState>,
     /// Per-Environment threshold overrides, as edited text. Empty means
-    /// default; `jobs_error`, `email` and `rtt` also accept `off`.
+    /// default; `jobs_error`, `email`, `rtt` and `txn` also accept `off`.
     pub threshold_jobs_overdue: Entity<InputState>,
     pub threshold_jobs_error: Entity<InputState>,
     pub threshold_syslog: Entity<InputState>,
@@ -32,6 +32,7 @@ pub struct EnvSheet {
     pub threshold_flow: Entity<InputState>,
     pub threshold_email: Entity<InputState>,
     pub threshold_upgrade: Entity<InputState>,
+    pub threshold_txn: Entity<InputState>,
     pub threshold_mid: Entity<InputState>,
     pub threshold_ecc_error: Entity<InputState>,
     pub threshold_ecc_queue: Entity<InputState>,
@@ -105,6 +106,12 @@ impl EnvSheet {
                 window,
                 cx,
                 &format_u64_threshold(defaults.upgrade_failed_degraded_at),
+                false,
+            ),
+            threshold_txn: Self::field(
+                window,
+                cx,
+                &format_rtt_threshold(defaults.transaction_avg_degraded_ms),
                 false,
             ),
             threshold_mid: Self::field(
@@ -196,6 +203,12 @@ impl EnvSheet {
                 &format_u64_threshold(env.thresholds.upgrade_failed_degraded_at),
                 false,
             ),
+            threshold_txn: Self::field(
+                window,
+                cx,
+                &format_rtt_threshold(env.thresholds.transaction_avg_degraded_ms),
+                false,
+            ),
             threshold_mid: Self::field(
                 window,
                 cx,
@@ -249,8 +262,8 @@ impl EnvSheet {
         }
     }
 
-    /// Parses the twelve threshold fields into effective values. Empty means
-    /// default; `jobs_error`, `email` and `rtt` also accept `off`.
+    /// Parses the thirteen threshold fields into effective values. Empty means
+    /// default; `jobs_error`, `email`, `rtt` and `txn` also accept `off`.
     pub fn thresholds_result(&self, cx: &App) -> Result<Thresholds, String> {
         parse_thresholds(&ThresholdTexts {
             jobs_overdue: self.threshold_jobs_overdue.read(cx).value().to_string(),
@@ -260,6 +273,7 @@ impl EnvSheet {
             flow: self.threshold_flow.read(cx).value().to_string(),
             email: self.threshold_email.read(cx).value().to_string(),
             upgrade: self.threshold_upgrade.read(cx).value().to_string(),
+            txn: self.threshold_txn.read(cx).value().to_string(),
             mid: self.threshold_mid.read(cx).value().to_string(),
             ecc_error: self.threshold_ecc_error.read(cx).value().to_string(),
             ecc_queue: self.threshold_ecc_queue.read(cx).value().to_string(),
@@ -338,8 +352,8 @@ fn parse_count_field(
         .map_err(|_| format!("{caption} must be a whole number or empty"))
 }
 
-/// The twelve threshold fields as edited text. One struct instead of twelve
-/// positional arguments.
+/// The thirteen threshold fields as edited text. One struct instead of
+/// thirteen positional arguments.
 pub struct ThresholdTexts {
     pub jobs_overdue: String,
     pub jobs_error: String,
@@ -348,6 +362,7 @@ pub struct ThresholdTexts {
     pub flow: String,
     pub email: String,
     pub upgrade: String,
+    pub txn: String,
     pub mid: String,
     pub ecc_error: String,
     pub ecc_queue: String,
@@ -366,6 +381,7 @@ impl ThresholdTexts {
             flow: String::new(),
             email: String::new(),
             upgrade: String::new(),
+            txn: String::new(),
             mid: String::new(),
             ecc_error: String::new(),
             ecc_queue: String::new(),
@@ -375,8 +391,8 @@ impl ThresholdTexts {
     }
 }
 
-/// Parses the twelve threshold fields. Empty means default; `jobs_error`,
-/// `email` and `rtt` also accept `off` (never vote).
+/// Parses the thirteen threshold fields. Empty means default; `jobs_error`,
+/// `email`, `rtt` and `txn` also accept `off` (never vote).
 pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
     let defaults = Thresholds::default();
     let rtt_trimmed = texts.rtt.trim();
@@ -388,6 +404,17 @@ pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
                 rtt_trimmed
                     .parse::<u64>()
                     .map_err(|_| "RTT ceiling must be a whole number of ms, off, or empty")?,
+            )
+        };
+    let txn_trimmed = texts.txn.trim();
+    let transaction_avg_degraded_ms =
+        if txn_trimmed.is_empty() || txn_trimmed.eq_ignore_ascii_case("off") {
+            None
+        } else {
+            Some(
+                txn_trimmed.parse::<u64>().map_err(
+                    |_| "Transaction average must be a whole number of ms, off, or empty",
+                )?,
             )
         };
     Ok(Thresholds {
@@ -458,6 +485,7 @@ pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
             None,
         )?,
         availability_rtt_degraded_ms,
+        transaction_avg_degraded_ms,
     })
 }
 
@@ -641,6 +669,7 @@ mod tests {
             flow: "4".into(),
             email: "3".into(),
             upgrade: "2".into(),
+            txn: "250".into(),
             mid: "3".into(),
             ecc_error: "2".into(),
             ecc_queue: "500".into(),
@@ -654,6 +683,7 @@ mod tests {
         assert_eq!(parsed.flow_error_degraded_at, 4);
         assert_eq!(parsed.email_failure_degraded_at, 3);
         assert_eq!(parsed.upgrade_failed_degraded_at, 2);
+        assert_eq!(parsed.transaction_avg_degraded_ms, Some(250));
         assert_eq!(parsed.availability_rtt_degraded_ms, None);
         let rtt = ThresholdTexts {
             rtt: "500".into(),
@@ -695,6 +725,7 @@ mod tests {
             flow: format_u64_threshold(tuned.flow_error_degraded_at),
             email: format_u64_threshold(tuned.email_failure_degraded_at),
             upgrade: format_u64_threshold(tuned.upgrade_failed_degraded_at),
+            txn: format_rtt_threshold(tuned.transaction_avg_degraded_ms),
             mid: format_u64_threshold(tuned.mid_unhealthy_degraded_at),
             ecc_error: format_u64_threshold(tuned.ecc_error_degraded_at),
             ecc_queue: format_u64_threshold(tuned.ecc_output_ready_degraded_at),

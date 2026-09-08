@@ -1,9 +1,9 @@
 # Signal reference
 
-What the twelve Signal cards measure, what makes each amber, what the
+What the thirteen Signal cards measure, what makes each amber, what the
 Operator can tune, and where each link lands. Code truth lives in
 `crates/daku-core/src/` (`availability.rs`, `jobs.rs`, `syslog.rs`,
-`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `sessions.rs`, `table_growth.rs`, `drift.rs`, `last_clone.rs`); rendering truth
+`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `sessions.rs`, `table_growth.rs`, `transaction.rs`, `drift.rs`, `last_clone.rs`); rendering truth
 in `src/dashboard_state.rs`. Research hedges live in
 [`docs/research/servicenow-signals.md`](./research/servicenow-signals.md) —
 this page describes what shipped.
@@ -41,6 +41,7 @@ Shared semantics:
 | Upgrades | `sys_upgrade_history` newest rows | ≥1 failed in 7 d | point-in-time |
 | Sessions | `v_user_session` row count, cap 100 | never votes (informational) | point-in-time |
 | Table growth | whole-table Aggregate counts, 5 tables | never votes (informational) | point-in-time |
+| Slow transactions | `syslog_transaction` avg response time, 1 h | opt-in (`off` by default) | point-in-time |
 | Version / plugins | `sys_plugins` + `sys_store_app` vs clone source | any unexpected mismatch / build differs | point-in-time |
 | Last clone | `clone_instance` on the clone source | never votes (informational) | point-in-time |
 
@@ -170,6 +171,22 @@ read `down`. Summary totals the readable tables ("5 tables · 211.3K
 rows"). No samples today — per-table trends join the roll-ups in a later
 wave. Drill-in lists one row per table with links into each list. Link:
 table-definition list.
+
+## Slow transactions — mean response time that Operators feel
+
+The availability probe measures one synthetic read; this Signal measures
+the mean server-side response time across real transactions in the last
+hour (`avg_fields=response_time` on `syslog_transaction`). While over the
+ceiling it fetches the 10 slowest transactions for the drill-in.
+
+Threshold: `transaction_avg_degraded_ms` (off by default — slowness varies
+wildly per instance, so the Operator opts in; the sheet accepts `off` to
+return to silent). No samples. Every query is date-bounded:
+`syslog_transaction` is a rotated table.
+
+Summary reads the hourly mean ("842 ms avg · last hour"). Drill-in rows
+show time, host, and milliseconds with redacted URLs. Link: filtered
+transaction list.
 
 ## Version / plugins — drift across Environments
 
