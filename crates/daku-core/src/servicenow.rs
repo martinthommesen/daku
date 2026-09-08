@@ -53,6 +53,91 @@ pub trait HttpTransport: Send + Sync {
     fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse>;
 }
 
+/// Process-wide HTTP concurrency guard: at most 8 requests in flight
+/// globally, 2 per host. Threads already isolate Environments from each
+/// other; this keeps a slow one from crowding the rest into 429s.
+pub struct LimitedTransport<T> {
+    inner: T,
+    global: std::sync::Arc<CountingSemaphore>,
+    hosts: std::sync::Mutex<HashMap<String, std::sync::Arc<CountingSemaphore>>>,
+}
+
+impl<T> LimitedTransport<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            global: std::sync::Arc::new(CountingSemaphore::new(8)),
+            hosts: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn host_key(&self, url: &str) -> std::sync::Arc<CountingSemaphore> {
+        let host = crate::collector::host_of_url(url).unwrap_or_else(|| "?".into());
+        self.hosts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(host)
+            .or_insert_with(|| std::sync::Arc::new(CountingSemaphore::new(2)))
+            .clone()
+    }
+}
+
+impl<T: HttpTransport> HttpTransport for LimitedTransport<T> {
+    fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+        let _global = self.global.acquire();
+        let host = self.host_key(&request.url);
+        let _host = host.acquire();
+        self.inner.execute(request)
+    }
+}
+
+struct CountingSemaphore {
+    max: usize,
+    used: std::sync::Mutex<usize>,
+    changed: std::sync::Condvar,
+}
+
+impl CountingSemaphore {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            used: std::sync::Mutex::new(0),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> SemaphoreGuard<'_> {
+        let mut used = self
+            .used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *used >= self.max {
+            used = self
+                .changed
+                .wait(used)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *used += 1;
+        SemaphoreGuard { semaphore: self }
+    }
+}
+
+struct SemaphoreGuard<'a> {
+    semaphore: &'a CountingSemaphore,
+}
+
+impl Drop for SemaphoreGuard<'_> {
+    fn drop(&mut self) {
+        let mut used = self
+            .semaphore
+            .used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *used = used.saturating_sub(1);
+        self.semaphore.changed.notify_one();
+    }
+}
+
 pub trait Clock: Send + Sync {
     fn now(&self) -> SystemTime;
     fn sleep(&self, duration: Duration);
@@ -1277,5 +1362,55 @@ mod tests {
     fn urlencode_keeps_unreserved_and_escapes_the_rest() {
         assert_eq!(urlencode("AZaz09-_.~"), "AZaz09-_.~");
         assert_eq!(urlencode(" /?#"), "%20%2F%3F%23");
+    }
+
+    #[test]
+    fn limited_transport_caps_in_flight_requests_per_host() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Sleeper {
+            current: Arc<AtomicUsize>,
+            high_water: Arc<AtomicUsize>,
+        }
+
+        impl HttpTransport for Sleeper {
+            fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+                let at = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.high_water.fetch_max(at, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                self.current.fetch_sub(1, Ordering::SeqCst);
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: request.url.clone(),
+                })
+            }
+        }
+
+        let current = Arc::new(AtomicUsize::new(0));
+        let high_water = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(LimitedTransport::new(Sleeper {
+            current: current.clone(),
+            high_water: high_water.clone(),
+        }));
+        // Eight threads on one host: the per-host cap of 2 must hold, and
+        // every request still completes exactly once.
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let transport = transport.clone();
+                scope.spawn(move || {
+                    transport
+                        .execute(&HttpRequest {
+                            method: "GET".into(),
+                            url: format!("https://slow.example.com/{index}"),
+                            headers: Vec::new(),
+                            body: None,
+                        })
+                        .unwrap()
+                });
+            }
+        });
+        assert_eq!(current.load(Ordering::SeqCst), 0);
+        assert_eq!(high_water.load(Ordering::SeqCst), 2);
     }
 }

@@ -25,7 +25,7 @@ use crate::mid_ecc::MidEccCollector;
 use crate::outbound::OutboundCollector;
 use crate::persistence::{self, StateStore};
 use crate::scan::ScanCollector;
-use crate::servicenow::{Clock, ServiceNowClient, SystemClock, UreqTransport};
+use crate::servicenow::{Clock, LimitedTransport, ServiceNowClient, SystemClock, UreqTransport};
 use crate::sessions::SessionsCollector;
 use crate::syslog::SyslogCollector;
 use crate::table_growth::TableGrowthCollector;
@@ -50,6 +50,16 @@ pub fn poll_interval_secs(settings: &DaemonSettings) -> u64 {
         0 => DEFAULT_POLL_INTERVAL_SECS,
         secs => secs.max(MIN_POLL_INTERVAL_SECS),
     }
+}
+
+/// Slow cadence, clamped to never outrun the shared one.
+pub fn slow_poll_interval_secs(settings: &DaemonSettings) -> u64 {
+    use daku_protocol::settings::DEFAULT_SLOW_POLL_INTERVAL_SECS;
+    let slow = match settings.slow_poll_interval_secs {
+        0 => DEFAULT_SLOW_POLL_INTERVAL_SECS,
+        secs => secs,
+    };
+    slow.max(poll_interval_secs(settings))
 }
 
 pub trait SignalCollector: Send + Sync {
@@ -226,20 +236,55 @@ pub struct CollectorLoop {
     groups: Vec<Vec<Box<dyn SignalCollector>>>,
     /// Run sequentially after every group has finished (cross-Environment Signals).
     shared: Vec<Box<dyn SignalCollector>>,
+    /// Slow cadence: every this many ticks (tick 0 always runs everything,
+    /// so the first pass matches the old every-tick behaviour).
+    slow_every: u64,
+    /// Run sequentially after `shared`, only on slow ticks.
+    slow: Vec<Box<dyn SignalCollector>>,
+    ticks: std::sync::atomic::AtomicU64,
+    /// True while the machine has no route to any Environment. Ticks pause
+    /// (short sleeps) instead of recording a wall of unreachable snapshots.
+    offline_check: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl CollectorLoop {
     pub fn new(interval: Duration) -> Self {
+        Self::with_slow_interval(interval, interval)
+    }
+
+    /// `slow_interval` longer than `interval` spaces the slow collectors;
+    /// shorter values clamp to every tick.
+    pub fn with_slow_interval(interval: Duration, slow_interval: Duration) -> Self {
+        let interval_secs = interval.as_secs().max(1);
+        let slow_secs = slow_interval.as_secs().max(1);
         Self {
             interval,
             groups: Vec::new(),
             shared: Vec::new(),
+            slow_every: slow_secs.div_ceil(interval_secs).max(1),
+            slow: Vec::new(),
+            ticks: std::sync::atomic::AtomicU64::new(0),
+            offline_check: None,
         }
+    }
+
+    /// Pauses ticking while `check` reports no route to any Environment.
+    /// Production wires `all_hosts_unreachable` over the poll hosts; tests
+    /// inject a script.
+    pub fn with_offline_check(mut self, check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.offline_check = Some(std::sync::Arc::new(check));
+        self
     }
 
     /// Registers a collector that runs after all groups, on the calling thread.
     pub fn register(&mut self, collector: impl SignalCollector + 'static) {
         self.shared.push(Box::new(collector));
+    }
+
+    /// Registers a collector that runs after `shared`, only on slow ticks.
+    /// Inventory, history, and batch Signals live here.
+    pub fn register_slow(&mut self, collector: impl SignalCollector + 'static) {
+        self.slow.push(Box::new(collector));
     }
 
     /// Registers a set of collectors that run in order on their own thread,
@@ -257,7 +302,10 @@ impl CollectorLoop {
     /// Runs one tick and reports how long it took, so the caller can sleep the
     /// remainder of the interval instead of a full interval on top of it.
     fn tick_timed(&self) -> (anyhow::Result<()>, Duration) {
+        use std::sync::atomic::Ordering;
         let started = Instant::now();
+        let tick = self.ticks.fetch_add(1, Ordering::Relaxed);
+        let slow_tick = tick.is_multiple_of(self.slow_every);
         let mut errors: Vec<anyhow::Error> = std::thread::scope(|scope| {
             let handles: Vec<_> = self
                 .groups
@@ -284,6 +332,15 @@ impl CollectorLoop {
             Ok(Err(error)) => errors.push(error),
             Err(_) => errors.push(anyhow::anyhow!("shared collectors panicked")),
         }
+        if slow_tick {
+            let slow =
+                std::thread::scope(|scope| scope.spawn(|| run_sequential(&self.slow)).join());
+            match slow {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(error),
+                Err(_) => errors.push(anyhow::anyhow!("slow collectors panicked")),
+            }
+        }
         let elapsed = started.elapsed();
         if elapsed > self.interval {
             eprintln!(
@@ -303,7 +360,22 @@ impl CollectorLoop {
         // Publish last-known state from SQLite so a fresh subscriber is not blank
         // until the first tick completes.
         publish(after);
+        let mut was_offline = false;
         while !shutdown.load(Ordering::Acquire) {
+            if self.offline_check.as_ref().is_some_and(|check| check()) {
+                if !was_offline {
+                    eprintln!(
+                        "daku collector paused: no route to any Environment (waiting for network)"
+                    );
+                    was_offline = true;
+                }
+                clock.sleep(Duration::from_secs(10));
+                continue;
+            }
+            if was_offline {
+                eprintln!("daku collector resumed");
+                was_offline = false;
+            }
             let (result, elapsed) = self.tick_timed();
             if let Err(error) = result {
                 eprintln!("daku collector tick failed: {error}");
@@ -316,6 +388,53 @@ impl CollectorLoop {
             clock.sleep(self.interval.saturating_sub(elapsed));
         }
     }
+}
+
+/// Hosts one poll round must reach: ServiceNow and probe hosts verbatim,
+/// plus the GitHub API for repo Environments. Deduped, in config order.
+pub fn poll_hosts(environments: &[EnvironmentConfig]) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for environment in environments {
+        let host = match environment.platform {
+            Platform::Github => "api.github.com".to_owned(),
+            _ => host_of_url(&environment.instance_url).unwrap_or_default(),
+        };
+        if !host.is_empty() && !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
+pub(crate) fn host_of_url(url: &str) -> Option<String> {
+    let authority = url.split("://").nth(1)?.split('/').next()?;
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_owned())
+    }
+}
+
+/// True when TCP 443 reaches none of the hosts (2 s each, sequential).
+/// Per-Environment outages are the collectors' job; all-dark means the
+/// machine itself is offline (VPN down, captive portal, airplane mode).
+/// Unresolvable DNS counts as unreachable — a blocking resolve here only
+/// delays an already-paused loop; per-tick DNS never happens.
+pub fn all_hosts_unreachable(hosts: &[String]) -> bool {
+    !hosts.is_empty()
+        && hosts.iter().all(|host| {
+            std::net::ToSocketAddrs::to_socket_addrs(format!("{host}:443").as_str())
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+                .is_none_or(|addr| {
+                    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_err()
+                })
+        })
 }
 
 /// Publishes the dashboard, costing one tick's publish rather than the whole
@@ -361,10 +480,20 @@ pub fn build_default_loop(
     credentials: Arc<dyn CredentialStore>,
     store: StateStore,
     interval: Duration,
+    slow_interval: Duration,
     client: ServiceNowClient,
 ) -> CollectorLoop {
     let client = Arc::new(client);
-    let mut loop_ = CollectorLoop::new(interval);
+    let mut loop_ = CollectorLoop::with_slow_interval(interval, slow_interval);
+    let offline_hosts = poll_hosts(&environments);
+    loop_.offline_check = Some(std::sync::Arc::new(move || {
+        all_hosts_unreachable(&offline_hosts)
+    }));
+    let servicenow: Vec<EnvironmentConfig> = environments
+        .iter()
+        .filter(|environment| environment.platform == Platform::Servicenow)
+        .cloned()
+        .collect();
     for environment in &environments {
         let one = vec![environment.clone()];
         match environment.platform {
@@ -436,12 +565,6 @@ pub fn build_default_loop(
                     store.clone(),
                 )),
                 Box::new(UpdateSetsCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(ScanCollector::new(
                     one,
                     credentials.clone(),
                     client.clone(),
@@ -464,27 +587,23 @@ pub fn build_default_loop(
             ))]),
         }
     }
-    // Drift and last-clone compare ServiceNow Environments against their
-    // clone source; other platforms never join that comparison.
-    let servicenow: Vec<EnvironmentConfig> = environments
-        .iter()
-        .filter(|environment| environment.platform == Platform::Servicenow)
-        .cloned()
-        .collect();
+    // Drift, last-clone, and scan read inventories and history: they ride
+    // the slow cadence, while every per-Environment Signal stays per-tick.
     if !servicenow.is_empty() {
-        loop_.register(DriftCollector::new(
+        loop_.register_slow(DriftCollector::new(
             servicenow.clone(),
             credentials.clone(),
             client.clone(),
             store.clone(),
             interval,
         ));
-        loop_.register(LastCloneCollector::new(
-            servicenow,
-            credentials,
-            client,
-            store,
+        loop_.register_slow(LastCloneCollector::new(
+            servicenow.clone(),
+            credentials.clone(),
+            client.clone(),
+            store.clone(),
         ));
+        loop_.register_slow(ScanCollector::new(servicenow, credentials, client, store));
     }
     loop_
 }
@@ -541,7 +660,8 @@ pub fn start_default_loop_with_store(
         credentials,
         store,
         Duration::from_secs(poll_interval_secs(settings)),
-        ServiceNowClient::new(UreqTransport::default(), SystemClock),
+        Duration::from_secs(slow_poll_interval_secs(settings)),
+        ServiceNowClient::new(LimitedTransport::new(UreqTransport::default()), SystemClock),
     );
     spawn_collector_loop(loop_, shutdown, move || {
         let now = unix_now();
@@ -585,6 +705,7 @@ pub fn probe_availability_once_with_store(
         credentials,
         store,
         Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS),
+        Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS),
         ServiceNowClient::new(UreqTransport::default(), SystemClock),
     );
     loop_.tick()
@@ -619,6 +740,7 @@ pub struct DoctorRow {
 pub struct DoctorReport {
     pub environments_path: PathBuf,
     pub poll_interval_secs: u64,
+    pub slow_poll_interval_secs: u64,
     pub rows: Vec<DoctorRow>,
 }
 
@@ -687,6 +809,7 @@ pub fn run_doctor(
     Ok(DoctorReport {
         environments_path: environments_path.to_owned(),
         poll_interval_secs: poll_interval_secs(settings),
+        slow_poll_interval_secs: slow_poll_interval_secs(settings),
         rows,
     })
 }
@@ -727,6 +850,7 @@ mod tests {
             poll_interval_secs(&DaemonSettings {
                 poll_interval_secs: secs,
                 webhook_url: None,
+                ..DaemonSettings::default()
             })
         };
         assert_eq!(interval(5), MIN_POLL_INTERVAL_SECS);
@@ -1016,11 +1140,14 @@ mod tests {
             Arc::new(MemoryCredentialStore::default()),
             db.store(),
             Duration::from_secs(120),
+            Duration::from_secs(1800),
             ServiceNowClient::new(FixtureTransport, SystemClock),
         );
         assert_eq!(loop_.groups.len(), 2);
-        assert_eq!(loop_.groups[0].len(), 13);
-        assert_eq!(loop_.shared.len(), 2, "drift and last-clone stay shared");
+        assert_eq!(loop_.groups[0].len(), 12);
+        assert!(loop_.shared.is_empty());
+        assert_eq!(loop_.slow.len(), 3, "drift, last-clone, and scan ride slow");
+        assert_eq!(loop_.slow_every, 15);
     }
 
     #[test]
@@ -1037,14 +1164,19 @@ mod tests {
             Arc::new(MemoryCredentialStore::default()),
             db.store(),
             Duration::from_secs(120),
+            Duration::from_secs(1800),
             ServiceNowClient::new(FixtureTransport, SystemClock),
         );
         assert_eq!(loop_.groups.len(), 3);
-        assert_eq!(loop_.groups[0].len(), 13, "servicenow keeps every Signal");
+        assert_eq!(
+            loop_.groups[0].len(),
+            12,
+            "servicenow keeps per-tick Signals"
+        );
         assert_eq!(loop_.groups[1].len(), 1, "http registers only its probe");
         assert_eq!(loop_.groups[2].len(), 1, "github registers only actions");
-        // Shared collectors follow the ServiceNow subset only.
-        assert_eq!(loop_.shared.len(), 2);
+        // Slow collectors follow the ServiceNow subset only.
+        assert_eq!(loop_.slow.len(), 3);
     }
 
     #[test]
@@ -1058,10 +1190,121 @@ mod tests {
             Arc::new(MemoryCredentialStore::default()),
             db.store(),
             Duration::from_secs(120),
+            Duration::from_secs(1800),
             ServiceNowClient::new(FixtureTransport, SystemClock),
         );
         assert_eq!(loop_.groups.len(), 1);
         assert!(loop_.shared.is_empty());
+        assert!(loop_.slow.is_empty());
+    }
+
+    #[test]
+    fn slow_collectors_run_every_nth_tick_starting_at_zero() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let slow_calls = Arc::new(AtomicUsize::new(0));
+        let mut loop_ =
+            CollectorLoop::with_slow_interval(Duration::from_secs(120), Duration::from_secs(360));
+        assert_eq!(loop_.slow_every, 3);
+        loop_.register(SleepingCollector(Duration::ZERO, calls.clone()));
+        loop_.register_slow(SleepingCollector(Duration::ZERO, slow_calls.clone()));
+        for _ in 0..7 {
+            loop_.tick().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 7);
+        // Ticks 0, 3, 6.
+        assert_eq!(slow_calls.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn slow_interval_clamps_to_the_shared_cadence() {
+        let loop_ =
+            CollectorLoop::with_slow_interval(Duration::from_secs(120), Duration::from_secs(30));
+        assert_eq!(loop_.slow_every, 1);
+        let settings = DaemonSettings {
+            poll_interval_secs: 120,
+            slow_poll_interval_secs: 60,
+            ..DaemonSettings::default()
+        };
+        assert_eq!(slow_poll_interval_secs(&settings), 120);
+        let settings = DaemonSettings {
+            poll_interval_secs: 0,
+            slow_poll_interval_secs: 0,
+            ..DaemonSettings::default()
+        };
+        assert_eq!(slow_poll_interval_secs(&settings), 1800);
+    }
+
+    #[test]
+    fn poll_hosts_covers_every_platform_deduped() {
+        let mut repo = prod();
+        repo.id = "repo".into();
+        repo.platform = Platform::Github;
+        repo.instance_url = "https://github.com/acme/app".into();
+        let mut dup = prod();
+        dup.id = "test".into();
+        let hosts = poll_hosts(&[prod(), dup, repo]);
+        assert_eq!(
+            hosts,
+            vec![
+                "acme-prod.example.service-now.com".to_owned(),
+                "api.github.com".to_owned()
+            ]
+        );
+        assert!(poll_hosts(&[]).is_empty());
+    }
+
+    #[test]
+    fn host_of_url_reads_hosts_and_brackets() {
+        assert_eq!(
+            host_of_url("https://acme.example.com/a?x=1"),
+            Some("acme.example.com".into())
+        );
+        assert_eq!(
+            host_of_url("https://user@acme.example.com:8443/a"),
+            Some("acme.example.com".into())
+        );
+        assert_eq!(host_of_url("https://[::1]:8443/a"), Some("::1".into()));
+        assert_eq!(host_of_url("https://"), None);
+        assert_eq!(host_of_url("not a url"), None);
+    }
+
+    #[test]
+    fn all_hosts_unreachable_needs_no_network_to_prove() {
+        // Refused loopback and unresolvable names are unreachable without
+        // sending a byte anywhere meaningful.
+        assert!(all_hosts_unreachable(&["127.0.0.1".into()]));
+        assert!(all_hosts_unreachable(&["invalid.invalid".into()]));
+        assert!(!all_hosts_unreachable(&[]));
+    }
+
+    #[test]
+    fn run_pauses_ticks_while_offline_and_resumes_after() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let mut loop_ = CollectorLoop::new(Duration::from_secs(120)).with_offline_check(|| true);
+        let shutdown = AtomicBool::new(false);
+        struct StopOnSleep<'a>(&'a AtomicBool);
+        impl Clock for StopOnSleep<'_> {
+            fn now(&self) -> std::time::SystemTime {
+                std::time::SystemTime::now()
+            }
+            fn sleep(&self, _: Duration) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        loop_.register(SleepingCollector(Duration::ZERO, ticks.clone()));
+        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|| {});
+        assert_eq!(
+            ticks.load(Ordering::Acquire),
+            0,
+            "offline ticks must not run collectors"
+        );
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let shutdown = AtomicBool::new(false);
+        let mut loop_ = CollectorLoop::new(Duration::from_secs(120)).with_offline_check(|| false);
+        loop_.register(SleepingCollector(Duration::ZERO, ticks.clone()));
+        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|| {});
+        assert_eq!(ticks.load(Ordering::Acquire), 1);
     }
 
     enum Behaviour {

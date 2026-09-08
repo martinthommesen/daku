@@ -314,6 +314,7 @@ fn run_doctor_command(fix: bool, arguments: &Arguments) -> anyhow::Result<()> {
     .with_context(|| format!("doctor: {}", environments_path.display()))?;
     println!("config: {}", report.environments_path.display());
     println!("poll interval: {} s", report.poll_interval_secs);
+    println!("slow interval: {} s", report.slow_poll_interval_secs);
     for row in &report.rows {
         println!("{}", format_doctor_row(row));
     }

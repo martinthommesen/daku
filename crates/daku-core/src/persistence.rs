@@ -162,6 +162,14 @@ impl StateStore {
             .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
             .map_err(to_io_error)?;
         apply_migrations(&connection)?;
+        // Bound the WAL sidecar: checkpoint every 1000 pages and cap the
+        // journal, so a long-lived daemon cannot grow -wal without bound
+        // between checkpoints.
+        connection
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint = 1000; PRAGMA journal_size_limit = 67108864;",
+            )
+            .map_err(to_io_error)?;
         // WAL may recreate sidecar modes; re-assert the main db file mode.
         #[cfg(unix)]
         fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
@@ -218,6 +226,10 @@ pub fn db_stats(path: &Path) -> DbStats {
     }
 }
 
+/// `doctor` warns past this database size: retention is automatic, so a
+/// bigger file means more Environments or Signals than the census covers.
+pub const DB_SIZE_WARNING_BYTES: u64 = 200 * 1024 * 1024;
+
 /// One-line `doctor` rendering of a census: `db <name> · 41 KB ·
 /// snapshots 21 · samples 1440 · rollups 2160 · health events 3`.
 pub fn format_db_stats(path: &Path, stats: &DbStats) -> String {
@@ -227,13 +239,20 @@ pub fn format_db_stats(path: &Path, stats: &DbStats) -> String {
         .unwrap_or("app.db");
     let size = if stats.bytes < 1024 {
         format!("{} B", stats.bytes)
-    } else {
+    } else if stats.bytes < 1024 * 1024 {
         format!("{} KB", stats.bytes / 1024)
+    } else {
+        format!("{} MB", stats.bytes / (1024 * 1024))
     };
-    format!(
+    let line = format!(
         "db {name} · {size} · snapshots {} · samples {} · rollups {} · health events {}",
         stats.snapshots, stats.samples, stats.rollups, stats.health_events
-    )
+    );
+    if stats.bytes > DB_SIZE_WARNING_BYTES {
+        format!("{line} · WARNING over 200 MB — reduce Environments or Signals")
+    } else {
+        line
+    }
 }
 
 /// Records that `signal_id` deliberately skipped probing (`reason` is
@@ -919,6 +938,25 @@ mod tests {
         let line = format_db_stats(db.path(), &stats);
         assert!(line.contains("snapshots 1"), "{line}");
         assert!(line.contains("health events 1"), "{line}");
+    }
+
+    #[test]
+    fn db_stats_warns_past_200_mb_and_scales_units() {
+        let db = TempDb::new("stats-units");
+        let big = DbStats {
+            bytes: 210 * 1024 * 1024,
+            ..DbStats::default()
+        };
+        let line = format_db_stats(db.path(), &big);
+        assert!(line.contains("210 MB"), "{line}");
+        assert!(line.contains("WARNING"), "{line}");
+        let small = DbStats {
+            bytes: 41 * 1024,
+            ..DbStats::default()
+        };
+        let line = format_db_stats(db.path(), &small);
+        assert!(line.contains("41 KB"), "{line}");
+        assert!(!line.contains("WARNING"), "{line}");
     }
 
     #[test]
