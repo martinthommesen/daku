@@ -153,6 +153,14 @@ fn run_doctor_command(fix: bool) -> anyhow::Result<()> {
     for row in &report.rows {
         println!("{}", format_doctor_row(row));
     }
+    let db_path = daku_core::persistence::StateStore::default_path();
+    println!(
+        "{}",
+        daku_core::persistence::format_db_stats(
+            &db_path,
+            &daku_core::persistence::db_stats(&db_path)
+        )
+    );
     std::process::exit(doctor_exit_code(&report.rows));
 }
 

@@ -181,6 +181,64 @@ pub struct SignalSnapshot {
     pub payload_json: String,
 }
 
+/// Read-only census of the daemon database for `doctor`: file size plus row
+/// counts per history table. A missing file — or a table from a migration
+/// the file predates — reads as zero. Never creates, migrates, or writes:
+/// opening read-only is what keeps `doctor` a diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DbStats {
+    pub bytes: u64,
+    pub snapshots: i64,
+    pub samples: i64,
+    pub rollups: i64,
+    pub health_events: i64,
+}
+
+pub fn db_stats(path: &Path) -> DbStats {
+    let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let Ok(connection) =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return DbStats {
+            bytes,
+            ..Default::default()
+        };
+    };
+    // Table names are internal constants, never Operator input.
+    let count = |table: &str| -> i64 {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0)
+    };
+    DbStats {
+        bytes,
+        snapshots: count("signal_snapshots"),
+        samples: count("signal_samples"),
+        rollups: count("signal_rollups_hourly"),
+        health_events: count("health_events"),
+    }
+}
+
+/// One-line `doctor` rendering of a census: `db <name> · 41 KB ·
+/// snapshots 21 · samples 1440 · rollups 2160 · health events 3`.
+pub fn format_db_stats(path: &Path, stats: &DbStats) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("app.db");
+    let size = if stats.bytes < 1024 {
+        format!("{} B", stats.bytes)
+    } else {
+        format!("{} KB", stats.bytes / 1024)
+    };
+    format!(
+        "db {name} · {size} · snapshots {} · samples {} · rollups {} · health events {}",
+        stats.snapshots, stats.samples, stats.rollups, stats.health_events
+    )
+}
+
 /// Records that `signal_id` deliberately skipped probing (`reason` is
 /// `"asleep"` or `"unreachable"` — the Availability outcome it deferred to).
 pub fn persist_signal_skipped(
@@ -643,6 +701,55 @@ mod tests {
         assert!(!table_exists(&connection, "environments"));
         assert!(!table_exists(&connection, "projects"));
         assert_eq!(apply_migrations(&connection).unwrap(), 0);
+    }
+
+    #[test]
+    fn db_stats_counts_rows_and_formats_one_line() {
+        use crate::availability::AvailabilityObservation;
+        use daku_protocol::{Reachability, SignalState};
+
+        let db = TempDb::new("stats");
+        // A never-opened database reads as all zeros and creates nothing.
+        assert_eq!(db_stats(db.path()), DbStats::default());
+        assert!(!db.path().exists());
+        let store = db.store();
+        let connection = store.open().unwrap();
+        crate::availability::persist_availability_snapshot(
+            &connection,
+            "prod",
+            &AvailabilityObservation {
+                reachability: Reachability::Reachable,
+                state: SignalState::Healthy,
+                build: None,
+                rtt_ms: 10,
+                error: None,
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+        persist_signal_sample(&connection, "prod", "jobs", 1_700_000_000, Some(2.0), None).unwrap();
+        record_hour_rollup(&connection, "prod", "jobs", 1_700_000_000).unwrap();
+        record_health_event(
+            &connection,
+            &HealthEvent {
+                environment_id: "prod".into(),
+                observed_at: 1_700_000_000,
+                kind: "health".into(),
+                from_health: Some("healthy".into()),
+                to_health: "degraded".into(),
+                build: None,
+            },
+        )
+        .unwrap();
+        let stats = db_stats(db.path());
+        assert_eq!(stats.snapshots, 1);
+        assert_eq!(stats.samples, 1);
+        assert_eq!(stats.rollups, 1);
+        assert_eq!(stats.health_events, 1);
+        assert!(stats.bytes > 0);
+        let line = format_db_stats(db.path(), &stats);
+        assert!(line.contains("snapshots 1"), "{line}");
+        assert!(line.contains("health events 1"), "{line}");
     }
 
     #[test]
