@@ -70,7 +70,17 @@ Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settin
     ```
 
     A failed probe aborts before writing (`--no-probe` skips it for
-    known-asleep Environments). `daku-daemon diagnostics [--out DIR]`
+    known-asleep Environments). Rotate a secret the same safe way —
+    shape-check, dry-run probe, then replace, with the old item surviving
+    any failure:
+
+    ```sh
+    daku-daemon rotate-credential --env dev --secret-file /path/to/new-blob.json
+    ```
+
+    Ask what each table grants the monitoring account before tightening
+    roles (`doctor --check-roles` reads one row per table and reports
+    granted/denied with the minimal role). `daku-daemon diagnostics [--out DIR]`
     writes a redacted bundle (config without secrets, scrubbed log tail,
     database census) for tickets and debugging — offline by design.
 2. Add an Environment from the app menu (daku → Add Environment…): label, `https://` URL, auth method, Credential, thresholds (empty means default), and expected-drift ids — Test dry-runs the probe, Save writes `~/.daku/environments.json` (0600) and the Keychain item, then reloads. Editing works from the Environment header (Edit); deleting asks twice. The sheet refuses malformed URLs, bad threshold numbers, and mismatched Credential shapes before anything is written.

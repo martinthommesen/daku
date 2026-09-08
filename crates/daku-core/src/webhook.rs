@@ -44,6 +44,15 @@ pub fn webhook_url_allowed(url: &str) -> bool {
     false
 }
 
+/// What a refused webhook URL prints: host and path only. Forwarder URLs
+/// routinely carry tokens in the query string, and daemon stderr is the
+/// most-copied log in the project — the refusal must not become the leak.
+/// Pinned by the redaction audit below.
+pub fn refusal_line(url: &str) -> String {
+    let scrubbed = url.split(['?', '#']).next().unwrap_or(url);
+    format!("daku webhook refused (loopback http or any https only): {scrubbed}")
+}
+
 pub struct WebhookRelay {
     last_sent: Mutex<HashMap<String, i64>>,
     last_refused: Mutex<Option<String>>,
@@ -88,7 +97,7 @@ impl WebhookRelay {
         if !webhook_url_allowed(&url) {
             let mut refused = self.last_refused.lock().expect("webhook refusal");
             if refused.as_deref() != Some(url.as_str()) {
-                eprintln!("daku webhook refused (loopback http or any https only): {url}");
+                eprintln!("{}", refusal_line(&url));
                 *refused = Some(url);
             }
             return;
@@ -409,5 +418,13 @@ mod tests {
             serde_json::from_str(r#"{"poll_interval_secs":60,"webhook_url":"https://x/hook"}"#)
                 .unwrap();
         assert_eq!(parsed.webhook_url.as_deref(), Some("https://x/hook"));
+    }
+
+    #[test]
+    fn refusal_line_never_carries_query_or_fragment() {
+        let line = refusal_line("http://192.168.1.10/hook?token=CANARY-9#frag");
+        assert!(line.contains("http://192.168.1.10/hook"), "{line}");
+        assert!(!line.contains("CANARY-9"), "refusals must not leak: {line}");
+        assert!(!line.contains('#'), "{line}");
     }
 }

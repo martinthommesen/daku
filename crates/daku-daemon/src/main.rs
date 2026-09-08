@@ -13,13 +13,21 @@ fn main() -> anyhow::Result<()> {
         return run_probe_availability(&arguments);
     }
     if arguments.doctor {
-        return run_doctor_command(arguments.doctor_fix, &arguments);
+        return run_doctor_command(
+            arguments.doctor_fix,
+            arguments.doctor_check_roles,
+            &arguments,
+        );
     }
-    if let Some(env_id) = arguments.digest_env.clone() {
+    if arguments.digest_command {
+        let env_id = arguments.digest_env.clone().unwrap_or_default();
         return run_digest_command(&env_id, arguments.digest_days);
     }
     if arguments.setup {
         return run_setup_command(&arguments);
+    }
+    if arguments.rotate_credential {
+        return run_rotate_command(&arguments);
     }
     if arguments.diagnostics {
         return run_diagnostics_command(arguments.diagnostics_out.clone());
@@ -266,6 +274,48 @@ fn run_setup_command(arguments: &Arguments) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validates a replacement secret with a dry-run probe and only then stores
+/// it. The old item survives any failure. The secret arrives via
+/// `--secret-file`, never argv.
+fn run_rotate_command(arguments: &Arguments) -> anyhow::Result<()> {
+    let environment_id = arguments
+        .digest_env
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| anyhow!("rotate-credential requires --env <id>"))?;
+    let secret_path = arguments
+        .setup_credential_file
+        .as_deref()
+        .ok_or_else(|| anyhow!("rotate-credential requires --secret-file <path>"))?;
+    let blob = std::fs::read_to_string(secret_path)
+        .context("could not read --secret-file")?
+        .trim()
+        .to_owned();
+    if blob.is_empty() {
+        bail!("--secret-file is empty; refusing to store a blank credential");
+    }
+    let environments =
+        daku_core::config::load_environments(&daku_core::default_environments_path())
+            .with_context(|| "could not load environments.json")?;
+    let environment = environments
+        .iter()
+        .find(|environment| environment.id == environment_id)
+        .ok_or_else(|| anyhow!("unknown environment {environment_id}"))?;
+    let store = resolve_credential_store(arguments);
+    let line = daku_core::rotate::rotate_credential(
+        store.as_ref(),
+        &daku_core::servicenow::ServiceNowClient::new(
+            daku_core::servicenow::UreqTransport::default(),
+            daku_core::servicenow::SystemClock,
+        ),
+        environment,
+        &blob,
+        !arguments.setup_no_probe,
+    )?;
+    println!("{line}");
+    Ok(())
+}
+
 fn resolve_credential_store(arguments: &Arguments) -> Arc<dyn daku_core::config::CredentialStore> {
     let wants_file = arguments
         .credential_store
@@ -287,7 +337,7 @@ fn resolve_credential_store(arguments: &Arguments) -> Arc<dyn daku_core::config:
     }
 }
 
-fn run_doctor_command(fix: bool, arguments: &Arguments) -> anyhow::Result<()> {
+fn run_doctor_command(fix: bool, check_roles: bool, arguments: &Arguments) -> anyhow::Result<()> {
     let environments_path = daku_core::default_environments_path();
     if fix {
         for line in daku_core::config::repair_environments_setup(&environments_path)? {
@@ -317,6 +367,29 @@ fn run_doctor_command(fix: bool, arguments: &Arguments) -> anyhow::Result<()> {
     println!("slow interval: {} s", report.slow_poll_interval_secs);
     for row in &report.rows {
         println!("{}", format_doctor_row(row));
+    }
+    if check_roles {
+        let environments = daku_core::config::load_environments(&environments_path)
+            .with_context(|| format!("doctor: {}", environments_path.display()))?;
+        let client = daku_core::servicenow::ServiceNowClient::new(
+            daku_core::servicenow::UreqTransport::default(),
+            daku_core::servicenow::SystemClock,
+        );
+        for role_report in daku_core::roles::run_role_check(
+            &environments,
+            resolve_credential_store(arguments),
+            &client,
+        ) {
+            println!("{}", daku_core::roles::format_role_report(&role_report));
+            for denied in role_report.denied() {
+                println!(
+                    "  denied: {} (needs {} — {})",
+                    denied.table,
+                    denied.min_role,
+                    denied.signals.join(", ")
+                );
+            }
+        }
     }
     let db_path = daku_core::persistence::StateStore::default_path();
     println!(
@@ -385,6 +458,8 @@ struct Arguments {
     probe_availability: bool,
     doctor: bool,
     doctor_fix: bool,
+    doctor_check_roles: bool,
+    digest_command: bool,
     diagnostics: bool,
     diagnostics_out: Option<std::path::PathBuf>,
     setup: bool,
@@ -396,6 +471,7 @@ struct Arguments {
     setup_clone_source: bool,
     setup_credential_file: Option<std::path::PathBuf>,
     setup_no_probe: bool,
+    rotate_credential: bool,
     credential_store: Option<String>,
     credential_file: Option<std::path::PathBuf>,
     digest_env: Option<String>,
@@ -411,6 +487,8 @@ impl Arguments {
         let mut probe_availability = false;
         let mut doctor = false;
         let mut doctor_fix = false;
+        let mut doctor_check_roles = false;
+        let mut digest_command = false;
         let mut diagnostics = false;
         let mut diagnostics_out = None;
         let mut setup = false;
@@ -422,6 +500,7 @@ impl Arguments {
         let mut setup_clone_source = false;
         let mut setup_credential_file = None;
         let mut setup_no_probe = false;
+        let mut rotate_credential = false;
         let mut credential_store = None;
         let mut credential_file = None;
         let mut digest_env = None;
@@ -437,6 +516,9 @@ impl Arguments {
                 }
                 "diagnostics" => {
                     diagnostics = true;
+                }
+                "rotate-credential" => {
+                    rotate_credential = true;
                 }
                 "--out" => {
                     diagnostics_out = Some(std::path::PathBuf::from(
@@ -501,16 +583,17 @@ impl Arguments {
                     setup_no_probe = true;
                 }
                 "digest" => {
+                    digest_command = true;
                     digest_env = Some(String::new());
                 }
                 "--env" => {
-                    let id = arguments
-                        .next()
-                        .ok_or_else(|| anyhow!("--env requires an environment id"))?;
-                    if digest_env.is_none() {
-                        bail!("--env requires the digest command");
-                    }
-                    digest_env = Some(id);
+                    // Order-free: end validation decides whether digest or
+                    // rotate-credential owns this flag.
+                    digest_env = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--env requires an environment id"))?,
+                    );
                 }
                 "--days" => {
                     digest_days = arguments
@@ -521,6 +604,9 @@ impl Arguments {
                 }
                 "--fix" => {
                     doctor_fix = true;
+                }
+                "--check-roles" => {
+                    doctor_check_roles = true;
                 }
                 "--bind" => {
                     bind = arguments
@@ -563,7 +649,7 @@ impl Arguments {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [probe-availability] [doctor [--fix]] [digest --env ID [--days N]] [diagnostics [--out DIR]] [setup --id ID --url URL [--label LABEL] [--platform servicenow|http|github] [--auth basic|oauth] [--clone-source] [--secret-file PATH] [--no-probe]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
+                        "usage: {} [probe-availability] [doctor [--fix] [--check-roles]] [digest --env ID [--days N]] [diagnostics [--out DIR]] [setup --id ID --url URL [--label LABEL] [--platform servicenow|http|github] [--auth basic|oauth] [--clone-source] [--secret-file PATH] [--no-probe]] [rotate-credential --env ID --secret-file PATH [--no-probe]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -573,6 +659,24 @@ impl Arguments {
         }
         if doctor_fix && !doctor {
             bail!("--fix requires doctor");
+        }
+        if doctor_check_roles && !doctor {
+            bail!("--check-roles requires doctor");
+        }
+        if digest_env.is_some() && digest_env.as_deref().is_some_and(|id| id.is_empty()) {
+            bail!("--env requires an environment id");
+        }
+        if digest_env.is_some() && !digest_command && !rotate_credential {
+            bail!("--env requires digest or rotate-credential");
+        }
+        if setup_credential_file.is_some() && !setup && !rotate_credential {
+            bail!("--secret-file requires setup or rotate-credential");
+        }
+        if setup_no_probe && !setup && !rotate_credential {
+            bail!("--no-probe requires setup or rotate-credential");
+        }
+        if setup_clone_source && !setup {
+            bail!("--clone-source requires setup");
         }
         if credential_file.is_some() && credential_store.as_deref() != Some("file") {
             bail!("--credential-file requires --credential-store file");
@@ -600,6 +704,8 @@ impl Arguments {
             probe_availability,
             doctor,
             doctor_fix,
+            doctor_check_roles,
+            digest_command,
             credential_store,
             credential_file,
             digest_env,
@@ -615,6 +721,7 @@ impl Arguments {
             setup_clone_source,
             setup_credential_file,
             setup_no_probe,
+            rotate_credential,
         })
     }
 }
@@ -846,6 +953,46 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_rotate_credential_and_check_roles_flags() {
+        let arguments = Arguments::parse([
+            "rotate-credential".into(),
+            "--env".into(),
+            "prod".into(),
+            "--secret-file".into(),
+            "/tmp/daku-secret.json".into(),
+        ])
+        .unwrap();
+        assert!(arguments.rotate_credential);
+        assert_eq!(arguments.digest_env.as_deref(), Some("prod"));
+        // --env without a command is rejected …
+        assert!(Arguments::parse(["--env".into(), "prod".into()]).is_err());
+        // … but either consumer accepts it, in any order.
+        assert!(
+            Arguments::parse(["--env".into(), "prod".into(), "rotate-credential".into()]).is_ok()
+        );
+        assert!(
+            Arguments::parse([
+                "rotate-credential".into(),
+                "--env".into(),
+                "prod".into(),
+                "--no-probe".into()
+            ])
+            .unwrap()
+            .setup_no_probe
+        );
+        // --secret-file without setup/rotate is rejected.
+        assert!(Arguments::parse(["--secret-file".into(), "/tmp/x.json".into()]).is_err());
+        // --check-roles needs doctor, --no-probe needs a writer.
+        assert!(
+            Arguments::parse(["doctor".into(), "--check-roles".into(),])
+                .unwrap()
+                .doctor_check_roles
+        );
+        assert!(Arguments::parse(["--check-roles".into()]).is_err());
+        assert!(Arguments::parse(["--no-probe".into()]).is_err());
     }
 
     fn doctor_row(credential_present: bool) -> daku_core::DoctorRow {
