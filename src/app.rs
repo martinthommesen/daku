@@ -316,17 +316,33 @@ impl Daku {
     }
 
     /// Pre-flight: plain fields plus Credential shape when a fresh blob was
-    /// entered. Shows the first problem in the sheet.
+    /// entered, plus threshold and expected-drift parsing. Shows the first
+    /// problem in the sheet.
     fn validate_sheet(
         &mut self,
         cx: &App,
     ) -> Option<(daku_protocol::EnvironmentConfig, Option<String>)> {
-        let (config, blob) = self.read_sheet(cx)?;
+        let (mut config, blob) = self.read_sheet(cx)?;
         if let Err(error) =
             crate::env_sheet::validate_fields(&config.id, &config.label, &config.instance_url)
         {
             self.set_sheet_notice(true, error);
             return None;
+        }
+        let sheet = self.env_sheet.as_ref()?;
+        match sheet.thresholds_result(cx) {
+            Ok(thresholds) => config.thresholds = thresholds,
+            Err(error) => {
+                self.set_sheet_notice(true, error);
+                return None;
+            }
+        }
+        match sheet.expected_drift_result(cx) {
+            Ok(expected_drift) => config.expected_drift = expected_drift,
+            Err(error) => {
+                self.set_sheet_notice(true, error);
+                return None;
+            }
         }
         if let Some(blob) = &blob
             && let Err(error) = daku_protocol::validate_credential(config.auth_method, blob)
@@ -993,7 +1009,10 @@ impl Daku {
                 .pt(px(64.0))
                 .child(
                     div()
+                        .id("env-sheet-panel")
                         .w(px(520.0))
+                        .max_h(px(640.0))
+                        .overflow_y_scroll()
                         .rounded(cx.theme().radius)
                         .border_1()
                         .border_color(cx.theme().border)
@@ -1053,6 +1072,74 @@ impl Daku {
                                 )
                                 .child(Input::new(&sheet.secret_b).mask_toggle()),
                         )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    "Thresholds — empty means default. Jobs errors and RTT accept off.",
+                                ),
+                        )
+                        .child(EnvSheet::field_row(
+                            "Jobs overdue ≥",
+                            &sheet.threshold_jobs_overdue,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "Jobs errors ≥ (off)",
+                            &sheet.threshold_jobs_error,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "Syslog errors ≥",
+                            &sheet.threshold_syslog,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "Outbound failures ≥",
+                            &sheet.threshold_outbound,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "Unhealthy MIDs ≥",
+                            &sheet.threshold_mid,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "ECC errors ≥",
+                            &sheet.threshold_ecc_error,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "ECC queue ≥",
+                            &sheet.threshold_ecc_queue,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "Drift mismatches ≥",
+                            &sheet.threshold_drift,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "RTT ceiling ms (off)",
+                            &sheet.threshold_rtt,
+                            cx,
+                        ))
+                        .child(match sheet.thresholds_result(cx) {
+                            Ok(thresholds) => div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("Effective: {}", thresholds.summary())),
+                            Err(error) => div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(error),
+                        })
+                        .child(EnvSheet::field_row(
+                            "Expected drift ids (comma-separated)",
+                            &sheet.expected_drift_field,
+                            cx,
+                        ))
                         .when(sheet.editing_id.is_some(), |element| {
                             element.child(
                                 div()
