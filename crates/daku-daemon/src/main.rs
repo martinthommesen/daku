@@ -18,6 +18,12 @@ fn main() -> anyhow::Result<()> {
     if let Some(env_id) = arguments.digest_env.clone() {
         return run_digest_command(&env_id, arguments.digest_days);
     }
+    if arguments.setup {
+        return run_setup_command(&arguments);
+    }
+    if arguments.diagnostics {
+        return run_diagnostics_command(arguments.diagnostics_out.clone());
+    }
     let auth = require_token(std::env::var(DAEMON_TOKEN_ENV))?;
     // The bearer capability belongs only to this server process. Remove it
     // before any provider or workspace subprocess can inherit the daemon's
@@ -197,6 +203,69 @@ fn run_digest_command(environment_id: &str, days: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Writes a redacted diagnostics bundle (config without secrets, scrubbed
+/// log tail, database census) for tickets and debugging. Offline by design:
+/// no probes, no Keychain reads. Prints the written files.
+fn run_diagnostics_command(out: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let home = daku_core::daku_home_dir();
+    let out = out.unwrap_or_else(|| {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        home.join(format!("diagnostics-{epoch}"))
+    });
+    for path in daku_core::diagnostics::write_diagnostics(&out, &home)? {
+        println!("{}", path.display());
+    }
+    Ok(())
+}
+
+/// Non-interactive onboarding: validates, probes (unless `--no-probe`),
+/// and saves one Environment plus its Credential. The secret arrives via
+/// `--secret-file`, never argv. Needs no token; writes config + store.
+fn run_setup_command(arguments: &Arguments) -> anyhow::Result<()> {
+    use daku_core::config::{AuthMethod, Platform};
+    let platform = match arguments.setup_platform.as_deref().unwrap_or("servicenow") {
+        "http" => Platform::Http,
+        "github" => Platform::Github,
+        _ => Platform::Servicenow,
+    };
+    let auth_method = match arguments.setup_auth.as_deref().unwrap_or("oauth") {
+        "basic" => AuthMethod::Basic,
+        _ => AuthMethod::OauthClientCredentials,
+    };
+    let credential_json = arguments
+        .setup_credential_file
+        .as_deref()
+        .map(std::fs::read_to_string)
+        .transpose()
+        .context("could not read --secret-file")?
+        .map(|secret| secret.trim().to_owned())
+        .filter(|secret| !secret.is_empty());
+    let store = resolve_credential_store(arguments);
+    let line = daku_core::setup::run_setup(
+        &daku_core::default_environments_path(),
+        store.as_ref(),
+        &daku_core::servicenow::ServiceNowClient::new(
+            daku_core::servicenow::UreqTransport::default(),
+            daku_core::servicenow::SystemClock,
+        ),
+        daku_core::setup::SetupArgs {
+            id: arguments.setup_id.clone().unwrap_or_default(),
+            label: arguments.setup_label.clone().unwrap_or_default(),
+            instance_url: arguments.setup_url.clone().unwrap_or_default(),
+            platform,
+            auth_method,
+            clone_source: arguments.setup_clone_source,
+            credential_json,
+            probe: !arguments.setup_no_probe,
+        },
+    )?;
+    println!("{line}");
+    Ok(())
+}
+
 fn resolve_credential_store(arguments: &Arguments) -> Arc<dyn daku_core::config::CredentialStore> {
     let wants_file = arguments
         .credential_store
@@ -315,6 +384,17 @@ struct Arguments {
     probe_availability: bool,
     doctor: bool,
     doctor_fix: bool,
+    diagnostics: bool,
+    diagnostics_out: Option<std::path::PathBuf>,
+    setup: bool,
+    setup_id: Option<String>,
+    setup_label: Option<String>,
+    setup_url: Option<String>,
+    setup_platform: Option<String>,
+    setup_auth: Option<String>,
+    setup_clone_source: bool,
+    setup_credential_file: Option<std::path::PathBuf>,
+    setup_no_probe: bool,
     credential_store: Option<String>,
     credential_file: Option<std::path::PathBuf>,
     digest_env: Option<String>,
@@ -330,6 +410,17 @@ impl Arguments {
         let mut probe_availability = false;
         let mut doctor = false;
         let mut doctor_fix = false;
+        let mut diagnostics = false;
+        let mut diagnostics_out = None;
+        let mut setup = false;
+        let mut setup_id = None;
+        let mut setup_label = None;
+        let mut setup_url = None;
+        let mut setup_platform = None;
+        let mut setup_auth = None;
+        let mut setup_clone_source = false;
+        let mut setup_credential_file = None;
+        let mut setup_no_probe = false;
         let mut credential_store = None;
         let mut credential_file = None;
         let mut digest_env = None;
@@ -342,6 +433,71 @@ impl Arguments {
                 }
                 "doctor" => {
                     doctor = true;
+                }
+                "diagnostics" => {
+                    diagnostics = true;
+                }
+                "--out" => {
+                    diagnostics_out = Some(std::path::PathBuf::from(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--out requires a directory"))?,
+                    ));
+                }
+                "setup" => {
+                    setup = true;
+                }
+                "--id" => {
+                    setup_id = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--id requires an environment id"))?,
+                    );
+                }
+                "--label" => {
+                    setup_label = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--label requires a label"))?,
+                    );
+                }
+                "--url" => {
+                    setup_url = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--url requires an https URL"))?,
+                    );
+                }
+                "--platform" => {
+                    let value = arguments.next().ok_or_else(|| {
+                        anyhow!("--platform requires servicenow, http, or github")
+                    })?;
+                    if !["servicenow", "http", "github"].contains(&value.as_str()) {
+                        bail!("--platform must be servicenow, http, or github, got {value:?}");
+                    }
+                    setup_platform = Some(value);
+                }
+                "--auth" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| anyhow!("--auth requires basic or oauth"))?;
+                    if !["basic", "oauth"].contains(&value.as_str()) {
+                        bail!("--auth must be basic or oauth, got {value:?}");
+                    }
+                    setup_auth = Some(value);
+                }
+                "--clone-source" => {
+                    setup_clone_source = true;
+                }
+                "--secret-file" => {
+                    setup_credential_file = Some(std::path::PathBuf::from(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--secret-file requires a path"))?,
+                    ));
+                }
+                "--no-probe" => {
+                    setup_no_probe = true;
                 }
                 "digest" => {
                     digest_env = Some(String::new());
@@ -406,7 +562,7 @@ impl Arguments {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [probe-availability] [doctor [--fix]] [digest --env ID [--days N]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
+                        "usage: {} [probe-availability] [doctor [--fix]] [digest --env ID [--days N]] [diagnostics [--out DIR]] [setup --id ID --url URL [--label LABEL] [--platform servicenow|http|github] [--auth basic|oauth] [--clone-source] [--secret-file PATH] [--no-probe]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -420,11 +576,20 @@ impl Arguments {
         if credential_file.is_some() && credential_store.as_deref() != Some("file") {
             bail!("--credential-file requires --credential-store file");
         }
+        if setup && (setup_id.is_none() || setup_url.is_none()) {
+            bail!("setup requires --id and --url");
+        }
+        if !setup && (setup_id.is_some() || setup_url.is_some()) {
+            bail!("--id and --url require setup");
+        }
         if digest_env.as_deref() == Some("") || digest_env.is_none() && digest_days != 7 {
             bail!("digest requires --env <id>");
         }
         if digest_days < 1 {
             bail!("--days must be at least 1");
+        }
+        if diagnostics_out.is_some() && !diagnostics {
+            bail!("--out requires diagnostics");
         }
         Ok(Self {
             bind,
@@ -438,6 +603,17 @@ impl Arguments {
             credential_file,
             digest_env,
             digest_days,
+            diagnostics,
+            diagnostics_out,
+            setup,
+            setup_id,
+            setup_label,
+            setup_url,
+            setup_platform,
+            setup_auth,
+            setup_clone_source,
+            setup_credential_file,
+            setup_no_probe,
         })
     }
 }
@@ -526,6 +702,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_diagnostics_with_out() {
+        let arguments =
+            Arguments::parse(["diagnostics".into(), "--out".into(), "/tmp/d.json".into()]).unwrap();
+        assert!(arguments.diagnostics);
+        assert_eq!(
+            arguments.diagnostics_out,
+            Some(std::path::PathBuf::from("/tmp/d.json"))
+        );
+        assert!(Arguments::parse(["--out".into(), "/tmp/d.json".into()]).is_err());
+    }
+
+    #[test]
     fn parses_digest_with_env_and_days() {
         let arguments = Arguments::parse([
             "digest".into(),
@@ -600,6 +788,63 @@ mod tests {
         );
         assert!(path.exists(), "file store writes to the flagged path");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_setup_with_options_and_rejects_halves() {
+        let arguments = Arguments::parse([
+            "setup".into(),
+            "--id".into(),
+            "dev".into(),
+            "--url".into(),
+            "https://acme.example.service-now.com".into(),
+            "--platform".into(),
+            "github".into(),
+            "--auth".into(),
+            "basic".into(),
+            "--clone-source".into(),
+            "--secret-file".into(),
+            "/tmp/daku-secret.json".into(),
+            "--no-probe".into(),
+        ])
+        .unwrap();
+        assert!(arguments.setup);
+        assert_eq!(arguments.setup_id.as_deref(), Some("dev"));
+        assert_eq!(
+            arguments.setup_url.as_deref(),
+            Some("https://acme.example.service-now.com")
+        );
+        assert_eq!(arguments.setup_platform.as_deref(), Some("github"));
+        assert_eq!(arguments.setup_auth.as_deref(), Some("basic"));
+        assert!(arguments.setup_clone_source);
+        assert!(arguments.setup_no_probe);
+        assert!(Arguments::parse(["setup".into()]).is_err());
+        assert!(
+            Arguments::parse(["setup".into(), "--id".into(), "dev".into()]).is_err(),
+            "setup without --url is rejected"
+        );
+        assert!(
+            Arguments::parse([
+                "--id".into(),
+                "dev".into(),
+                "--url".into(),
+                "https://x".into()
+            ])
+            .is_err(),
+            "--id/--url without setup is rejected"
+        );
+        assert!(
+            Arguments::parse([
+                "setup".into(),
+                "--id".into(),
+                "dev".into(),
+                "--url".into(),
+                "https://x".into(),
+                "--platform".into(),
+                "jira".into(),
+            ])
+            .is_err()
+        );
     }
 
     fn doctor_row(credential_present: bool) -> daku_core::DoctorRow {

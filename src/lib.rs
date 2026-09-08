@@ -5,6 +5,7 @@ pub mod daemon;
 mod dashboard_state;
 mod env_sheet;
 mod notifications;
+mod palette;
 mod platform;
 mod updater;
 
@@ -30,6 +31,8 @@ actions!(
         ExportSnapshot,
         ToggleNotifications,
         ToggleWeeklyDigest,
+        TogglePalette,
+        ClosePalette,
         AddEnvironment,
         DetachSelectedEnvironment
     ]
@@ -138,6 +141,8 @@ pub fn run() {
                 KeyBinding::new("secondary-r", ReloadDaemon, None),
                 KeyBinding::new("secondary-shift-c", CopySummary, None),
                 KeyBinding::new("secondary-shift-e", ExportSnapshot, None),
+                KeyBinding::new("secondary-k", TogglePalette, None),
+                KeyBinding::new("escape", ClosePalette, None),
                 KeyBinding::new("secondary-1", SelectEnvironmentSlot { slot: 0 }, None),
                 KeyBinding::new("secondary-2", SelectEnvironmentSlot { slot: 1 }, None),
                 KeyBinding::new("secondary-3", SelectEnvironmentSlot { slot: 2 }, None),
@@ -295,6 +300,7 @@ pub(crate) fn set_app_menus_with_prefs(
                     "Export Environment Snapshot",
                     ExportSnapshot,
                 ));
+                items.push(MenuItem::action("Command Palette…", TogglePalette));
                 items.push(MenuItem::action(
                     "Toggle Health Notifications",
                     ToggleNotifications,

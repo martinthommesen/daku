@@ -3,6 +3,7 @@
 pub mod availability;
 pub mod collector;
 pub mod config;
+pub mod diagnostics;
 pub mod digest;
 pub mod drift;
 pub mod email;
@@ -21,6 +22,7 @@ pub mod servicenow;
 pub mod sessions;
 pub mod settings;
 pub mod settings_backend;
+pub mod setup;
 pub mod syslog;
 pub mod table_growth;
 pub mod transaction;

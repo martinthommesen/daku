@@ -7,8 +7,8 @@ use daku_client::DaemonSupervisor;
 use daku_protocol::{EnvironmentHealth, HealthEventDto, Reachability, ServerMessage};
 use gpui::{
     App, AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, FontWeight,
-    IntoElement, PathBuilder, Pixels, Point, SharedString, Window, canvas, div, point, prelude::*,
-    px,
+    IntoElement, KeyDownEvent, PathBuilder, Pixels, Point, SharedString, Window, canvas, div,
+    point, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Sizable as _, TitleBar, h_flex,
@@ -25,6 +25,7 @@ use gpui_component::{
 };
 
 use crate::AddEnvironment;
+use crate::ClosePalette;
 use crate::CloseWindow;
 use crate::CopySummary;
 use crate::DetachSelectedEnvironment;
@@ -34,6 +35,7 @@ use crate::SelectEnvironment;
 use crate::SelectEnvironmentSlot;
 use crate::SetQuietHours;
 use crate::ToggleNotifications;
+use crate::TogglePalette;
 use crate::ToggleSignalNotify;
 use crate::ToggleWeeklyDigest;
 use crate::dashboard_state::{
@@ -65,6 +67,9 @@ pub struct Daku {
     /// Health event awaiting annotation: (environment, observed_at, kind).
     /// Signal rows take no notes.
     note_target: Option<(String, i64, String)>,
+    /// Command palette (⌘K) visibility and filter text.
+    palette_open: bool,
+    palette_input: Entity<InputState>,
     /// Desktop boot time: health events observed before this record as seen
     /// without firing, so launch/reconnect replays never storm.
     boot_now: i64,
@@ -111,6 +116,7 @@ impl Daku {
             }
             let timeline_filter = cx.new(|cx| InputState::new(window, cx).default_value(""));
             let note_input = cx.new(|cx| InputState::new(window, cx).default_value(""));
+            let palette_input = cx.new(|cx| InputState::new(window, cx).default_value(""));
             tick_freshness(cx);
             // Detached windows never pump clicks or post: the main window
             // owns notifications, so a second window cannot double-fire.
@@ -128,6 +134,8 @@ impl Daku {
                 timeline_filter,
                 note_input,
                 note_target: None,
+                palette_open: false,
+                palette_input,
                 boot_now: unix_now(),
                 notify_seen: HashSet::new(),
                 last_ambient: None,
@@ -358,6 +366,23 @@ impl Daku {
             self.state.open_card("drift");
         }
         cx.notify();
+    }
+
+    /// Opens the selected Environment in its own window (palette and menu
+    /// share this; the detached window pins, drops the sidebar, and owns
+    /// no notifications).
+    fn detach_selected(&mut self, cx: &mut App) {
+        let Some(id) = self.state.selected_id().map(str::to_owned) else {
+            return;
+        };
+        let supervisor = self.supervisor.clone();
+        let settings = self.settings.clone();
+        let bounds = gpui::WindowBounds::Windowed(gpui::Bounds::centered(
+            None,
+            gpui::size(gpui::px(1100.0), gpui::px(800.0)),
+            cx,
+        ));
+        let _ = crate::open_daku_window(cx, supervisor, settings, None, Some(id), bounds);
     }
 
     fn select_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
@@ -739,6 +764,146 @@ impl Daku {
             .detach();
         }
     }
+
+    /// Filtered palette rows for the current query. Pure over state plus
+    /// the input text, so the overlay is one read during render.
+    fn palette_matches(&self, cx: &App) -> Vec<crate::palette::PaletteEntry> {
+        let query = self.palette_input.read(cx).value().to_string();
+        let selected = self.state.selected_id().map(str::to_owned);
+        let envs: Vec<crate::palette::EnvRef<'_>> = self
+            .state
+            .environments()
+            .iter()
+            .map(|env| crate::palette::EnvRef {
+                id: &env.id,
+                label: &env.label,
+                health: env.health.as_str(),
+            })
+            .collect();
+        let entries = crate::palette::entries_for(&envs, selected.as_deref());
+        crate::palette::filter_entries(&entries, &query)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Runs one palette entry by id; unknown ids are ignored. The sheet
+    /// needs a window and runs here; the Enter key runs
+    /// `run_palette_command`, which covers everything else.
+    fn run_palette_entry(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_open = false;
+        if !self.run_palette_command(id, cx) {
+            match id {
+                "add-env" => self.open_add_sheet(window, cx),
+                "detach" => self.detach_selected(cx),
+                _ => {}
+            }
+        }
+        cx.notify();
+    }
+
+    /// Window-free palette entries. Returns false for entries the caller
+    /// must handle with a window.
+    fn run_palette_command(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        if let Some(env_id) = id.strip_prefix("switch:") {
+            self.select_environment(env_id, false, cx);
+            return true;
+        }
+        match id {
+            "reload" => {
+                if let Some(supervisor) = self.supervisor.as_ref().filter(|s| s.is_local()) {
+                    let _ = supervisor.reload();
+                }
+            }
+            "copy" => self.copy_summary(cx),
+            "export" => self.export_snapshot(cx),
+            "toggle-notifications" => {
+                if let Ok(mut settings) = self.settings.lock() {
+                    settings.notifications_enabled = !settings.notifications_enabled;
+                }
+                self.persist_settings();
+                self.refresh_menus(cx);
+            }
+            "toggle-digest" => {
+                if let Ok(mut settings) = self.settings.lock() {
+                    settings.digest_weekly = !settings.digest_weekly;
+                }
+                self.persist_settings();
+                self.refresh_menus(cx);
+            }
+            "mute-1h" => self.mute_selected(3600, cx),
+            "mute-4h" => self.mute_selected(14_400, cx),
+            "mute-24h" => self.mute_selected(86_400, cx),
+            "unmute" => self.unmute_selected(cx),
+            "open-snow" => {
+                if let Some(url) = self.state.selected().map(|env| env.instance_url.clone()) {
+                    cx.open_url(&url);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The palette overlay: filter input plus matching rows under the
+    /// Environment header. `None` when closed.
+    fn palette_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.palette_open {
+            return None;
+        }
+        let matches = self.palette_matches(cx);
+        Some(
+            v_flex()
+                .mx(px(22.0))
+                .mb(px(8.0))
+                .p(px(10.0))
+                .gap(px(4.0))
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().secondary)
+                .child(Input::new(&self.palette_input).small())
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key.as_str() == "enter" {
+                        let first = this.palette_matches(cx).into_iter().next();
+                        // No window down here: entries needing one (add-env,
+                        // detach) stay on the click path; Enter runs the
+                        // window-free subset and closes.
+                        if let Some(entry) = first {
+                            let id = entry.id.clone();
+                            this.palette_open = false;
+                            this.run_palette_command(&id, cx);
+                            cx.notify();
+                        }
+                    }
+                }))
+                .children(matches.into_iter().map(|entry| {
+                    let id = entry.id.clone();
+                    div()
+                        .id(SharedString::from(format!("palette-{id}")))
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(cx.theme().radius)
+                        .text_sm()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().muted))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.run_palette_entry(&id, window, cx);
+                        }))
+                        .child(entry.title.clone())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(entry.hint.clone()),
+                        )
+                }))
+                .into_any_element(),
+        )
+    }
 }
 
 /// Export root for one Environment at one moment. Pure so tests pin the
@@ -968,6 +1133,16 @@ impl Render for Daku {
             .on_action(cx.listener(|this, _: &ExportSnapshot, _, cx| {
                 this.export_snapshot(cx);
             }))
+            .on_action(cx.listener(|this, _: &TogglePalette, _, cx| {
+                this.palette_open = !this.palette_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ClosePalette, _, cx| {
+                if this.palette_open {
+                    this.palette_open = false;
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleNotifications, _, cx| {
                 if let Ok(mut settings) = this.settings.lock() {
                     settings.notifications_enabled = !settings.notifications_enabled;
@@ -1012,17 +1187,7 @@ impl Render for Daku {
                 this.open_add_sheet(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DetachSelectedEnvironment, _, cx| {
-                let Some(id) = this.state.selected_id().map(str::to_owned) else {
-                    return;
-                };
-                let supervisor = this.supervisor.clone();
-                let settings = this.settings.clone();
-                let bounds = gpui::WindowBounds::Windowed(gpui::Bounds::centered(
-                    None,
-                    gpui::size(gpui::px(1100.0), gpui::px(800.0)),
-                    cx,
-                ));
-                let _ = crate::open_daku_window(cx, supervisor, settings, None, Some(id), bounds);
+                this.detach_selected(cx);
             }))
             .child(
                 TitleBar::new()
@@ -1929,6 +2094,7 @@ impl Daku {
                             .children(cards),
                     )
                     .children(self.recent_block(cx))
+                    .children(self.palette_overlay(cx))
                     .children(drill_in)
                     .children(compare)
             })
