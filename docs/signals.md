@@ -13,7 +13,8 @@ Shared semantics:
 - Poll cadence: one shared loop, default 120 s (`poll_interval_secs` in
   `~/.daku/settings.json`, floor 30 s, read at daemon start).
 - Thresholds: per-Environment `thresholds` object in
-  `~/.daku/environments.json`; missing keys fall back to the defaults below,
+  `~/.daku/environments.json` (or the Environment sheet, which edits the
+  same values); missing keys fall back to the defaults below,
   unknown keys are rejected. `daku-daemon doctor` prints effective values.
 - Outcomes `reachable` · `unreachable` · `asleep` (hibernating PDI) are
   distinct from health. Asleep Environments are skipped, never probed, never
