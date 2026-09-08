@@ -1086,7 +1086,7 @@ impl Daku {
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(
-                                    "Thresholds — empty means default. Jobs errors, email, RTT and transaction avg accept off.",
+                                    "Thresholds — empty means default. Jobs errors, email, update sets, RTT and transaction avg accept off.",
                                 ),
                         )
                         .child(EnvSheet::field_row(
@@ -1127,6 +1127,11 @@ impl Daku {
                         .child(EnvSheet::field_row(
                             "Transaction avg ms (off)",
                             &sheet.threshold_txn,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "Open update sets ≥ (off)",
+                            &sheet.threshold_updates,
                             cx,
                         ))
                         .child(EnvSheet::field_row(

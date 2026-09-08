@@ -435,6 +435,37 @@
     "signal_id": "slow_txn",
     "state": "degraded"
   },
+  "update_sets_clean": {
+    "payload": {
+      "open_count": 0,
+      "open_rows": [],
+      "open_rows_truncated": false
+    },
+    "signal_id": "update_sets",
+    "state": "healthy"
+  },
+  "update_sets_open": {
+    "payload": {
+      "open_count": 2,
+      "open_rows": [
+        {
+          "name": "Add field X",
+          "state": "build",
+          "sys_id": "us-1",
+          "sys_updated_on": "2026-01-27 00:12:00"
+        },
+        {
+          "name": "Fix flow",
+          "state": "Open",
+          "sys_id": "us-2",
+          "sys_updated_on": "2026-01-26 00:12:00"
+        }
+      ],
+      "open_rows_truncated": false
+    },
+    "signal_id": "update_sets",
+    "state": "degraded"
+  },
   "upgrade_clean": {
     "payload": {
       "failed_7d": 0,

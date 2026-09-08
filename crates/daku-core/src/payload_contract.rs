@@ -32,6 +32,7 @@ use crate::syslog::{SYSLOG_SIGNAL_ID, SyslogCollector};
 use crate::table_growth::{TABLE_GROWTH_SIGNAL_ID, TableGrowthCollector};
 use crate::test_support::{TempDb, prod};
 use crate::transaction::{TRANSACTION_SIGNAL_ID, TransactionCollector};
+use crate::update_sets::{UPDATE_SETS_SIGNAL_ID, UpdateSetsCollector};
 use crate::upgrade::{UPGRADE_SIGNAL_ID, UpgradeCollector};
 
 const PINNED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/payloads.json");
@@ -165,6 +166,20 @@ impl HttpTransport for ContractTransport {
                     {"sys_id":"up-1","from_version":"Zurich P0","to_version":"Zurich P1","state":"Completed","upgrade_started":"2099-01-01 01:00:00","upgrade_finished":"2099-01-01 02:00:00"}
                 ]}"#
             }
+        } else if url.contains("/api/now/table/sys_update_set") {
+            // Before any sys_update_xml arm: "sys_update_set" is a prefix of
+            // nothing else here, but keep the specific table first by habit.
+            if source {
+                r#"{"result":[
+                    {"sys_id":"us-1","name":"Add field X","state":"build","sys_updated_on":"2026-01-27 00:12:00"},
+                    {"sys_id":"us-2","name":"Fix flow","state":"Open","sys_updated_on":"2026-01-26 00:12:00"},
+                    {"sys_id":"us-3","name":"Shipped","state":"Complete","sys_updated_on":"2026-01-20 00:12:00"}
+                ]}"#
+            } else {
+                r#"{"result":[
+                    {"sys_id":"us-3","name":"Shipped","state":"Complete","sys_updated_on":"2026-01-20 00:12:00"}
+                ]}"#
+            }
         } else if url.contains("/api/now/table/v_user_session") {
             if source {
                 r#"{"result":[{"sys_id":"s1"},{"sys_id":"s2"},{"sys_id":"s3"}]}"#
@@ -281,6 +296,7 @@ fn generate() -> BTreeMap<String, Value> {
     let db = TempDb::new("payload-counts");
     let mut contract_prod = prod();
     contract_prod.thresholds.transaction_avg_degraded_ms = Some(500);
+    contract_prod.thresholds.update_sets_open_degraded_at = 1;
     let environments = vec![contract_prod, env("test", "acme-test", false)];
     let store = credentials(&["prod", "test"]);
     for collector in [
@@ -338,6 +354,12 @@ fn generate() -> BTreeMap<String, Value> {
             client(),
             db.store(),
         )),
+        Box::new(UpdateSetsCollector::new(
+            environments.clone(),
+            store.clone(),
+            client(),
+            db.store(),
+        )),
         Box::new(MidEccCollector::new(
             environments.clone(),
             store.clone(),
@@ -367,6 +389,8 @@ fn generate() -> BTreeMap<String, Value> {
         ("table_growth_quiet", "test", TABLE_GROWTH_SIGNAL_ID),
         ("txn_slow", "prod", TRANSACTION_SIGNAL_ID),
         ("txn_ok", "test", TRANSACTION_SIGNAL_ID),
+        ("update_sets_open", "prod", UPDATE_SETS_SIGNAL_ID),
+        ("update_sets_clean", "test", UPDATE_SETS_SIGNAL_ID),
         ("mid_ecc_healthy", "prod", MID_ECC_SIGNAL_ID),
         ("mid_ecc_unhealthy", "test", MID_ECC_SIGNAL_ID),
     ] {
@@ -539,9 +563,10 @@ fn every_known_signal_has_a_pinned_case() {
     use crate::syslog::SYSLOG_SIGNAL_ID;
     use crate::table_growth::TABLE_GROWTH_SIGNAL_ID;
     use crate::transaction::TRANSACTION_SIGNAL_ID;
+    use crate::update_sets::UPDATE_SETS_SIGNAL_ID;
     use crate::upgrade::UPGRADE_SIGNAL_ID;
 
-    const KNOWN: [&str; 13] = [
+    const KNOWN: [&str; 14] = [
         AVAILABILITY_SIGNAL_ID,
         JOBS_SIGNAL_ID,
         SYSLOG_SIGNAL_ID,
@@ -553,6 +578,7 @@ fn every_known_signal_has_a_pinned_case() {
         SESSIONS_SIGNAL_ID,
         TABLE_GROWTH_SIGNAL_ID,
         TRANSACTION_SIGNAL_ID,
+        UPDATE_SETS_SIGNAL_ID,
         DRIFT_SIGNAL_ID,
         LAST_CLONE_SIGNAL_ID,
     ];

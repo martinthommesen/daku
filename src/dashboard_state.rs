@@ -7,7 +7,7 @@ use daku_protocol::{
     RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
 };
 
-pub const SIGNAL_IDS: [&str; 13] = [
+pub const SIGNAL_IDS: [&str; 14] = [
     "availability",
     "jobs",
     "syslog",
@@ -19,6 +19,7 @@ pub const SIGNAL_IDS: [&str; 13] = [
     "sessions",
     "table_growth",
     "slow_txn",
+    "update_sets",
     "drift",
     "last_clone",
 ];
@@ -43,6 +44,7 @@ pub fn signal_label(signal_id: &str) -> &'static str {
         "sessions" => "Sessions",
         "table_growth" => "Table growth",
         "slow_txn" => "Slow transactions",
+        "update_sets" => "Update sets",
         "drift" => "Version / plugins",
         "last_clone" => "Last clone",
         _ => "Signal",
@@ -552,6 +554,7 @@ impl DashboardState {
             "slow_txn" => {
                 "/syslog_transaction_list.do?sysparm_query=sys_created_on>javascript:gs.hoursAgoStart(1)"
             }
+            "update_sets" => "/sys_update_set_list.do",
             "drift" => "/v_plugin_list.do",
             "last_clone" => "/clone_instance_list.do",
             _ => return None,
@@ -685,6 +688,9 @@ impl DashboardState {
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "slow_txn" => self
                 .slow_txn_rows(value)
+                .unwrap_or_else(|| self.drill_in_text(signal_id)),
+            "update_sets" => self
+                .update_sets_rows(value)
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "availability" => self.drill_in_trend(signal_id, now),
             _ => self.drill_in_text(signal_id),
@@ -978,6 +984,34 @@ impl DashboardState {
                 })
                 .collect(),
             truncated: value.get("slow_rows_truncated") == Some(&serde_json::Value::Bool(true))
+                || list.len() > DRILL_IN_ROW_LIMIT,
+        })
+    }
+
+    /// Open update sets the daemon counted. Each row links its
+    /// `sys_update_set` record.
+    fn update_sets_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let list = value
+            .get("open_rows")
+            .and_then(|item| item.as_array())
+            .filter(|list| !list.is_empty())?;
+        Some(DrillIn::Rows {
+            headers: vec!["Update set", "Updated"],
+            rows: list
+                .iter()
+                .take(DRILL_IN_ROW_LIMIT)
+                .map(|entry| {
+                    let sys_id = entry
+                        .get("sys_id")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("");
+                    DrillInRow {
+                        cells: vec![cell(entry, "name"), cell(entry, "sys_updated_on")],
+                        link: self.record_url("sys_update_set", sys_id),
+                    }
+                })
+                .collect(),
+            truncated: value.get("open_rows_truncated") == Some(&serde_json::Value::Bool(true))
                 || list.len() > DRILL_IN_ROW_LIMIT,
         })
     }
@@ -1600,6 +1634,19 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 .map(|ms| ms.round() as u64)
                 .unwrap_or(0)
         ),
+        "update_sets" => {
+            let open = value
+                .get("open_count")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0);
+            if open == 0 {
+                "no open update sets".into()
+            } else if open == 1 {
+                "1 open update set".into()
+            } else {
+                format!("{open} open update sets")
+            }
+        }
         "drift" => {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
                 "source of truth".into()
@@ -1759,6 +1806,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "sessions_count",
                 "table_growth",
                 "txn_slow",
+                "update_sets_open",
                 "drift_source",
             ]
             .map(pinned)
@@ -1778,6 +1826,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "sessions_zero",
                 "table_growth_quiet",
                 "txn_ok",
+                "update_sets_clean",
                 "drift_compare",
                 "last_clone_target_completed",
             ]
@@ -1926,7 +1975,7 @@ mod tests {
     /// `card_summary`, `card_detail`). Add a pinned case there and
     /// `pinned_payloads_render` fails until it is listed here — that is the
     /// point of the pin.
-    const RENDERED: [(&str, &str, &str); 39] = [
+    const RENDERED: [(&str, &str, &str); 41] = [
         ("availability_asleep", "142 ms", ""),
         // The build string is shown with the plugin inventory (drift), not
         // under the latency number.
@@ -1969,6 +2018,8 @@ mod tests {
         ("table_growth_quiet", "5 tables \u{b7} 12K rows", ""),
         ("txn_slow", "842 ms avg \u{b7} last hour", ""),
         ("txn_ok", "118 ms avg \u{b7} last hour", ""),
+        ("update_sets_open", "2 open update sets", ""),
+        ("update_sets_clean", "no open update sets", ""),
         ("skipped_asleep", "", "Environment asleep"),
         ("skipped_clone_source_asleep", "", "clone source asleep"),
         (
@@ -2158,7 +2209,13 @@ mod tests {
                 .any(|line| line.contains("Slow transactions: degraded")),
             "{text}"
         );
-        assert_eq!(lines.len(), 15, "{text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Update sets: degraded")),
+            "{text}"
+        );
+        assert_eq!(lines.len(), 16, "{text}");
     }
 
     #[test]
@@ -2488,6 +2545,34 @@ mod tests {
                     ],
                     link: None,
                 }],
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drill_in_lists_open_update_sets_with_record_links() {
+        let state = loaded();
+        assert_eq!(
+            state.drill_in("update_sets", TEST_NOW),
+            DrillIn::Rows {
+                headers: vec!["Update set", "Updated"],
+                rows: vec![
+                    DrillInRow {
+                        cells: vec!["Add field X".to_owned(), "2026-01-27 00:12:00".to_owned(),],
+                        link: Some(
+                            "https://prod.example.service-now.com/sys_update_set.do?sys_id=us-1"
+                                .to_owned()
+                        ),
+                    },
+                    DrillInRow {
+                        cells: vec!["Fix flow".to_owned(), "2026-01-26 00:12:00".to_owned(),],
+                        link: Some(
+                            "https://prod.example.service-now.com/sys_update_set.do?sys_id=us-2"
+                                .to_owned()
+                        ),
+                    },
+                ],
                 truncated: false,
             }
         );

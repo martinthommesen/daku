@@ -1,9 +1,9 @@
 # Signal reference
 
-What the thirteen Signal cards measure, what makes each amber, what the
+What the fourteen Signal cards measure, what makes each amber, what the
 Operator can tune, and where each link lands. Code truth lives in
 `crates/daku-core/src/` (`availability.rs`, `jobs.rs`, `syslog.rs`,
-`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `sessions.rs`, `table_growth.rs`, `transaction.rs`, `drift.rs`, `last_clone.rs`); rendering truth
+`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `sessions.rs`, `table_growth.rs`, `transaction.rs`, `update_sets.rs`, `drift.rs`, `last_clone.rs`); rendering truth
 in `src/dashboard_state.rs`. Research hedges live in
 [`docs/research/servicenow-signals.md`](./research/servicenow-signals.md) —
 this page describes what shipped.
@@ -42,6 +42,7 @@ Shared semantics:
 | Sessions | `v_user_session` row count, cap 100 | never votes (informational) | point-in-time |
 | Table growth | whole-table Aggregate counts, 5 tables | never votes (informational) | point-in-time |
 | Slow transactions | `syslog_transaction` avg response time, 1 h | opt-in (`off` by default) | point-in-time |
+| Update sets | `sys_update_set` newest rows, open states | opt-in (`off` by default) | point-in-time |
 | Version / plugins | `sys_plugins` + `sys_store_app` vs clone source | any unexpected mismatch / build differs | point-in-time |
 | Last clone | `clone_instance` on the clone source | never votes (informational) | point-in-time |
 
@@ -187,6 +188,23 @@ return to silent). No samples. Every query is date-bounded:
 Summary reads the hourly mean ("842 ms avg · last hour"). Drill-in rows
 show time, host, and milliseconds with redacted URLs. Link: filtered
 transaction list.
+
+## Update sets — open work per Environment
+
+The 10 newest `sys_update_set` rows with the open ones counted. Stale open
+sets collide at commit time and hide unreviewed customizations.
+
+Threshold: `update_sets_open_degraded_at` (off by default — developers keep
+work-in-progress sets open while building; the sheet accepts `off` to
+return to silent). Open means the state reads as `open`, `build`, or
+`progress` (choice values vary by release between "Open" and "In
+Progress"); `complete`, `ignore`, and friends never match. No samples.
+
+Summary counts the open sets ("2 open update sets", "no open update
+sets"). Drill-in lists them with links into each record. Conflict
+detection via the CI/CD preview API is future work — previews are
+expensive, role-gated reads that do not belong in a 2-minute poll. Link:
+update-set list.
 
 ## Version / plugins — drift across Environments
 

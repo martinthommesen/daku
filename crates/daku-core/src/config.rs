@@ -495,6 +495,8 @@ mod tests {
         assert_eq!(thresholds.email_failure_degraded_at, u64::MAX);
         assert_eq!(thresholds.upgrade_failed_degraded_at, 1);
         assert_eq!(thresholds.transaction_avg_degraded_ms, None);
+        assert_eq!(thresholds.update_sets_open_degraded_at, u64::MAX);
+        assert!(thresholds.summary().contains("updates≥off"));
         assert_eq!(thresholds.ecc_output_ready_degraded_at, 100);
         assert_eq!(thresholds.availability_rtt_degraded_ms, None);
         assert!(thresholds.summary().contains("rtt>off"));
