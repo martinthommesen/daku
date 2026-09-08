@@ -662,6 +662,44 @@ impl DashboardState {
         lines.join("\n")
     }
 
+    /// Agent context as redacted JSON: environments (id, label, platform,
+    /// health, reachability), per-Signal states with summaries, and the
+    /// merged timeline. No instance URLs, no payloads (syslog rows carry
+    /// message text), no credentials — safe to paste into an agent chat.
+    /// Backs CopyAgentContext and mirrors what the MCP tools serve.
+    pub fn agent_context_json(&self, now: i64) -> String {
+        let Some(selected) = self.selected() else {
+            return "{}".into();
+        };
+        let signals: Vec<serde_json::Value> = signal_ids_for(&selected.platform_id)
+            .iter()
+            .copied()
+            .map(|signal_id| {
+                serde_json::json!({
+                    "signal_id": signal_id,
+                    "state": self
+                        .snapshots
+                        .get(&selected.id)
+                        .and_then(|map| map.get(signal_id))
+                        .map(|snapshot| snapshot.dto.state.as_str())
+                        .unwrap_or(WAITING),
+                    "summary": self.card_summary(signal_id),
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "environment": {
+                "id": selected.id,
+                "label": selected.label,
+                "platform": selected.platform_id,
+                "health": selected.health.as_str(),
+            },
+            "signals": signals,
+            "timeline": self.timeline(now, 20, "").iter().map(|row| &row.text).collect::<Vec<_>>(),
+        }))
+        .unwrap_or_else(|_| "{}".into())
+    }
+
     /// Export payloads for the selected Environment: snapshots as pretty
     /// JSON (signal, state, observed_at, payload), samples and rollups as
     /// CSV rows. The summary text (`summary_text`) is the Markdown export.
@@ -3258,6 +3296,23 @@ mod tests {
         let state = DashboardState::new();
         assert_eq!(state.export_snapshots_json(), "[]");
         assert_eq!(state.export_trends_csv(), "signal_id,observed_at,value\n");
+        assert_eq!(state.agent_context_json(TEST_NOW), "{}");
+    }
+
+    #[test]
+    fn agent_context_json_redacts_urls_and_payloads() {
+        let context: serde_json::Value =
+            serde_json::from_str(&loaded().agent_context_json(TEST_NOW)).unwrap();
+        assert_eq!(context["environment"]["id"], "prod");
+        assert_eq!(context["environment"]["health"], "degraded");
+        let text = serde_json::to_string(&context).unwrap();
+        assert!(!text.contains("example.service-now.com"), "{text}");
+        assert!(!text.contains("payload"), "{text}");
+        assert!(!text.contains("Null pointer"), "{text}");
+        let signals = context["signals"].as_array().unwrap();
+        assert_eq!(signals.len(), 15);
+        assert_eq!(signals[0]["signal_id"], "availability");
+        assert!(!context["timeline"].as_array().unwrap().is_empty());
     }
 
     #[test]

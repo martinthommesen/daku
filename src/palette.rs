@@ -56,6 +56,7 @@ pub fn entries_for(envs: &[EnvRef<'_>], selected_id: Option<&str>) -> Vec<Palett
     for (id, title, hint) in [
         ("reload", "Reload Daemon", "config"),
         ("copy", "Copy Environment Summary", "clipboard"),
+        ("copy-context", "Copy Agent Context (JSON)", "clipboard"),
         ("export", "Export Environment Snapshot", "files"),
         ("add-env", "Add Environment…", "setup"),
         (

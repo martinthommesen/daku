@@ -23,6 +23,9 @@ fn main() -> anyhow::Result<()> {
         let env_id = arguments.digest_env.clone().unwrap_or_default();
         return run_digest_command(&env_id, arguments.digest_days);
     }
+    if arguments.mcp {
+        return run_mcp_command();
+    }
     if arguments.setup {
         return run_setup_command(&arguments);
     }
@@ -227,6 +230,18 @@ fn run_diagnostics_command(out: Option<std::path::PathBuf>) -> anyhow::Result<()
         println!("{}", path.display());
     }
     Ok(())
+}
+
+/// Local MCP server over stdio: coding agents query daku state (read-only)
+/// with `tools/list` + `tools/call`. No sockets, no tokens — stdio inherits
+/// the invoking user's trust, like every other local subcommand.
+fn run_mcp_command() -> anyhow::Result<()> {
+    daku_core::mcp::run_stdio(
+        &daku_core::persistence::StateStore::daemon(
+            daku_core::persistence::StateStore::default_path(),
+        ),
+        &daku_core::default_environments_path(),
+    )
 }
 
 /// Non-interactive onboarding: validates, probes (unless `--no-probe`),
@@ -460,6 +475,7 @@ struct Arguments {
     doctor_fix: bool,
     doctor_check_roles: bool,
     digest_command: bool,
+    mcp: bool,
     diagnostics: bool,
     diagnostics_out: Option<std::path::PathBuf>,
     setup: bool,
@@ -489,6 +505,7 @@ impl Arguments {
         let mut doctor_fix = false;
         let mut doctor_check_roles = false;
         let mut digest_command = false;
+        let mut mcp = false;
         let mut diagnostics = false;
         let mut diagnostics_out = None;
         let mut setup = false;
@@ -513,6 +530,9 @@ impl Arguments {
                 }
                 "doctor" => {
                     doctor = true;
+                }
+                "mcp" => {
+                    mcp = true;
                 }
                 "diagnostics" => {
                     diagnostics = true;
@@ -649,7 +669,7 @@ impl Arguments {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [probe-availability] [doctor [--fix] [--check-roles]] [digest --env ID [--days N]] [diagnostics [--out DIR]] [setup --id ID --url URL [--label LABEL] [--platform servicenow|http|github] [--auth basic|oauth] [--clone-source] [--secret-file PATH] [--no-probe]] [rotate-credential --env ID --secret-file PATH [--no-probe]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
+                        "usage: {} [probe-availability] [doctor [--fix] [--check-roles]] [digest --env ID [--days N]] [diagnostics [--out DIR]] [mcp] [setup --id ID --url URL [--label LABEL] [--platform servicenow|http|github] [--auth basic|oauth] [--clone-source] [--secret-file PATH] [--no-probe]] [rotate-credential --env ID --secret-file PATH [--no-probe]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -706,6 +726,7 @@ impl Arguments {
             doctor_fix,
             doctor_check_roles,
             digest_command,
+            mcp,
             credential_store,
             credential_file,
             digest_env,
@@ -793,6 +814,12 @@ mod tests {
     fn parses_probe_availability() {
         let arguments = Arguments::parse(["probe-availability".into()]).unwrap();
         assert!(arguments.probe_availability);
+    }
+
+    #[test]
+    fn parses_mcp() {
+        assert!(Arguments::parse(["mcp".into()]).unwrap().mcp);
+        assert!(!Arguments::parse(["doctor".into()]).unwrap().mcp);
     }
 
     #[test]

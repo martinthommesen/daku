@@ -14,6 +14,7 @@ pub mod health;
 pub mod http_probe;
 pub mod jobs;
 pub mod last_clone;
+pub mod mcp;
 pub mod mid_ecc;
 pub mod outbound;
 pub mod persistence;

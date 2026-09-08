@@ -28,6 +28,7 @@ actions!(
         CheckForUpdates,
         ReloadDaemon,
         CopySummary,
+        CopyAgentContext,
         ExportSnapshot,
         ToggleNotifications,
         ToggleWeeklyDigest,
@@ -296,6 +297,10 @@ pub(crate) fn set_app_menus_with_prefs(
                     items.push(MenuItem::action("Check for Updates…", CheckForUpdates));
                 }
                 items.push(MenuItem::action("Copy Environment Summary", CopySummary));
+                items.push(MenuItem::action(
+                    "Copy Agent Context (JSON)",
+                    CopyAgentContext,
+                ));
                 items.push(MenuItem::action(
                     "Export Environment Snapshot",
                     ExportSnapshot,

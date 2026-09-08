@@ -27,6 +27,7 @@ use gpui_component::{
 use crate::AddEnvironment;
 use crate::ClosePalette;
 use crate::CloseWindow;
+use crate::CopyAgentContext;
 use crate::CopySummary;
 use crate::DetachSelectedEnvironment;
 use crate::ExportSnapshot;
@@ -55,8 +56,9 @@ pub struct Daku {
     state: DashboardState,
     supervisor: Option<DaemonSupervisor>,
     settings: Arc<Mutex<AppSettings>>,
-    /// Copy-summary confirmation, cleared ~2 s after ⌘⇧C.
-    copied_flash: bool,
+    /// Copy-summary confirmation, cleared ~2 s after copy actions. Carries
+    /// the flashed text.
+    copied_flash: Option<String>,
     /// Export confirmation path, cleared ~4 s after ⌘⇧E.
     exported_path: Option<String>,
     /// Recent-timeline search text. Read during render, so keystrokes
@@ -129,7 +131,7 @@ impl Daku {
                 state,
                 supervisor,
                 settings,
-                copied_flash: false,
+                copied_flash: None,
                 exported_path: None,
                 timeline_filter,
                 note_input,
@@ -713,16 +715,28 @@ impl Daku {
     }
 
     fn copy_summary(&mut self, cx: &mut Context<Self>) {
+        self.flash("Copied Environment summary", cx, 2);
         let text = self.state.summary_text(unix_now());
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-        self.copied_flash = true;
+    }
+
+    /// Copies the redacted agent-context JSON (see `agent_context_json`).
+    fn copy_agent_context(&mut self, cx: &mut Context<Self>) {
+        self.flash("Copied agent context (JSON)", cx, 2);
+        let text = self.state.agent_context_json(unix_now());
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
+    /// Footer flash with its own text, cleared after `secs`.
+    fn flash(&mut self, text: &str, cx: &mut Context<Self>, secs: u64) {
+        self.copied_flash = Some(text.to_owned());
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(std::time::Duration::from_secs(2))
+                .timer(std::time::Duration::from_secs(secs))
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
-                this.copied_flash = false;
+                this.copied_flash = None;
                 cx.notify();
             });
         })
@@ -816,6 +830,7 @@ impl Daku {
                 }
             }
             "copy" => self.copy_summary(cx),
+            "copy-context" => self.copy_agent_context(cx),
             "export" => self.export_snapshot(cx),
             "toggle-notifications" => {
                 if let Ok(mut settings) = self.settings.lock() {
@@ -1130,6 +1145,9 @@ impl Render for Daku {
             .on_action(cx.listener(|this, _: &CopySummary, _, cx| {
                 this.copy_summary(cx);
             }))
+            .on_action(cx.listener(|this, _: &CopyAgentContext, _, cx| {
+                this.copy_agent_context(cx);
+            }))
             .on_action(cx.listener(|this, _: &ExportSnapshot, _, cx| {
                 this.export_snapshot(cx);
             }))
@@ -1300,8 +1318,8 @@ impl Daku {
             .map_or(cx.theme().muted_foreground, |health| {
                 health_color(health, cx)
             });
-        let footer = if self.copied_flash {
-            "Copied Environment summary".to_owned()
+        let footer = if let Some(flashed) = self.copied_flash.as_deref() {
+            flashed.to_owned()
         } else if let Some(path) = self.exported_path.as_deref() {
             format!("Exported to {path}")
         } else {
