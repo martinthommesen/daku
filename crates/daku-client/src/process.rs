@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -11,7 +10,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::DaemonClient;
@@ -23,113 +21,15 @@ const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RESTART_BACKOFF_MIN: Duration = Duration::from_millis(500);
 /// Ceiling for the doubling — a dead daemon costs one spawn per 30 s, not two per second.
 const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
-pub const DEFAULT_EXPOSED_DAEMON_PORT: u16 = 34_123;
 
 fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(RESTART_BACKOFF_MAX)
 }
 
-/// Desktop-owned launch configuration for the daemon it supervises.
-///
-/// Provider settings belong to the daemon and live in `settings.json`; this
-/// is an app preference because it controls how the desktop launches its own
-/// child process. The bearer token is intentionally stable across daemon-only
-/// rebuilds and desktop relaunches so a configured web client keeps working.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
-pub struct DaemonExposureSettings {
-    pub enabled: bool,
-    pub port: u16,
-    pub allowed_origins: Vec<String>,
-    pub token: String,
-}
-
-impl Default for DaemonExposureSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            port: DEFAULT_EXPOSED_DAEMON_PORT,
-            allowed_origins: vec!["http://localhost:3001".into()],
-            token: Self::new_token(),
-        }
-    }
-}
-
-impl DaemonExposureSettings {
-    pub fn new_token() -> String {
-        Uuid::new_v4().simple().to_string()
-    }
-
-    pub fn ensure_token(&mut self) -> bool {
-        if !self.token.trim().is_empty() {
-            return false;
-        }
-        self.token.clear();
-        self.token.push_str(&Self::new_token());
-        true
-    }
-
-    pub fn allowed_origins_text(&self) -> String {
-        self.allowed_origins.join(", ")
-    }
-
-    pub fn with_allowed_origins_text(mut self, text: &str) -> anyhow::Result<Self> {
-        self.allowed_origins = parse_allowed_origins(text)?;
-        Ok(self)
-    }
-
-    pub fn validate(mut self) -> anyhow::Result<Self> {
-        if self.port == 0 {
-            bail!("daemon port must be between 1 and 65535");
-        }
-        if self.token.trim().is_empty() {
-            bail!("daemon authentication token is empty");
-        }
-        self.allowed_origins = parse_allowed_origins(&self.allowed_origins_text())?;
-        Ok(self)
-    }
-
-    fn bind_address(&self) -> String {
-        if self.enabled {
-            format!("0.0.0.0:{}", self.port)
-        } else {
-            "127.0.0.1:0".into()
-        }
-    }
-}
-
-/// Parse the comma-separated exact browser origins edited by the desktop.
-/// Browser Origin headers contain only an HTTP(S) origin, never a path.
-pub fn parse_allowed_origins(text: &str) -> anyhow::Result<Vec<String>> {
-    let mut origins = Vec::new();
-    let mut seen = HashSet::new();
-    for candidate in text
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let url = url::Url::parse(candidate)
-            .with_context(|| format!("invalid browser origin {candidate:?}"))?;
-        if !matches!(url.scheme(), "http" | "https")
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || url.path() != "/"
-        {
-            bail!(
-                "browser origin {candidate:?} must be an exact http:// or https:// origin without a path"
-            );
-        }
-        let origin = url.origin().ascii_serialization();
-        if origin == "null" {
-            bail!("browser origin {candidate:?} is not a network origin");
-        }
-        if seen.insert(origin.clone()) {
-            origins.push(origin);
-        }
-    }
-    Ok(origins)
+/// Fresh bearer token per spawn. Loopback-only launches have no browser
+/// clients to keep working across restarts, so nothing persists this.
+fn new_daemon_token() -> String {
+    Uuid::new_v4().simple().to_string()
 }
 
 pub(crate) struct DaemonProcess {
@@ -138,25 +38,18 @@ pub(crate) struct DaemonProcess {
 }
 
 impl DaemonProcess {
-    fn spawn_configured(
-        executable: &Path,
-        settings: DaemonExposureSettings,
-    ) -> anyhow::Result<Self> {
-        let settings = settings.validate()?;
-        let auth = settings.token.clone();
+    /// Loopback-only spawn: `--bind 127.0.0.1:0`, a fresh token per spawn,
+    /// no origins, never `--allow-non-loopback` (that envelope is the
+    /// daemon's own CLI for Operator-run debugging, not desktop launches).
+    fn spawn(executable: &Path) -> anyhow::Result<Self> {
+        let auth = new_daemon_token();
         let app_executable = std::env::current_exe().context("could not locate daku executable")?;
         let mut command = ProcessCommand::new(executable);
         command
             .arg("--bind")
-            .arg(settings.bind_address())
+            .arg("127.0.0.1:0")
             .arg("--parent-pid")
             .arg(std::process::id().to_string());
-        if settings.enabled {
-            command.arg("--allow-non-loopback");
-        }
-        for origin in &settings.allowed_origins {
-            command.arg("--allow-origin").arg(origin);
-        }
         let mut child = command
             .env(DAEMON_TOKEN_ENV, &auth)
             .env(APP_EXECUTABLE_ENV, app_executable)
@@ -326,7 +219,6 @@ struct SupervisorInner {
     /// Address and token of a daemon managed elsewhere, kept for reconnects.
     remote: Option<(String, String)>,
     target: Mutex<DaemonTarget>,
-    exposure: Mutex<Option<DaemonExposureSettings>>,
     restart: Mutex<()>,
     client_updates: Mutex<Vec<Sender<DaemonClient>>>,
     last_error: Mutex<Option<String>>,
@@ -358,25 +250,11 @@ pub struct DaemonSupervisor {
 
 impl DaemonSupervisor {
     pub fn spawn(executable: &Path, watch_for_rebuilds: bool) -> anyhow::Result<Self> {
-        Self::spawn_configured(
-            executable,
-            watch_for_rebuilds,
-            DaemonExposureSettings::default(),
-        )
-    }
-
-    pub fn spawn_configured(
-        executable: &Path,
-        watch_for_rebuilds: bool,
-        exposure: DaemonExposureSettings,
-    ) -> anyhow::Result<Self> {
-        let exposure = exposure.validate()?;
-        let process = DaemonProcess::spawn_configured(executable, exposure.clone())?;
+        let process = DaemonProcess::spawn(executable)?;
         let initial_stamp = ExecutableStamp::read(executable)?;
         let supervisor = Self::from_target(
             DaemonTarget::Local(process),
             Some(executable.to_owned()),
-            Some(exposure),
             None,
         )?;
         let weak_inner = Arc::downgrade(&supervisor.inner);
@@ -392,7 +270,7 @@ impl DaemonSupervisor {
     pub fn connect(address: &str, token: String) -> anyhow::Result<Self> {
         let remote = Some((address.to_owned(), token.clone()));
         let client = DaemonClient::connect(address, token)?;
-        let supervisor = Self::from_target(DaemonTarget::Remote(client), None, None, remote)?;
+        let supervisor = Self::from_target(DaemonTarget::Remote(client), None, remote)?;
         let weak_inner = Arc::downgrade(&supervisor.inner);
         std::thread::Builder::new()
             .name("daku-daemon-reconnect".into())
@@ -404,7 +282,6 @@ impl DaemonSupervisor {
     fn from_target(
         target: DaemonTarget,
         executable: Option<PathBuf>,
-        exposure: Option<DaemonExposureSettings>,
         remote: Option<(String, String)>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
@@ -412,7 +289,6 @@ impl DaemonSupervisor {
                 executable,
                 remote,
                 target: Mutex::new(target),
-                exposure: Mutex::new(exposure),
                 restart: Mutex::new(()),
                 client_updates: Mutex::new(Vec::new()),
                 last_error: Mutex::new(None),
@@ -511,10 +387,7 @@ fn monitor_daemon(
             continue;
         }
         let _restart = inner.restart.lock();
-        let Some(exposure) = inner.exposure.lock().clone() else {
-            return;
-        };
-        match replace_local_daemon(&inner, executable, &exposure) {
+        match replace_local_daemon(&inner, executable) {
             Ok(()) => {
                 *inner.last_error.lock() = None;
                 backoff = RESTART_BACKOFF_MIN;
@@ -585,11 +458,7 @@ fn monitor_remote(weak_inner: std::sync::Weak<SupervisorInner>) {
     }
 }
 
-fn replace_local_daemon(
-    inner: &SupervisorInner,
-    executable: &Path,
-    exposure: &DaemonExposureSettings,
-) -> anyhow::Result<()> {
+fn replace_local_daemon(inner: &SupervisorInner, executable: &Path) -> anyhow::Result<()> {
     let previous = {
         let mut target = inner.target.lock();
         match &*target {
@@ -611,7 +480,7 @@ fn replace_local_daemon(
     // Dropping can wait briefly for graceful shutdown, but the target lock is
     // already released so UI actions never block behind process teardown.
     drop(previous);
-    let replacement = DaemonProcess::spawn_configured(executable, exposure.clone())?;
+    let replacement = DaemonProcess::spawn(executable)?;
     let client = replacement.client();
     *inner.target.lock() = DaemonTarget::Local(replacement);
     inner
@@ -624,19 +493,6 @@ fn replace_local_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn browser_origins_are_exact_and_deduplicated() {
-        assert_eq!(
-            parse_allowed_origins(
-                "https://app.daku.test, http://localhost:3001, https://app.daku.test"
-            )
-            .unwrap(),
-            ["https://app.daku.test", "http://localhost:3001"]
-        );
-        assert!(parse_allowed_origins("https://app.daku.test/path").is_err());
-        assert!(parse_allowed_origins("ws://app.daku.test").is_err());
-    }
 
     #[test]
     fn backoff_doubles_and_caps() {
@@ -652,44 +508,6 @@ mod tests {
             "127.0.0.1:34123"
         );
         assert_eq!(desktop_client_address("[::]:34123").unwrap(), "[::1]:34123");
-    }
-
-    #[test]
-    fn exposure_validate_rejects_port_zero_and_empty_token() {
-        let settings = DaemonExposureSettings {
-            port: 0,
-            ..DaemonExposureSettings::default()
-        };
-        assert!(
-            settings
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("port")
-        );
-        let settings = DaemonExposureSettings {
-            token: "   ".into(),
-            ..DaemonExposureSettings::default()
-        };
-        assert!(
-            settings
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("token")
-        );
-        assert!(DaemonExposureSettings::default().validate().is_ok());
-    }
-
-    #[test]
-    fn ensure_token_mints_only_when_empty() {
-        let mut settings = DaemonExposureSettings::default();
-        let before = settings.token.clone();
-        assert!(!settings.ensure_token());
-        assert_eq!(settings.token, before);
-        settings.token.clear();
-        assert!(settings.ensure_token());
-        assert!(!settings.token.trim().is_empty());
     }
 
     #[test]

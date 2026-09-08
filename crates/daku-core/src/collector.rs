@@ -45,6 +45,17 @@ pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
 /// request per non-zero count.
 pub const ROW_LIST_LIMIT: usize = 10;
 
+/// Keeps the first `ROW_LIST_LIMIT` rows and reports whether the input was
+/// longer. Every counting Signal bounds its drill-in list the same way;
+/// share the helper so a limit or truncation-semantics change lands once.
+/// A full page reads truncated: the row queries are `sysparm_limit=10`
+/// pages, so ten rows back may hide an eleventh.
+pub fn take_bounded<T>(rows: Vec<T>) -> (Vec<T>, bool) {
+    let truncated = rows.len() >= ROW_LIST_LIMIT;
+    let kept = rows.into_iter().take(ROW_LIST_LIMIT).collect();
+    (kept, truncated)
+}
+
 pub fn poll_interval_secs(settings: &DaemonSettings) -> u64 {
     match settings.poll_interval_secs {
         0 => DEFAULT_POLL_INTERVAL_SECS,
@@ -344,13 +355,15 @@ impl CollectorLoop {
         let elapsed = started.elapsed();
         if elapsed > self.interval {
             eprintln!(
-                "daku collector tick took {:.0}s (poll interval {:.0}s)",
+                "daku collector tick {tick} took {:.0}s (poll interval {:.0}s)",
                 elapsed.as_secs_f64(),
                 self.interval.as_secs_f64()
             );
         }
         let result = match errors.into_iter().next() {
-            Some(error) => Err(error),
+            // The tick number joins the daemon-log lines for one round
+            // (overrun warnings, this failure) across threads.
+            Some(error) => Err(error.context(format!("tick {tick}"))),
             None => Ok(()),
         };
         (result, elapsed)
@@ -428,11 +441,15 @@ pub(crate) fn host_of_url(url: &str) -> Option<String> {
 pub fn all_hosts_unreachable(hosts: &[String]) -> bool {
     !hosts.is_empty()
         && hosts.iter().all(|host| {
-            std::net::ToSocketAddrs::to_socket_addrs(format!("{host}:443").as_str())
+            let addrs = std::net::ToSocketAddrs::to_socket_addrs(format!("{host}:443").as_str())
                 .ok()
-                .and_then(|mut addrs| addrs.next())
-                .is_none_or(|addr| {
-                    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_err()
+                .map(|addrs| addrs.collect::<Vec<_>>())
+                .unwrap_or_default();
+            // Empty means DNS failed (unreachable); otherwise reachable wins
+            // if ANY resolved address connects (dual-stack / round-robin DNS).
+            addrs.is_empty()
+                || addrs.iter().all(|addr| {
+                    std::net::TcpStream::connect_timeout(addr, Duration::from_secs(2)).is_err()
                 })
         })
 }
@@ -828,6 +845,20 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn take_bounded_keeps_ten_and_flags_full_pages() {
+        // Empty and short lists pass through unflagged.
+        assert_eq!(take_bounded::<u8>(Vec::new()), (Vec::new(), false));
+        assert_eq!(take_bounded(vec![1, 2, 3]), (vec![1, 2, 3], false));
+        // A full `sysparm_limit=10` page may hide an eleventh row, so ten
+        // back reads truncated; eleven back keeps ten and flags.
+        let ten: Vec<u8> = (0..10).collect();
+        assert_eq!(take_bounded(ten.clone()), (ten, true));
+        let (kept, truncated) = take_bounded((0..11).collect::<Vec<u8>>());
+        assert_eq!(kept, (0..10).collect::<Vec<u8>>());
+        assert!(truncated);
+    }
+
+    #[test]
     fn poll_interval_secs_reads_top_level_json_key() {
         let settings: DaemonSettings =
             serde_json::from_str(r#"{"poll_interval_secs": 30}"#).unwrap();
@@ -1002,7 +1033,10 @@ mod tests {
         loop_.register(Failing);
         loop_.register(Recording(ran.clone()));
         let error = loop_.tick().unwrap_err();
-        assert!(error.to_string().contains("first collector failed"));
+        assert!(
+            format!("{error:#}").contains("first collector failed"),
+            "{error:#}"
+        );
         assert!(
             ran.load(Ordering::Acquire),
             "later collectors must still run"
@@ -1030,7 +1064,10 @@ mod tests {
         let mut loop_ = CollectorLoop::new(Duration::from_secs(120));
         loop_.register(Panicking);
         let error = without_panic_output(|| loop_.tick().unwrap_err());
-        assert!(error.to_string().contains("shared collectors panicked"));
+        assert!(
+            format!("{error:#}").contains("shared collectors panicked"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1044,7 +1081,10 @@ mod tests {
         ))]);
         loop_.register(SleepingCollector(Duration::ZERO, calls.clone()));
         let error = without_panic_output(|| loop_.tick().unwrap_err());
-        assert!(error.to_string().contains("collector group 0 panicked"));
+        assert!(
+            format!("{error:#}").contains("collector group 0 panicked"),
+            "{error:#}"
+        );
         assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 
@@ -1122,7 +1162,7 @@ mod tests {
         ]);
         loop_.register(SleepingCollector(Duration::ZERO, calls.clone()));
         let error = loop_.tick().unwrap_err();
-        assert!(error.to_string().contains("boom"));
+        assert!(format!("{error:#}").contains("boom"), "{error:#}");
         assert_eq!(
             calls.load(Ordering::Acquire),
             2,

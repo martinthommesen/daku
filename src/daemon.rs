@@ -27,13 +27,7 @@ pub fn start_process() -> anyhow::Result<daku_client::DaemonSupervisor> {
         ),
         (None, None) => {}
     }
-    let app_settings = daku_client::persistence::load_or_create_app_settings()
-        .context("could not load desktop daemon settings")?;
-    daku_client::DaemonSupervisor::spawn_configured(
-        &daemon_executable_path()?,
-        cfg!(debug_assertions),
-        app_settings.daemon_exposure,
-    )
+    daku_client::DaemonSupervisor::spawn(&daemon_executable_path()?, cfg!(debug_assertions))
 }
 
 fn daemon_executable_path() -> anyhow::Result<PathBuf> {

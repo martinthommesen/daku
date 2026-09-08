@@ -112,7 +112,26 @@ pub(crate) fn age_days(completed: &str, observed_at: i64) -> Option<i64> {
     if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
+    // `days_from_civil` normalizes impossible dates (Feb 30 becomes March),
+    // so reject them here instead of rendering a plausible-but-wrong age.
+    if day > days_in_month(year, month) {
+        return None;
+    }
     Some((observed_at.div_euclid(86_400) - days_from_civil(year, month, day)).max(0))
+}
+
+/// Gregorian days in `month`, leap-aware. `month` is 1–12 (checked by the
+/// caller); out-of-range months yield 0 so the date is rejected.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
 }
 
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
@@ -471,6 +490,14 @@ mod tests {
         // A source clock ahead of the daemon must not render a negative age.
         assert_eq!(age_days("2026-02-01 00:00:00", observed_at), Some(0));
         assert_eq!(age_days("not a date", observed_at), None);
+        // Impossible calendar dates are rejected, not normalized into March.
+        assert_eq!(age_days("2026-02-30 00:00:00", observed_at), None);
+        assert_eq!(age_days("2026-04-31 00:00:00", observed_at), None);
+        assert_eq!(age_days("2025-02-29 00:00:00", observed_at), None);
+        assert!(
+            age_days("2024-02-29 00:00:00", observed_at).is_some_and(|age| age > 300),
+            "leap-day 2024 is a real date"
+        );
     }
 
     struct LastCloneTransport {
@@ -805,20 +832,16 @@ mod tests {
 
     #[test]
     fn last_clone_uses_total_count_when_present() {
-        let (_db, store) = collect_last_clone_with_total(
-            200,
-            include_str!("../tests/fixtures/last_clone/completed.json"),
-            Some(42),
-        );
+        let body = include_str!("../tests/fixtures/last_clone/completed.json");
+        let (_db, store) = collect_last_clone_with_total(200, body, Some(42));
         assert_eq!(payload(&store, "dev")["unknown"], "older_than_page");
         // A total equal to the raw row count is a complete page, not a
-        // truncated one. `dev` has no row in this fixture, so "never cloned"
-        // is only reachable while the boundary stays strictly greater-than.
-        let (_db, store) = collect_last_clone_with_total(
-            200,
-            include_str!("../tests/fixtures/last_clone/completed.json"),
-            Some(1),
-        );
+        // truncated one. The total is derived from the fixture (not a
+        // literal) so fixture growth keeps this on the boundary the
+        // strictly-greater-than check pins: `dev` has no row here, so
+        // "never cloned" is only reachable while `count > raw_rows` holds.
+        let raw = parse_last_clones(200, body).map(|(_, raw)| raw as u64);
+        let (_db, store) = collect_last_clone_with_total(200, body, raw);
         let dev = payload(&store, "dev");
         assert!(dev.get("unknown").is_none());
         assert!(dev["completed"].is_null());

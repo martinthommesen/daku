@@ -11,8 +11,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::process::DaemonExposureSettings;
-
 fn default_notifications_on() -> bool {
     true
 }
@@ -44,7 +42,6 @@ impl QuietHours {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppSettings {
-    pub daemon_exposure: DaemonExposureSettings,
     /// Operator mutes: Environment id → unix seconds until which attention
     /// surfaces (notifications, menu-bar dot, Dock badge) stay silent.
     /// Expired entries are pruned on read. The daemon keeps collecting.
@@ -69,7 +66,6 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            daemon_exposure: DaemonExposureSettings::default(),
             mutes: HashMap::new(),
             notifications_enabled: true,
             notify_signals: HashMap::new(),
@@ -84,9 +80,7 @@ impl AppSettings {
     /// True while `now` is before the mute deadline. Expired entries read as
     /// unmuted (and are pruned on the next save).
     pub fn is_muted(&self, environment_id: &str, now: i64) -> bool {
-        self.mutes
-            .get(environment_id)
-            .is_some_and(|until| now < *until)
+        mute_active(&self.mutes, environment_id, now)
     }
 
     /// Per-signal switch; absent reads as on.
@@ -115,17 +109,22 @@ impl AppSettings {
     }
 }
 
+/// One shared mute predicate for the persisted settings and the dashboard
+/// snapshot: true while `now` is before the deadline for `id`. Expired
+/// entries read as unmuted everywhere; each side prunes on its own write
+/// path (`prune_mutes` on save, `apply_mutes` on apply).
+pub fn mute_active(mutes: &HashMap<String, i64>, id: &str, now: i64) -> bool {
+    mutes.get(id).is_some_and(|until| now < *until)
+}
+
 /// Persists desktop preferences atomically (`0600`). Mutes call this on every
-/// change; the daemon-exposure token path in `load_or_create_app_settings_at`
-/// already writes through `write_json_atomically`.
+/// change.
 pub fn save_app_settings(settings: &AppSettings) -> io::Result<()> {
     save_app_settings_at(&default_app_settings_path(), settings)
 }
 
 pub fn save_app_settings_at(path: &Path, settings: &AppSettings) -> io::Result<()> {
-    let mut settings = settings.clone();
-    settings.daemon_exposure.ensure_token();
-    write_json_atomically(path, &settings)
+    write_json_atomically(path, settings)
 }
 
 fn configuration_directory() -> PathBuf {
@@ -166,30 +165,18 @@ pub fn load_or_create_app_settings() -> io::Result<AppSettings> {
     load_or_create_app_settings_at(&default_app_settings_path())
 }
 
-/// Reads `app.json`, minting a `daemon_exposure.token` when absent. The token
-/// must be persisted or a configured browser client breaks on every restart.
+/// Reads `app.json`, minting it with defaults when absent. A stale
+/// `daemon_exposure` block from before the hosted-daemon deletion loads
+/// fine: serde ignores unknown fields, and nothing reads it anymore.
 pub fn load_or_create_app_settings_at(path: &Path) -> io::Result<AppSettings> {
-    let source = read_app_settings(path)?;
-    let token_was_persisted = source
-        .as_ref()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-        .and_then(|value| {
-            value
-                .get("daemon_exposure")
-                .and_then(|daemon| daemon.get("token"))
-                .and_then(serde_json::Value::as_str)
-                .map(|token| !token.trim().is_empty())
-        })
-        .unwrap_or(false);
-    let mut settings: AppSettings = source
-        .map(|bytes| serde_json::from_slice::<AppSettings>(&bytes).map_err(to_io_error))
-        .transpose()?
-        .unwrap_or_default();
-    let minted = settings.daemon_exposure.ensure_token();
-    if !token_was_persisted || minted {
-        write_json_atomically(path, &settings)?;
+    match read_app_settings(path)? {
+        None => {
+            let settings = AppSettings::default();
+            write_json_atomically(path, &settings)?;
+            Ok(settings)
+        }
+        Some(bytes) => serde_json::from_slice::<AppSettings>(&bytes).map_err(to_io_error),
     }
-    Ok(settings)
 }
 
 fn write_json_atomically(path: &Path, value: &impl Serialize) -> io::Result<()> {
@@ -243,11 +230,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_app_settings_are_written_with_a_token() {
+    fn missing_app_settings_are_written_with_defaults() {
         let settings_file = TempSettings::new();
         let path = settings_file.path();
         let settings = load_or_create_app_settings_at(path).unwrap();
-        assert!(!settings.daemon_exposure.token.trim().is_empty());
+        assert_eq!(settings.mutes.len(), 0);
         assert!(path.exists());
         #[cfg(unix)]
         assert_eq!(
@@ -257,17 +244,15 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_token_is_minted_and_rewritten() {
+    fn a_stale_daemon_exposure_block_loads_and_is_left_alone() {
         let settings_file = TempSettings::new();
         let path = settings_file.path();
-        fs::write(path, r#"{"daemon_exposure":{"token":""}}"#).unwrap();
+        let original = r#"{"daemon_exposure":{"token":"abc","enabled":true,"port":34123}}"#;
+        fs::write(path, original).unwrap();
         let settings = load_or_create_app_settings_at(path).unwrap();
-        assert!(!settings.daemon_exposure.token.trim().is_empty());
-        let written: AppSettings = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(
-            written.daemon_exposure.token,
-            settings.daemon_exposure.token
-        );
+        assert!(settings.mutes.is_empty());
+        // Untouched on disk: nothing migrates or rewrites it.
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]
@@ -362,14 +347,14 @@ mod tests {
     }
 
     #[test]
-    fn a_persisted_token_survives_legacy_keys_without_a_rewrite() {
+    fn a_persisted_file_with_legacy_keys_loads_without_a_rewrite() {
         let settings_file = TempSettings::new();
         let path = settings_file.path();
         let original =
             r#"{"daemon_exposure":{"token":"abc"},"theme":"dark","analytics_enabled":false}"#;
         fs::write(path, original).unwrap();
         let settings = load_or_create_app_settings_at(path).unwrap();
-        assert_eq!(settings.daemon_exposure.token, "abc");
+        assert!(settings.notify_signals.is_empty());
         assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 }

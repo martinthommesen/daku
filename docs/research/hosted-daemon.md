@@ -133,20 +133,17 @@ need this answer to delete safely.
 
 ## Follow-up plan stubs
 
-- **Under (A) — "Delete the desktop daemon-exposure plumbing" (S)**, **half
-  landed**. Plans 018/020/032 deleted the three callerless helpers this note
-  originally listed — the LAN-URL helper in `src/daemon.rs` and the supervisor's
-  re-configure and remote-mode predicates in
-  `crates/daku-client/src/process.rs`; none of them exists at `HEAD`. The rest
-  is **still live** and still needs its own plan and a smoke run, because
-  `spawn_configured` has a caller on the app-launch path: `DaemonExposureSettings`, `parse_allowed_origins`,
+- **Under (A) — "Delete the desktop daemon-exposure plumbing" (S)**,
+  **landed**. Plans 018/020/032 deleted the three callerless helpers this note
+  originally listed; the rest (`DaemonExposureSettings`, `parse_allowed_origins`,
   `allowed_origins_text`, `with_allowed_origins_text`, `ensure_token`,
-  `bind_address`, `DaemonProcess::spawn_configured` and
-  `DaemonSupervisor::spawn_configured` in
-  `crates/daku-client/src/process.rs`; `AppSettings.daemon_exposure` and its
-  migration read in `crates/daku-client/src/persistence.rs`; the
-  `spawn_configured` call site in `src/daemon.rs` (→ `DaemonSupervisor::spawn`).
-  Out of scope: `crates/daku-daemon/src/main.rs` flags and
+  `bind_address`, `DaemonProcess::spawn_configured`,
+  `DaemonSupervisor::spawn_configured`, `AppSettings.daemon_exposure` and its
+  migration read, the `spawn_configured` call site in `src/daemon.rs`) was
+  removed with it: desktop launches are loopback-only (`--bind 127.0.0.1:0`,
+  fresh token per spawn), stale `daemon_exposure` blocks in `app.json` load
+  untouched. Smoke: local spawn plus `DAKU_DAEMON_ADDRESS` attach.
+  Out of scope (kept): `crates/daku-daemon/src/main.rs` flags and
   `crates/daku-core/src/server.rs`.
 - **Under (B), when wanted — "Remote daemon support" (L)**: plan 018
   (reconnect) first, then a `CredentialStore` implementation behind a daemon

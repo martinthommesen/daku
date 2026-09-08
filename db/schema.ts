@@ -91,7 +91,8 @@ export const healthEvents = sqliteTable(
 );
 
 /**
- * Hourly aggregates over raw samples for 30-day trends (v1.1, ADR-0009).
+ * Hourly aggregates over raw samples for 90-day trends (v1.1 ADR-0009,
+ * extended to 90 d by ADR-0012).
  * One idempotent recompute of the current hour per publish; the 24 h raw
  * ring stays untouched. `avg_real` draws the line, `max_real` the ticks.
  */

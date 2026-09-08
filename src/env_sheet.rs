@@ -6,7 +6,7 @@
 //! reuses the wire contract (`validate_credential`), so the sheet and the
 //! daemon reject the same garbage with the same message.
 
-use daku_protocol::{AuthMethod, EnvironmentConfig, Thresholds};
+use daku_protocol::{AuthMethod, EnvironmentConfig, Platform, Thresholds};
 use gpui::{App, Entity, Styled, Window, div, prelude::*, px};
 use gpui_component::ActiveTheme as _;
 use gpui_component::input::{Input, InputState};
@@ -20,6 +20,12 @@ pub struct EnvSheet {
     pub label_field: Entity<InputState>,
     pub url_field: Entity<InputState>,
     pub auth: AuthMethod,
+    /// Monitored product family. New sheets start as ServiceNow; edits load
+    /// the stored value. Changing it on edit keeps thresholds and expected
+    /// drift (per-Environment tuning, harmless across platforms); the
+    /// Credential shape is auth-method-dependent, not platform-dependent,
+    /// so nothing else migrates.
+    pub platform: Platform,
     pub clone_source: bool,
     pub secret_a: Entity<InputState>,
     pub secret_b: Entity<InputState>,
@@ -68,6 +74,7 @@ impl EnvSheet {
             label_field: Self::field(window, cx, "", false),
             url_field: Self::field(window, cx, "https://", false),
             auth: AuthMethod::OauthClientCredentials,
+            platform: Platform::Servicenow,
             clone_source: false,
             secret_a: Self::field(window, cx, "", false),
             secret_b: Self::field(window, cx, "", true),
@@ -187,6 +194,7 @@ impl EnvSheet {
             label_field: Self::field(window, cx, &env.label, false),
             url_field: Self::field(window, cx, &env.instance_url, false),
             auth: env.auth_method,
+            platform: env.platform,
             clone_source: env.clone_source,
             secret_a: Self::field(window, cx, "", false),
             secret_b: Self::field(window, cx, "", true),
@@ -616,38 +624,74 @@ pub fn credential_blob(auth_method: AuthMethod, first: &str, second: &str) -> Op
 
 /// Builds the config to save: fresh ids sort last, edits keep sort order,
 /// thresholds and expected drift (edited as JSON for now).
-pub fn build_config(
-    id: String,
-    label: String,
-    instance_url: String,
-    auth_method: AuthMethod,
-    clone_source: bool,
-    sort_order: i64,
-    existing: Option<&EnvironmentConfig>,
-) -> EnvironmentConfig {
+/// Parameters for [`build_config`]: the sheet's plain fields plus the
+/// stored config an edit carries forward (tuning) or `None` for an add.
+/// A struct rather than eight arguments.
+pub struct BuildConfig<'a> {
+    pub id: String,
+    pub label: String,
+    pub instance_url: String,
+    pub auth_method: AuthMethod,
+    pub platform: Platform,
+    pub clone_source: bool,
+    pub sort_order: i64,
+    pub existing: Option<&'a EnvironmentConfig>,
+}
+
+pub fn build_config(params: BuildConfig<'_>) -> EnvironmentConfig {
     EnvironmentConfig {
-        id,
-        label,
-        instance_url,
-        auth_method,
-        sort_order,
-        clone_source,
-        // The sheet has no platform picker (v1): edits keep the stored
-        // platform, new Environments start as ServiceNow. Other platforms
-        // are hand-declared in environments.json (see docs/platforms.md).
-        platform: existing.map(|env| env.platform).unwrap_or_default(),
-        thresholds: existing
+        id: params.id,
+        label: params.label,
+        instance_url: params.instance_url,
+        auth_method: params.auth_method,
+        sort_order: params.sort_order,
+        clone_source: params.clone_source,
+        // The sheet owns the platform now (picker below): new Environments
+        // take the picked value, edits take the pick too — changing it keeps
+        // thresholds and expected drift (see the `platform` field docs).
+        platform: params.platform,
+        thresholds: params
+            .existing
             .map(|env| env.thresholds.clone())
             .unwrap_or_default(),
-        expected_drift: existing
+        expected_drift: params
+            .existing
             .map(|env| env.expected_drift.clone())
             .unwrap_or_default(),
     }
 }
 
+/// URL caption per platform, so the field says what it wants.
+pub fn url_caption(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Servicenow => "Instance URL",
+        Platform::Http => "Probe URL",
+        Platform::Github => "Repository URL (https://github.com/<owner>/<repo>)",
+    }
+}
+
+/// Merges parsed sheet tuning into the config `build_config` produced.
+/// Separate because `build_config` by design carries the *stored* tuning
+/// forward — calling it alone drops the Operator's edits, so the save path
+/// must always run this merge afterwards (`validate_sheet` does).
+pub fn apply_sheet_tuning(
+    config: &mut EnvironmentConfig,
+    thresholds: Thresholds,
+    expected_drift: Vec<String>,
+) {
+    config.thresholds = thresholds;
+    config.expected_drift = expected_drift;
+}
+
 /// Pre-flight validation of the plain fields. Credential shape is checked
-/// separately so an empty pair (leave stored) skips it.
-pub fn validate_fields(id: &str, label: &str, instance_url: &str) -> Result<(), String> {
+/// separately so an empty pair (leave stored) skips it. GitHub URLs must
+/// name one `owner/repo`, mirroring the daemon loader.
+pub fn validate_fields(
+    id: &str,
+    label: &str,
+    instance_url: &str,
+    platform: Platform,
+) -> Result<(), String> {
     if id.trim().is_empty() {
         return Err("id must not be empty".to_owned());
     }
@@ -659,6 +703,9 @@ pub fn validate_fields(id: &str, label: &str, instance_url: &str) -> Result<(), 
     }
     if let Some(reason) = daku_protocol::instance_url_error(instance_url) {
         return Err(reason.to_owned());
+    }
+    if platform == Platform::Github && daku_protocol::split_github_repo(instance_url).is_none() {
+        return Err("github URL must look like https://github.com/<owner>/<repo>".to_owned());
     }
     Ok(())
 }
@@ -706,35 +753,75 @@ mod tests {
 
     #[test]
     fn field_validation_rejects_empties_and_bad_urls() {
-        assert!(validate_fields("", "L", "https://x.example.service-now.com").is_err());
-        assert!(validate_fields("a b", "L", "https://x.example.service-now.com").is_err());
-        assert!(validate_fields("a", "", "https://x.example.service-now.com").is_err());
-        assert!(validate_fields("a", "L", "http://x.example.com").is_err());
-        assert!(validate_fields("a", "L", "https://x.example.service-now.com").is_ok());
+        let snow = Platform::Servicenow;
+        assert!(validate_fields("", "L", "https://x.example.service-now.com", snow).is_err());
+        assert!(validate_fields("a b", "L", "https://x.example.service-now.com", snow).is_err());
+        assert!(validate_fields("a", "", "https://x.example.service-now.com", snow).is_err());
+        assert!(validate_fields("a", "L", "http://x.example.com", snow).is_err());
+        assert!(validate_fields("a", "L", "https://x.example.service-now.com", snow).is_ok());
+        // GitHub URLs must name one owner/repo, like the daemon loader.
+        let github = Platform::Github;
+        assert!(validate_fields("a", "L", "https://github.com/acme/app", github).is_ok());
+        assert!(validate_fields("a", "L", "https://github.com/acme/app/", github).is_ok());
+        assert!(validate_fields("a", "L", "https://github.com/acme/app.git", github).is_ok());
+        assert!(validate_fields("a", "L", "https://github.com/acme", github).is_err());
+        assert!(validate_fields("a", "L", "https://example.com/acme/app", github).is_err());
+        // HTTP probes take any https URL.
+        assert!(
+            validate_fields(
+                "a",
+                "L",
+                "https://status.example.com/health",
+                Platform::Http
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn build_config_takes_the_picked_platform() {
+        let config = build_config(BuildConfig {
+            id: "status".into(),
+            label: "Status".into(),
+            instance_url: "https://status.example.com/health".into(),
+            auth_method: AuthMethod::Basic,
+            platform: Platform::Http,
+            clone_source: false,
+            sort_order: 3,
+            existing: None,
+        });
+        assert_eq!(config.platform, Platform::Http);
+        assert_eq!(url_caption(Platform::Http), "Probe URL");
+        assert_eq!(
+            url_caption(Platform::Github),
+            "Repository URL (https://github.com/<owner>/<repo>)"
+        );
     }
 
     #[test]
     fn build_config_preserves_tuning_on_edit() {
-        let mut existing = build_config(
-            "dev".into(),
-            "Dev".into(),
-            "https://dev.example.service-now.com".into(),
-            AuthMethod::Basic,
-            false,
-            3,
-            None,
-        );
+        let mut existing = build_config(BuildConfig {
+            id: "dev".into(),
+            label: "Dev".into(),
+            instance_url: "https://dev.example.service-now.com".into(),
+            auth_method: AuthMethod::Basic,
+            platform: Platform::Servicenow,
+            clone_source: false,
+            sort_order: 3,
+            existing: None,
+        });
         existing.thresholds.syslog_error_degraded_at = 10;
         existing.expected_drift = vec!["com.example.staged".into()];
-        let edited = build_config(
-            "dev".into(),
-            "Dev 2".into(),
-            "https://dev.example.service-now.com".into(),
-            AuthMethod::Basic,
-            true,
-            3,
-            Some(&existing),
-        );
+        let edited = build_config(BuildConfig {
+            id: "dev".into(),
+            label: "Dev 2".into(),
+            instance_url: "https://dev.example.service-now.com".into(),
+            auth_method: AuthMethod::Basic,
+            platform: Platform::Servicenow,
+            clone_source: true,
+            sort_order: 3,
+            existing: Some(&existing),
+        });
         assert_eq!(edited.label, "Dev 2");
         assert!(edited.clone_source);
         assert_eq!(edited.thresholds.syslog_error_degraded_at, 10);
@@ -786,6 +873,122 @@ mod tests {
         assert_eq!(
             parse_thresholds(&rtt).unwrap().availability_rtt_degraded_ms,
             Some(500)
+        );
+    }
+
+    #[test]
+    fn sheet_tuning_survives_build_config_only_through_the_merge() {
+        let stored = Thresholds {
+            syslog_error_degraded_at: 99,
+            ..Thresholds::default()
+        };
+        let existing = EnvironmentConfig {
+            id: "dev".into(),
+            label: "Dev".into(),
+            instance_url: "https://acme-dev.example.service-now.com".into(),
+            auth_method: AuthMethod::Basic,
+            sort_order: 0,
+            clone_source: false,
+            platform: daku_protocol::Platform::Servicenow,
+            thresholds: stored,
+            expected_drift: vec!["com.example.staged".into()],
+        };
+        // `build_config` carries stored tuning forward by design: the
+        // Operator's edits are dropped until the merge runs.
+        let mut config = build_config(BuildConfig {
+            id: "dev".into(),
+            label: "Dev".into(),
+            instance_url: "https://acme-dev.example.service-now.com".into(),
+            auth_method: AuthMethod::Basic,
+            platform: Platform::Servicenow,
+            clone_source: false,
+            sort_order: 0,
+            existing: Some(&existing),
+        });
+        assert_eq!(config.thresholds.syslog_error_degraded_at, 99);
+        let edited = Thresholds {
+            syslog_error_degraded_at: 10,
+            ..Thresholds::default()
+        };
+        apply_sheet_tuning(&mut config, edited, vec!["com.example.new".into()]);
+        assert_eq!(config.thresholds.syslog_error_degraded_at, 10);
+        assert_eq!(config.expected_drift, ["com.example.new"]);
+    }
+
+    #[test]
+    fn sheet_parses_every_threshold_struct_field() {
+        // Parity with the file path (`deny_unknown_fields` on `Thresholds`):
+        // a threshold added to the struct but not to the sheet would load
+        // from hand-edited JSON yet silently reset to default on sheet save.
+        // Distinct markers pinpoint the uncovered field.
+        let texts = ThresholdTexts {
+            jobs_overdue: "11".into(),
+            jobs_error: "12".into(),
+            syslog: "13".into(),
+            outbound: "14".into(),
+            flow: "15".into(),
+            email: "16".into(),
+            upgrade: "17".into(),
+            txn: "18".into(),
+            updates: "19".into(),
+            scan: "20".into(),
+            actions: "21".into(),
+            probe_rtt: "22".into(),
+            mid: "23".into(),
+            ecc_error: "24".into(),
+            ecc_queue: "25".into(),
+            drift: "26".into(),
+            rtt: "27".into(),
+        };
+        let parsed = parse_thresholds(&texts).unwrap();
+        assert_eq!(parsed.jobs_overdue_degraded_at, 11);
+        assert_eq!(parsed.jobs_error_degraded_at, 12);
+        assert_eq!(parsed.syslog_error_degraded_at, 13);
+        assert_eq!(parsed.outbound_failures_degraded_at, 14);
+        assert_eq!(parsed.flow_error_degraded_at, 15);
+        assert_eq!(parsed.email_failure_degraded_at, 16);
+        assert_eq!(parsed.upgrade_failed_degraded_at, 17);
+        assert_eq!(parsed.transaction_avg_degraded_ms, Some(18));
+        assert_eq!(parsed.update_sets_open_degraded_at, 19);
+        assert_eq!(parsed.scan_p1_degraded_at, 20);
+        assert_eq!(parsed.actions_failed_degraded_at, 21);
+        assert_eq!(parsed.http_probe_rtt_degraded_ms, Some(22));
+        assert_eq!(parsed.mid_unhealthy_degraded_at, 23);
+        assert_eq!(parsed.ecc_error_degraded_at, 24);
+        assert_eq!(parsed.ecc_output_ready_degraded_at, 25);
+        assert_eq!(parsed.drift_mismatches_degraded_at, 26);
+        assert_eq!(parsed.availability_rtt_degraded_ms, Some(27));
+        // And no eighteenth struct field hides behind the markers: the
+        // serialized key set is exactly the seventeen the sheet covers.
+        let value = serde_json::to_value(Thresholds::default()).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "actions_failed_degraded_at",
+                "availability_rtt_degraded_ms",
+                "drift_mismatches_degraded_at",
+                "ecc_error_degraded_at",
+                "ecc_output_ready_degraded_at",
+                "email_failure_degraded_at",
+                "flow_error_degraded_at",
+                "http_probe_rtt_degraded_ms",
+                "jobs_error_degraded_at",
+                "jobs_overdue_degraded_at",
+                "mid_unhealthy_degraded_at",
+                "outbound_failures_degraded_at",
+                "scan_p1_degraded_at",
+                "syslog_error_degraded_at",
+                "transaction_avg_degraded_ms",
+                "update_sets_open_degraded_at",
+                "upgrade_failed_degraded_at",
+            ]
         );
     }
 

@@ -23,16 +23,34 @@ fn first_label(url: &str) -> Option<String> {
     Some(label.to_owned())
 }
 
-/// Drops query and fragment from URL-looking tokens (`token=` carriers),
-/// truncates long lines. Plain words pass through untouched.
+/// Drops everything after the host from URL-looking tokens and masks
+/// `secret=value` carriers, then truncates long lines. Plain words pass
+/// through untouched. Webhook paths are secret-bearing (some integrations
+/// put the secret in the path), so only scheme+host survives.
 fn scrub_log_line(line: &str) -> String {
-    let scrubbed: Vec<&str> = line
+    let scrubbed: Vec<String> = line
         .split_whitespace()
         .map(|token| {
             if token.contains("://") {
-                token.split(['?', '#']).next().unwrap_or(token)
+                crate::webhook::redacted_url(token)
+            } else if let Some((key, _)) = token.split_once('=')
+                && matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "token"
+                        | "secret"
+                        | "password"
+                        | "passwd"
+                        | "auth"
+                        | "credential"
+                        | "access_token"
+                        | "api_key"
+                        | "apikey"
+                        | "client_secret"
+                )
+            {
+                format!("{key}=…")
             } else {
-                token
+                token.to_owned()
             }
         })
         .collect();
@@ -82,13 +100,12 @@ fn redact_settings(home: &Path) -> serde_json::Value {
     let webhook = settings
         .get("webhook_url")
         .and_then(|url| url.as_str())
-        .map(|url| {
-            // Host + path only: forwarder URLs routinely carry tokens in
-            // the query string.
-            url.split(['?', '#']).next().unwrap_or(url).to_owned()
-        });
+        // Host only: forwarder URLs carry tokens in the query string, and
+        // some integrations put the secret in the path itself.
+        .map(crate::webhook::redacted_url);
     serde_json::json!({
         "poll_interval_secs": settings.get("poll_interval_secs"),
+        "slow_poll_interval_secs": settings.get("slow_poll_interval_secs"),
         "webhook_host": webhook,
     })
 }
@@ -174,9 +191,13 @@ mod tests {
     #[test]
     fn scrub_log_line_strips_queries_and_truncates() {
         let line = "probe https://x.example.com/hook?token=abc#frag ok";
-        assert_eq!(scrub_log_line(line), "probe https://x.example.com/hook ok");
+        assert_eq!(scrub_log_line(line), "probe https://x.example.com ok");
         assert_eq!(scrub_log_line(&"y".repeat(400)).len(), 302);
         assert_eq!(scrub_log_line("plain words 123"), "plain words 123");
+        assert_eq!(
+            scrub_log_line("refresh token=CANARY-9 user=alice"),
+            "refresh token=… user=alice"
+        );
     }
 
     fn sandbox(files: &[(&str, &str)]) -> PathBuf {
@@ -197,7 +218,7 @@ mod tests {
             ),
             (
                 "settings.json",
-                r#"{"poll_interval_secs":60,"webhook_url":"https://hooks.example.com/x?token=CANARY-1"}"#,
+                r#"{"poll_interval_secs":60,"slow_poll_interval_secs":900,"webhook_url":"https://hooks.example.com/secret/PATH-CANARY-1?token=CANARY-1"}"#,
             ),
             (
                 "daemon.log",
@@ -213,9 +234,17 @@ mod tests {
             .map(|path| std::fs::read_to_string(path).unwrap())
             .collect::<Vec<_>>()
             .join("\n");
-        for canary in ["CANARY-1", "CANARY-2", "CANARY-3"] {
+        for canary in ["CANARY-1", "CANARY-2", "CANARY-3", "PATH-CANARY-1"] {
             assert!(!bundle.contains(canary), "{canary} leaked into the bundle");
         }
+        assert!(
+            bundle.contains("hooks.example.com"),
+            "webhook host stays for identification"
+        );
+        assert!(
+            bundle.contains("900"),
+            "slow cadence belongs in a cadence ticket bundle"
+        );
         assert!(
             bundle.contains("acme-prod"),
             "first labels stay for identification"

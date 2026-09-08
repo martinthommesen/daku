@@ -80,6 +80,23 @@ const DEFAULT_WINDOW_WIDTH: f32 = 1380.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 880.0;
 const MIN_WINDOW_WIDTH: f32 = 980.0;
 const MIN_WINDOW_HEIGHT: f32 = 680.0;
+
+/// Shell-owned fixture gate: `=1` loads canned dashboard events instead of
+/// spawning the daemon. Lives here (not in the dashboard model) so
+/// `dashboard_state` reads neither env vars nor clocks.
+pub fn ui_fixture_enabled() -> bool {
+    matches!(std::env::var("DAKU_UI_FIXTURE").as_deref(), Ok("1"))
+}
+
+/// Canned dashboard events with now-relative rollup windows, for fixture
+/// mode and headless tests of the shell wiring.
+pub fn fixture_events() -> Vec<daku_protocol::ServerMessage> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(1_700_000_000);
+    crate::dashboard_state::fixture_events_at(now)
+}
 trait DakuApplicationExt {
     fn with_main_window_reopen(self) -> Self;
 }
@@ -99,7 +116,7 @@ impl DakuApplicationExt for Application {
 }
 
 pub fn run() {
-    let fixture = crate::dashboard_state::ui_fixture_enabled();
+    let fixture = ui_fixture_enabled();
     let daemon = if fixture {
         None
     } else {

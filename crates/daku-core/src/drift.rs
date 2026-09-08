@@ -56,9 +56,11 @@ pub fn unexpected_mismatches<'a>(
     mismatches: &'a [PluginMismatch],
     expected_drift: &[String],
 ) -> Vec<&'a PluginMismatch> {
+    let expected: std::collections::HashSet<&str> =
+        expected_drift.iter().map(String::as_str).collect();
     mismatches
         .iter()
-        .filter(|mismatch| !expected_drift.iter().any(|id| id == &mismatch.id))
+        .filter(|mismatch| !expected.contains(mismatch.id.as_str()))
         .collect()
 }
 
@@ -110,10 +112,7 @@ impl DriftCollector {
         observed_at: i64,
         max_age_secs: i64,
     ) -> anyhow::Result<EnvInventory> {
-        let cached = self
-            .inventories
-            .lock()
-            .expect("drift inventory cache")
+        let cached = crate::lock_or_poisoned(&self.inventories)
             .get(&environment.id)
             .filter(|entry| observed_at.saturating_sub(entry.fetched_at) <= INVENTORY_REFRESH_SECS)
             .cloned();
@@ -135,17 +134,14 @@ impl DriftCollector {
                 let mut combined = plugins;
                 combined.extend(store_apps);
                 let truncated = plugins_truncated || store_truncated;
-                self.inventories
-                    .lock()
-                    .expect("drift inventory cache")
-                    .insert(
-                        environment.id.clone(),
-                        CachedInventory {
-                            fetched_at: observed_at,
-                            plugins: combined.clone(),
-                            truncated,
-                        },
-                    );
+                crate::lock_or_poisoned(&self.inventories).insert(
+                    environment.id.clone(),
+                    CachedInventory {
+                        fetched_at: observed_at,
+                        plugins: combined.clone(),
+                        truncated,
+                    },
+                );
                 (combined, truncated)
             }
         };

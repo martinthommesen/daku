@@ -59,3 +59,12 @@ pub use daku_protocol::{
 pub use server::{Backend, ServerOptions, serve};
 pub use settings::{DaemonSettings, DaemonSettingsStore};
 pub use settings_backend::SettingsBackend;
+
+/// Recover the guard from a poisoned mutex instead of panicking the tick.
+/// A panic while a shared-cache guard is held must degrade one tick, not
+/// wedge every later tick on `lock().expect(...)` until restart.
+pub fn lock_or_poisoned<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}

@@ -55,7 +55,7 @@ pub fn handle_message(
             "tools": [
                 {"name": "environments_list", "description": "List monitored Environments with platform and health.", "inputSchema": {"type": "object", "properties": {}}},
                 {"name": "health_get", "description": "Rolled-up health plus per-Signal votes for one Environment.", "inputSchema": {"type": "object", "properties": {"environment_id": {"type": "string"}}, "required": ["environment_id"]}},
-                {"name": "signals_get", "description": "Latest snapshot per Signal for one Environment (states and summaries, never raw payloads or URLs).", "inputSchema": {"type": "object", "properties": {"environment_id": {"type": "string"}}, "required": ["environment_id"]}},
+                {"name": "signals_get", "description": "Latest snapshot per Signal for one Environment (states plus redacted drill-in rows, never raw payloads or URLs).", "inputSchema": {"type": "object", "properties": {"environment_id": {"type": "string"}}, "required": ["environment_id"]}},
                 {"name": "events_recent", "description": "Recent health and Signal transitions for one Environment, newest first.", "inputSchema": {"type": "object", "properties": {"environment_id": {"type": "string"}, "limit": {"type": "integer", "default": 20}}, "required": ["environment_id"]}},
                 {"name": "digest_week", "description": "Markdown week-in-review for one Environment: transitions, builds, current states.", "inputSchema": {"type": "object", "properties": {"environment_id": {"type": "string"}, "days": {"type": "integer", "default": 7}}, "required": ["environment_id"]}},
             ],
@@ -90,11 +90,13 @@ fn find_environment<'a>(
         .ok_or_else(|| format!("unknown environment {id}"))
 }
 
-/// One Environment's computed state: reachability, per-Signal votes, and
-/// the latest observation time (0 when nothing was ever recorded).
+/// One Environment's computed state: reachability, per-Signal votes, the
+/// raw payload per Signal (for redacted drill-in rows), and the latest
+/// observation time (0 when nothing was ever recorded).
 pub struct EnvVotes {
     pub reachability: Reachability,
     pub votes: Vec<(String, SignalState)>,
+    pub payloads: Vec<(String, String)>,
     pub observed_at: i64,
 }
 
@@ -104,6 +106,7 @@ fn votes_of(store: &StateStore, environment_id: &str) -> Result<EnvVotes, String
         .map_err(|error| format!("{error}"))?;
     let mut reachability = Reachability::Reachable;
     let mut votes = Vec::new();
+    let mut payloads = Vec::new();
     let mut observed_at = None;
     for snapshot in snapshots
         .iter()
@@ -124,11 +127,13 @@ fn votes_of(store: &StateStore, environment_id: &str) -> Result<EnvVotes, String
             snapshot.signal_id.clone(),
             SignalState::parse(&snapshot.state).unwrap_or(SignalState::Skipped),
         ));
+        payloads.push((snapshot.signal_id.clone(), snapshot.payload_json.clone()));
         observed_at = Some(observed_at.unwrap_or(0).max(snapshot.observed_at));
     }
     Ok(EnvVotes {
         reachability,
         votes,
+        payloads,
         observed_at: observed_at.unwrap_or(0),
     })
 }
@@ -194,14 +199,28 @@ fn call_tool(
         }
         "signals_get" => {
             find_environment(&environments, env_id)?;
-            let votes = votes_of(store, env_id)?.votes;
-            // States only: summaries live desktop-side, payloads stay out.
+            let computed = votes_of(store, env_id)?;
+            let payloads: std::collections::HashMap<&str, &str> = computed
+                .payloads
+                .iter()
+                .map(|(id, payload)| (id.as_str(), payload.as_str()))
+                .collect();
+            // States plus redacted drill-in rows; summaries live
+            // desktop-side, payloads stay out.
             serde_json::to_string_pretty(
-                &votes
+                &computed
+                    .votes
                     .iter()
-                    .map(
-                        |(id, state)| serde_json::json!({"signal_id": id, "state": state.as_str()}),
-                    )
+                    .map(|(id, state)| {
+                        serde_json::json!({
+                            "signal_id": id,
+                            "state": state.as_str(),
+                            "rows": payloads
+                                .get(id.as_str())
+                                .map(|payload| redacted_rows(id, payload))
+                                .unwrap_or_default(),
+                        })
+                    })
                     .collect::<Vec<_>>(),
             )
             .map_err(|error| format!("{error}"))
@@ -271,14 +290,97 @@ fn call_tool(
     }
 }
 
+/// Redacted drill-in rows for one Signal payload: which items are offending,
+/// without the payload itself. The allowlist names exactly one display field
+/// per list — config-ish names (job names, MID host names, plugin ids), never
+/// message bodies (syslog `message`, email `subject`), URLs (outbound,
+/// transaction), or credentials. Lists without a safe display field report
+/// counts only (`names` empty). Bounded to `ROW_NAMES_CAP` names; `truncated`
+/// ORs the payload's own flag with the cap.
+pub const ROW_NAMES_CAP: usize = 10;
+
+/// (signal id, list key, display-field key or `None` for counts only).
+const REDACTED_ROW_TABLE: &[(&str, &str, Option<&str>)] = &[
+    ("jobs", "overdue_rows", Some("name")),
+    ("jobs", "error_rows", Some("name")),
+    ("syslog", "error_rows", Some("source")),
+    ("mid_ecc", "agents_unhealthy_list", Some("host_name")),
+    ("outbound", "failure_rows", None),
+    ("flow", "error_rows", Some("name")),
+    ("email", "error_rows", None),
+    ("upgrade", "upgrades", Some("from_version")),
+    ("update_sets", "open_rows", Some("name")),
+    ("scan", "finding_rows", Some("priority")),
+    ("drift", "mismatch_list", Some("id")),
+    ("github", "run_rows", Some("name")),
+    ("transaction", "slow_rows", None),
+];
+
+fn redacted_rows(signal_id: &str, payload_json: &str) -> Vec<serde_json::Value> {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_json) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for (_, list_key, name_key) in REDACTED_ROW_TABLE
+        .iter()
+        .filter(|(signal, _, _)| *signal == signal_id)
+    {
+        let Some(list) = payload.get(list_key).and_then(|list| list.as_array()) else {
+            continue;
+        };
+        if list.is_empty() {
+            continue;
+        }
+        let names: Vec<String> = match name_key {
+            Some(key) => list
+                .iter()
+                .filter_map(|row| {
+                    row.get(key)
+                        .and_then(|name| name.as_str())
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                })
+                .take(ROW_NAMES_CAP)
+                .collect(),
+            None => Vec::new(),
+        };
+        let truncated = payload
+            .get(format!("{list_key}_truncated"))
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false)
+            || (name_key.is_some() && list.len() > names.len());
+        rows.push(serde_json::json!({
+            "list": list_key,
+            "count": list.len(),
+            "names": names,
+            "truncated": truncated,
+        }));
+    }
+    rows
+}
+
 /// Runs the stdio loop: one JSON-RPC message per stdin line, replies on
 /// stdout. Parse errors answer `-32700` and continue; notifications (no
 /// `id`) get no reply. Ends on EOF.
 pub fn run_stdio(store: &StateStore, environments_path: &Path) -> anyhow::Result<()> {
-    use std::io::BufRead as _;
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout();
-    for line in stdin.lock().lines() {
+    run_lines(
+        std::io::stdin().lock(),
+        std::io::stdout(),
+        store,
+        environments_path,
+    )
+}
+
+/// The stdio loop over injected streams: `run_stdio` wires the real stdio,
+/// tests feed piped bytes. Broken-pipe on reply is terminal (nobody is
+/// listening); a bad stdin line is a `-32700` reply, never a panic.
+fn run_lines(
+    reader: impl std::io::BufRead,
+    mut writer: impl std::io::Write,
+    store: &StateStore,
+    environments_path: &Path,
+) -> anyhow::Result<()> {
+    for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -291,9 +393,8 @@ pub fn run_stdio(store: &StateStore, environments_path: &Path) -> anyhow::Result
             })),
         };
         if let Some(reply) = reply {
-            use std::io::Write as _;
-            writeln!(out, "{}", serde_json::to_string(&reply)?)?;
-            out.flush()?;
+            writeln!(writer, "{}", serde_json::to_string(&reply)?)?;
+            writer.flush()?;
         }
     }
     Ok(())
@@ -430,6 +531,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reply["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn redacted_rows_name_offenders_without_payloads_or_urls() {
+        // Job names ride; counts and truncation survive.
+        let rows = redacted_rows(
+            "jobs",
+            r#"{"overdue_rows":[{"name":"Nightly sync"}],"overdue_rows_truncated":false,"error_rows":[]}"#,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["list"], "overdue_rows");
+        assert_eq!(rows[0]["count"], 1);
+        assert_eq!(rows[0]["names"], serde_json::json!(["Nightly sync"]));
+        assert_eq!(rows[0]["truncated"], false);
+        // Syslog message text never rides — only the source.
+        let rows = redacted_rows(
+            "syslog",
+            r#"{"error_rows":[{"source":"Scheduled job","message":"Null pointer in SECRET-1"}],"error_rows_truncated":false}"#,
+        );
+        let text = serde_json::to_string(&rows).unwrap();
+        assert!(!text.contains("SECRET-1"), "{text}");
+        assert_eq!(rows[0]["names"], serde_json::json!(["Scheduled job"]));
+        // Email subjects and outbound URLs are user content: counts only.
+        let rows = redacted_rows(
+            "email",
+            r#"{"error_rows":[{"subject":"SECRET-2"}],"error_rows_truncated":false}"#,
+        );
+        assert_eq!(rows[0]["count"], 1);
+        assert_eq!(rows[0]["names"], serde_json::json!([]));
+        assert!(!serde_json::to_string(&rows).unwrap().contains("SECRET-2"));
+        let rows = redacted_rows(
+            "outbound",
+            r#"{"failure_rows":[{"url":"https://SECRET-3.example.com/hook"}],"failure_rows_truncated":true}"#,
+        );
+        assert_eq!(rows[0]["count"], 1);
+        assert_eq!(rows[0]["truncated"], true);
+        assert!(!serde_json::to_string(&rows).unwrap().contains("SECRET-3"));
+        // Unknown signals, unparsable payloads, and empty lists yield nothing.
+        assert!(redacted_rows("availability", r#"{"rtt_ms":4}"#).is_empty());
+        assert!(redacted_rows("jobs", "not json").is_empty());
+        assert!(redacted_rows("jobs", r#"{"overdue_rows":[],"error_rows":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn stdio_loop_answers_parse_errors_skips_blanks_and_ends_on_eof() {
+        let (db, file) = rig();
+        let input = concat!(
+            "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"initialize\", \"params\": {}}\n",
+            "\n",
+            "   \n",
+            "{not json\n",
+            "{\"jsonrpc\": \"2.0\", \"method\": \"notifications/initialized\"}\n",
+        );
+        let mut output = Vec::new();
+        run_lines(input.as_bytes(), &mut output, &db.store(), file.path()).unwrap();
+        let replies: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // initialize reply + parse-error reply; blanks and the notification
+        // produce nothing.
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["id"], 1);
+        assert_eq!(replies[0]["result"]["serverInfo"]["name"], "daku");
+        assert_eq!(replies[1]["id"], serde_json::Value::Null);
+        assert_eq!(replies[1]["error"]["code"], -32700);
     }
 
     #[test]

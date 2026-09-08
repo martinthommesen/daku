@@ -28,9 +28,12 @@ anyhow = "1.0"
 # The zed sha is pinned in Cargo.lock only — gpui-component depends on
 # `gpui = { git = zed }` with no rev, and Cargo treats `git+zed?rev=X` and
 # `git+zed` as different sources (ADR-0008). Bump with
-# `cargo update -p gpui-component --precise <rev>` (also
-# `-p gpui-component-assets`) then `cargo update -p gpui --precise <zed sha
-# from gpui-component's Cargo.lock at that rev>`, and re-run `bun run check`.
+# `cargo update -p gpui-component --precise <rev>` then
+# `cargo update -p gpui --precise <zed sha from gpui-component's Cargo.lock
+# at that rev>` — atomically, never stopping after the first (zed is
+# unpinned until the second re-pins it; the four longbridge crates share one
+# source id, so no separate `-p gpui-component-assets` bump is needed) — and
+# re-run `bun run check`.
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "font-kit",

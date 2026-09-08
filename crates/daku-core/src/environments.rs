@@ -79,6 +79,20 @@ impl Backend for EnvironmentsBackend {
                 environment,
                 credential_json,
             } => {
+                // Stored Credentials are bound to the saved URL: probing a
+                // different host with the stored item would disclose it to
+                // an arbitrary endpoint on a typo. Changed URLs require an
+                // explicit blob; unchanged URLs keep the fallback.
+                if credential_json.is_none()
+                    && let Ok(saved) = load_or_empty(&self.environments_path)
+                    && let Some(previous) = saved.iter().find(|item| item.id == environment.id)
+                    && previous.instance_url != environment.instance_url
+                {
+                    bail!(
+                        "environment {} URL differs from the saved one; provide the credential to probe the new URL",
+                        environment.id
+                    );
+                }
                 let observation = test_environment(
                     &environment,
                     credential_json.as_deref(),
@@ -152,7 +166,10 @@ pub fn save_environments(path: &Path, environments: &[EnvironmentConfig]) -> any
 fn load_or_empty(path: &Path) -> anyhow::Result<Vec<EnvironmentConfig>> {
     match fs::read(path) {
         Ok(bytes) => {
-            serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+            let environments: Vec<EnvironmentConfig> = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            crate::config::reject_duplicate_ids(&environments)?;
+            Ok(environments)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(anyhow!("reading {}: {error}", path.display())),
@@ -176,7 +193,7 @@ pub fn save_environment(
         if !allow_credential_write {
             bail!("refusing credential write on a non-loopback daemon");
         }
-        validate_credential(environment.auth_method, blob).map_err(|error| anyhow!("{error}"))?;
+        validate_credential(environment.auth_method, blob)?;
     }
     let mut environments = load_or_empty(path)?;
     match environments
@@ -237,8 +254,7 @@ pub fn test_environment(
     let ephemeral;
     let store: &dyn CredentialStore = match credential_json {
         Some(blob) => {
-            validate_credential(environment.auth_method, blob)
-                .map_err(|error| anyhow!("{error}"))?;
+            validate_credential(environment.auth_method, blob)?;
             ephemeral = MemoryCredentialStore::default();
             ephemeral.insert(&environment.id, blob);
             &ephemeral
@@ -528,10 +544,79 @@ mod tests {
                 "irrelevant",
             ),
         ] {
-            let error = validate_credential(method, blob).unwrap_err();
+            let error = validate_credential(method, blob).unwrap_err().to_string();
             assert!(!error.contains(secret), "{error}");
         }
         assert!(validate_credential(AuthMethod::Basic, BASIC).is_ok());
         assert!(validate_credential(AuthMethod::OauthClientCredentials, OAUTH).is_ok());
+    }
+
+    #[test]
+    fn test_wire_probe_with_changed_url_requires_explicit_credential() {
+        use crate::servicenow::{
+            HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
+        };
+        use std::sync::Arc;
+
+        struct ExplodingTransport;
+        impl HttpTransport for ExplodingTransport {
+            fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+                panic!("stored credential must never reach {}", request.url);
+            }
+        }
+        struct OkTransport;
+        impl HttpTransport for OkTransport {
+            fn execute(&self, _request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![("content-type".into(), "application/json".into())],
+                    body: r#"{"result":[{"value":"glide-1"}]}"#.into(),
+                })
+            }
+        }
+
+        let file = TempFile::new("env-wire-url");
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        credentials.insert("dev", BASIC);
+        save_environment(file.path(), &env("dev"), None, credentials.as_ref(), true).unwrap();
+        let backend = EnvironmentsBackend::new(
+            file.path().to_path_buf(),
+            credentials.clone(),
+            Arc::new(ServiceNowClient::new(ExplodingTransport, SystemClock)),
+            true,
+        );
+        // Changed URL + stored credential fallback: refused before any HTTP.
+        let mut moved_env = env("dev");
+        moved_env.instance_url = "https://dev-evil.example.service-now.com".into();
+        let error = backend
+            .handle(Command::TestEnvironment {
+                environment: Box::new(moved_env),
+                credential_json: None,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provide the credential"), "{error}");
+
+        // Unchanged URL keeps the fallback and probes with the stored item.
+        let backend = EnvironmentsBackend::new(
+            file.path().to_path_buf(),
+            credentials.clone(),
+            Arc::new(ServiceNowClient::new(OkTransport, SystemClock)),
+            true,
+        );
+        let payload = backend
+            .handle(Command::TestEnvironment {
+                environment: Box::new(env("dev")),
+                credential_json: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                payload,
+                ResponsePayload::EnvironmentTest { ref build, .. }
+                if build.as_deref() == Some("glide-1")
+            ),
+            "unchanged URL probes with the stored credential"
+        );
     }
 }

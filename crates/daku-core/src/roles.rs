@@ -272,6 +272,40 @@ mod tests {
     }
 
     #[test]
+    fn role_check_table_map_is_pinned() {
+        // Characterization: every (table, min_role, signals) triple. A new
+        // Signal without a role row, a dropped entry, or a wrong role string
+        // must update this list deliberately, not slip past the suite.
+        let map: Vec<(&str, &str, Vec<&str>)> = TABLE_CHECKS
+            .iter()
+            .map(|check| (check.table, check.min_role, check.signals.to_vec()))
+            .collect();
+        assert_eq!(
+            map,
+            [
+                ("sys_properties", "admin", vec!["availability", "drift"]),
+                ("sys_trigger", "admin", vec!["jobs"]),
+                ("syslog", "admin", vec!["syslog", "table_growth"]),
+                ("ecc_agent", "mid_server", vec!["mid_ecc"]),
+                ("ecc_queue", "mid_server", vec!["mid_ecc", "table_growth"]),
+                ("sys_outbound_http_log", "admin", vec!["outbound"]),
+                ("sys_flow_context", "admin", vec!["flow"]),
+                ("sys_email", "admin", vec!["email", "table_growth"]),
+                ("sys_upgrade_history", "admin", vec!["upgrade"]),
+                ("v_user_session", "admin", vec!["sessions"]),
+                ("sys_update_set", "admin", vec!["update_sets"]),
+                ("scan_finding", "scan_user", vec!["scan"]),
+                ("sys_plugins", "admin", vec!["drift"]),
+                ("sys_store_app", "admin", vec!["drift"]),
+                ("clone_instance", "clone_admin", vec!["last_clone"]),
+                ("syslog_transaction", "admin", vec!["slow_txn"]),
+                ("sys_attachment", "admin", vec!["table_growth"]),
+                ("task", "itil (varies)", vec!["table_growth"]),
+            ]
+        );
+    }
+
+    #[test]
     fn role_check_reports_granted_and_denied_tables() {
         let reports = check(vec!["sys_trigger", "syslog"]);
         assert_eq!(reports.len(), 1);

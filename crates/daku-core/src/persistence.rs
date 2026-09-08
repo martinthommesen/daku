@@ -593,10 +593,14 @@ pub fn load_health_events(
     let mut statement = connection
         .prepare(
             "SELECT environment_id, observed_at, kind, from_health, to_health, build, note
-             FROM health_events
-             WHERE environment_id = ?1
-             ORDER BY observed_at ASC
-             LIMIT ?2",
+              FROM (
+                SELECT environment_id, observed_at, kind, from_health, to_health, build, note
+                FROM health_events
+                WHERE environment_id = ?1
+                ORDER BY observed_at DESC
+                LIMIT ?2
+              )
+              ORDER BY observed_at ASC",
         )
         .map_err(to_io_error)?;
     let mut rows = statement
@@ -692,10 +696,14 @@ pub fn load_signal_events(
     let mut statement = connection
         .prepare(
             "SELECT environment_id, signal_id, observed_at, from_state, to_state
-              FROM signal_events
-              WHERE environment_id = ?1
-              ORDER BY observed_at ASC
-              LIMIT ?2",
+              FROM (
+                SELECT environment_id, signal_id, observed_at, from_state, to_state
+                FROM signal_events
+                WHERE environment_id = ?1
+                ORDER BY observed_at DESC
+                LIMIT ?2
+              )
+              ORDER BY observed_at ASC",
         )
         .map_err(to_io_error)?;
     let mut rows = statement
@@ -1286,5 +1294,99 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn load_health_events_returns_newest_window_oldest_first() {
+        let db = TempDb::new("health-events-order");
+        let connection = db.store().open().unwrap();
+        for at in [100, 200, 300, 400] {
+            record_health_event(
+                &connection,
+                &health_event("prod", at, "health", None, "healthy"),
+            )
+            .unwrap();
+        }
+        let events = load_health_events(&connection, "prod", 2).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.observed_at)
+                .collect::<Vec<_>>(),
+            vec![300, 400],
+            "publish window is the newest rows, still oldest-first"
+        );
+    }
+
+    #[test]
+    fn load_signal_events_returns_newest_window_oldest_first() {
+        let db = TempDb::new("signal-events-order");
+        let connection = db.store().open().unwrap();
+        for at in [100, 200, 300, 400] {
+            record_signal_event(
+                &connection,
+                &SignalEvent {
+                    environment_id: "prod".into(),
+                    signal_id: format!("jobs-{at}"),
+                    observed_at: at,
+                    from_state: None,
+                    to_state: "degraded".into(),
+                },
+            )
+            .unwrap();
+        }
+        let events = load_signal_events(&connection, "prod", 2).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.observed_at)
+                .collect::<Vec<_>>(),
+            vec![300, 400],
+            "publish window is the newest rows, still oldest-first"
+        );
+    }
+
+    #[test]
+    fn prune_health_events_enforces_newest_500_cap() {
+        let db = TempDb::new("health-events-cap");
+        let connection = db.store().open().unwrap();
+        let now = 1_700_000_000;
+        for offset in 0..HEALTH_EVENTS_MAX_PER_ENV + 2 {
+            record_health_event(
+                &connection,
+                &health_event("prod", now - 1000 + offset, "health", None, "healthy"),
+            )
+            .unwrap();
+        }
+        assert_eq!(prune_health_events(&connection, "prod", now).unwrap(), 2);
+        let events =
+            load_health_events(&connection, "prod", HEALTH_EVENTS_MAX_PER_ENV + 10).unwrap();
+        assert_eq!(events.len(), HEALTH_EVENTS_MAX_PER_ENV as usize);
+        assert_eq!(events[0].observed_at, now - 1000 + 2);
+    }
+
+    #[test]
+    fn prune_signal_events_enforces_newest_500_cap() {
+        let db = TempDb::new("signal-events-cap");
+        let connection = db.store().open().unwrap();
+        let now = 1_700_000_000;
+        for offset in 0..HEALTH_EVENTS_MAX_PER_ENV + 2 {
+            record_signal_event(
+                &connection,
+                &SignalEvent {
+                    environment_id: "prod".into(),
+                    signal_id: format!("jobs-{offset}"),
+                    observed_at: now - 1000 + offset,
+                    from_state: None,
+                    to_state: "degraded".into(),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(prune_signal_events(&connection, "prod", now).unwrap(), 2);
+        let events =
+            load_signal_events(&connection, "prod", HEALTH_EVENTS_MAX_PER_ENV + 10).unwrap();
+        assert_eq!(events.len(), HEALTH_EVENTS_MAX_PER_ENV as usize);
+        assert_eq!(events[0].observed_at, now - 1000 + 2);
     }
 }

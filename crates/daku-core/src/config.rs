@@ -61,8 +61,22 @@ pub fn load_environments(path: &Path) -> anyhow::Result<Vec<EnvironmentConfig>> 
         validate_instance_url(&environment.id, &environment.instance_url)?;
         validate_platform_url(environment)?;
     }
+    reject_duplicate_ids(&environments)?;
     environments.sort_by_key(|environment| environment.sort_order);
     Ok(environments)
+}
+
+/// Two entries sharing one id also share one credential-store key while
+/// probing different hosts — the wrong credential reaches the wrong host
+/// and doctor/digest/MCP report only the first entry. Fail fast, naming it.
+pub(crate) fn reject_duplicate_ids(environments: &[EnvironmentConfig]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for environment in environments {
+        if !seen.insert(environment.id.as_str()) {
+            anyhow::bail!("duplicate environment id {:?}", environment.id);
+        }
+    }
+    Ok(())
 }
 
 /// Repairs what `doctor --fix` may safely touch: the parent directory
@@ -159,21 +173,9 @@ fn validate_platform_url(environment: &EnvironmentConfig) -> anyhow::Result<()> 
 }
 
 /// `owner/repo` from a GitHub URL, tolerating a trailing slash or `.git`.
-pub fn split_github_repo(instance_url: &str) -> Option<(String, String)> {
-    let path = instance_url
-        .strip_prefix("https://")?
-        .split('/')
-        .collect::<Vec<_>>();
-    if path.len() < 3 || !path[0].eq_ignore_ascii_case("github.com") {
-        return None;
-    }
-    let owner = path[1].trim();
-    let repo = path[2].trim().trim_end_matches(".git").trim();
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((owner.to_owned(), repo.to_owned()))
-}
+/// Re-exported from the wire contract so the desktop sheet accepts the same
+/// spellings the daemon loader does.
+pub use daku_protocol::split_github_repo;
 
 /// Looks up the secret blob for an Environment id.
 ///
@@ -494,9 +496,10 @@ mod tests {
         assert!(format!("{error:#}").contains("parsing "), "{error:#}");
     }
 
-    /// Duplicate ids parse today; pinned so a future validation change is deliberate.
+    /// Duplicate ids are rejected: two entries share one credential-store
+    /// key while probing different hosts.
     #[test]
-    fn load_environments_sorts_by_sort_order_and_keeps_duplicate_ids() {
+    fn load_environments_sorts_by_sort_order_and_rejects_duplicate_ids() {
         let entry = |id: &str, sort_order: i64| {
             format!(
                 r#"{{"id":"{id}","label":"{id}","instance_url":"https://{id}.example.service-now.com","auth_method":"basic","sort_order":{sort_order}}}"#
@@ -513,8 +516,11 @@ mod tests {
         );
 
         let file = write_temp(&format!("[{},{}]", entry("prod", 0), entry("prod", 1)));
-        let duplicates = load_environments(file.path()).unwrap();
-        assert_eq!(duplicates.len(), 2);
+        let error = load_environments(file.path()).unwrap_err().to_string();
+        assert!(
+            error.contains(r#"duplicate environment id "prod""#),
+            "{error}"
+        );
     }
 
     #[test]

@@ -5,9 +5,11 @@ fifteen-Signal suite; HTTP and GitHub are single-Signal probes that reuse
 the same health rollup, notifications, mutes, thresholds, and history.
 
 Declare the platform per Environment in `~/.daku/environments.json`
-(missing reads as `"servicenow"`). The Environment sheet edits everything
-except the platform: new Environments start as ServiceNow, edits keep the
-stored value.
+(missing reads as `"servicenow"`), or pick it in the Environment sheet:
+ServiceNow, HTTP probe, or GitHub Actions, each with its own URL hint and
+validation (GitHub URLs must name one `owner/repo`). Changing the platform
+on edit keeps thresholds and expected drift; the Credential shape is
+auth-method-dependent, so nothing else migrates.
 
 ## HTTP — any status page or health endpoint
 
@@ -54,5 +56,7 @@ triggers, cancels, or re-runs anything.
 
 Copy `crates/daku-core/src/http_probe.rs`: a `Signal` impl, a threshold if
 it votes, registration in `build_default_loop`'s platform match, payload
-cases in `payload_contract.rs`, card rendering behind `signal_ids_for`,
-and a section here. No plugin machinery to satisfy.
+cases in `payload_contract.rs` (re-bless with `DAKU_BLESS_PAYLOADS=1`),
+fixture parity in `fixture_events_at` (`src/dashboard_state.rs`), card
+rendering behind `signal_ids_for`, and a section here. No plugin machinery
+to satisfy.

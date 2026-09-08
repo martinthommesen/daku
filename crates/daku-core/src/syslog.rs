@@ -90,8 +90,7 @@ fn fetch_syslog_rows(
                 })
             })
             .collect();
-    let truncated = rows.len() >= ROW_LIST_LIMIT;
-    (rows.into_iter().take(ROW_LIST_LIMIT).collect(), truncated)
+    crate::collector::take_bounded(rows)
 }
 
 #[derive(Default)]

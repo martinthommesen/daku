@@ -16,7 +16,7 @@
 
 use daku_protocol::SignalState;
 
-use crate::collector::{Observation, PerEnvironmentCollector, ROW_LIST_LIMIT, Signal};
+use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::ServiceNowClient;
 
@@ -88,8 +88,7 @@ fn fetch_update_sets(
                 })
             })
             .collect();
-    let truncated = rows.len() >= ROW_LIST_LIMIT;
-    Ok((rows.into_iter().take(ROW_LIST_LIMIT).collect(), truncated))
+    Ok(crate::collector::take_bounded(rows))
 }
 
 #[derive(Default)]

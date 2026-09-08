@@ -58,7 +58,7 @@ new settings, immediate tick.
 
 **Cost — protocol**: *none*. `ClientMessage::Shutdown` already exists,
 `DaemonClient::shutdown` is already public, and `ServerOptions::allow_shutdown`
-is `arguments.parent_pid.is_some()` — which `DaemonProcess::spawn_configured`
+is `arguments.parent_pid.is_some()` — which `DaemonProcess::spawn`
 always passes. `PROTOCOL_VERSION` stays at its current value. This also means
 no desktop/daemon lockstep ship.
 
@@ -178,10 +178,12 @@ benchmark.
    outright on `Remote`. If the Operator triggers reload against a daemon
    reached via `DaemonSupervisor::connect`, the daemon shuts down (if it honours
    shutdown at all) and `monitor_remote` re-dials a dead address forever.
-   `DaemonSupervisor`'s public surface today is `spawn`, `spawn_configured`,
+   `DaemonSupervisor`'s public surface today is `spawn`,
    `connect`, `last_error`, `client`, `subscribe_clients` — **no local-vs-remote
    predicate**. A build plan must add one and hide or disable the affordance.
-2. **Exposed browser clients get dropped.** With `--allow-non-loopback`, a
+2. **Exposed browser clients get dropped.** (Moot since the hosted-daemon
+   deletion: desktop launches are loopback-only, so no browser clients exist.
+   Left for the record.) With `--allow-non-loopback`, a
    restart closes every browser socket. They must re-dial; unlike the desktop
    they have no `subscribe_clients` fan-out. Unknown whether anything downstream
    relies on socket continuity.

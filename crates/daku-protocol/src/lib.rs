@@ -5,12 +5,12 @@
 pub mod environment;
 pub mod identity;
 pub mod settings;
-pub mod theme;
 
 mod protocol;
 
 pub use environment::{
-    AuthMethod, EnvironmentConfig, NON_VOTING_SIGNALS, Platform, Thresholds, validate_credential,
+    AuthMethod, CredentialShapeError, EnvironmentConfig, NON_VOTING_SIGNALS, Platform, Thresholds,
+    split_github_repo, validate_credential,
 };
 pub use protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,

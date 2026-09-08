@@ -49,7 +49,7 @@ A bounded, persisted record that one Signal changed state, confirmed over two co
 _Avoid_: alert, incident, audit log
 
 **Roll-up**:
-An hourly aggregate over raw Signal samples (avg for latency, max for backlog/error counts) kept for 30 days. Raw 24 h samples answer "spiking now?"; roll-ups answer "normal for a Monday?" with a flat ~720 points per Environment per Signal instead of ~86k raw points.
+An hourly aggregate over raw Signal samples (avg for latency, max for backlog/error counts) kept for 90 days. Raw 24 h samples answer "spiking now?"; roll-ups answer "normal for a Monday?" with a flat ~2160 points per Environment per Signal instead of ~86k raw points.
 _Avoid_: downsampling (the rejected per-frame optimisation), archive
 
 ### Screen

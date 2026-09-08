@@ -317,9 +317,11 @@ impl DashboardState {
         self.connected = connected;
     }
 
-    /// True while `now` is before the mute deadline for `id`.
+    /// True while `now` is before the mute deadline for `id`. Shares the
+    /// predicate with `AppSettings` (`daku_client::persistence::mute_active`)
+    /// so expiry reads identically on both sides of the sync.
     pub fn is_muted(&self, id: &str, now: i64) -> bool {
-        self.mutes.get(id).is_some_and(|until| now < *until)
+        daku_client::persistence::mute_active(&self.mutes, id, now)
     }
 
     pub fn muted_until(&self, id: &str) -> Option<i64> {
@@ -2412,11 +2414,10 @@ fn pinned(name: &str) -> SignalSnapshotDto {
     }
 }
 
-pub fn ui_fixture_enabled() -> bool {
-    matches!(std::env::var("DAKU_UI_FIXTURE").as_deref(), Ok("1"))
-}
-
-pub fn fixture_events() -> Vec<ServerMessage> {
+/// Fixture entrypoint lives on the shell (`crate::ui_fixture_enabled`,
+/// `crate::fixture_events`): this module takes events in and renders state
+/// out, reading neither env vars nor clocks.
+pub fn fixture_events_at(now: i64) -> Vec<ServerMessage> {
     vec![
         ServerMessage::EnvironmentsUpdated {
             environments: vec![
@@ -2524,9 +2525,9 @@ pub fn fixture_events() -> Vec<ServerMessage> {
             // Real-now-relative hours so every window renders in fixture
             // mode; the 24 h view reads the raw samples above instead.
             points: vec![
-                fixture_rollup(200, 8.0),
-                fixture_rollup(26, 5.0),
-                fixture_rollup(1, 2.0),
+                fixture_rollup(now, 200, 8.0),
+                fixture_rollup(now, 26, 5.0),
+                fixture_rollup(now, 1, 2.0),
             ],
         },
         ServerMessage::SignalSamplesUpdated {
@@ -2561,13 +2562,11 @@ pub fn fixture_events() -> Vec<ServerMessage> {
     ]
 }
 
-/// One rollup point `hours_ago` hours before the current hour, so the
-/// 7 d / 30 d drill-in windows have something to draw in fixture mode.
-fn fixture_rollup(hours_ago: i64, avg: f64) -> RollupPoint {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or(1_700_000_000);
+/// One rollup point `hours_ago` hours before `now`'s hour, so the 7 d /
+/// 30 d drill-in windows have something to draw in fixture mode. `now` is a
+/// parameter — the model stays free of clocks (and env vars); the shell
+/// passes the current time.
+fn fixture_rollup(now: i64, hours_ago: i64, avg: f64) -> RollupPoint {
     let hour = now - now % 3600 - hours_ago * 3600;
     RollupPoint {
         hour_start: hour,
@@ -2763,7 +2762,7 @@ mod tests {
     fn fixture_events_cover_every_signal_id() {
         use std::collections::HashSet;
         let mut covered = HashSet::new();
-        for event in fixture_events() {
+        for event in fixture_events_at(TEST_NOW) {
             if let ServerMessage::SignalSnapshotsUpdated { snapshots, .. } = event {
                 for snapshot in snapshots {
                     covered.insert(snapshot.signal_id.clone());
@@ -2773,7 +2772,7 @@ mod tests {
         for signal_id in SIGNAL_IDS {
             assert!(
                 covered.contains(signal_id),
-                "fixture_events() has no snapshot for {signal_id} — extend it alongside payloads.json"
+                "fixture_events_at() has no snapshot for {signal_id} — extend it alongside payloads.json"
             );
         }
     }
@@ -2781,7 +2780,7 @@ mod tests {
     fn loaded() -> DashboardState {
         let mut state = DashboardState::new();
         state.set_connected(true);
-        state.apply_all(&fixture_events());
+        state.apply_all(&fixture_events_at(TEST_NOW));
         state
     }
 
@@ -4190,7 +4189,7 @@ mod tests {
                 Reachability::Reachable,
             )],
         });
-        state.apply_all(&fixture_events()[..1]);
+        state.apply_all(&fixture_events_at(TEST_NOW)[..1]);
         state.select("test");
         assert!(
             state
@@ -4211,7 +4210,7 @@ mod tests {
                 Reachability::Reachable,
             )],
         });
-        state.apply_all(&fixture_events()[..1]);
+        state.apply_all(&fixture_events_at(TEST_NOW)[..1]);
         state.select("test");
         let syslog = state
             .cards(TEST_NOW)

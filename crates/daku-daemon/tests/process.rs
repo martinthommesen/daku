@@ -216,13 +216,19 @@ fn daemon_refuses_to_start_with_an_empty_token() {
 
 /// Other tests in this file spawn daemons from the same process, so match on
 /// the supervisor's own `--parent-pid <us>` argument rather than the binary
-/// name. The trailing space anchors the pid against a longer one, and the
-/// pattern drops the leading dashes so pgrep does not read it as an option.
+/// name. The `([^0-9]|$)` anchors the pid against a longer one sharing its
+/// prefix, and the pattern drops the leading dashes so pgrep does not read
+/// it as an option.
 #[cfg(unix)]
 fn supervised_daemon_pids() -> Vec<u32> {
     let self_pid = std::process::id().to_string();
     let listed = Command::new("pgrep")
-        .args(["-P", &self_pid, "-f", &format!("parent-pid {self_pid} ")])
+        .args([
+            "-P",
+            &self_pid,
+            "-f",
+            &format!("parent-pid {self_pid}([^0-9]|$)"),
+        ])
         .output()
         .unwrap();
     String::from_utf8_lossy(&listed.stdout)

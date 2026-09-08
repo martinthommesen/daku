@@ -4,7 +4,9 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, mpsc};
 
 use daku_client::DaemonSupervisor;
-use daku_protocol::{EnvironmentHealth, HealthEventDto, Reachability, ServerMessage};
+use daku_protocol::{
+    EnvironmentHealth, HealthEventDto, Reachability, ServerMessage, is_supported_instance_url,
+};
 use gpui::{
     App, AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, FontWeight,
     IntoElement, KeyDownEvent, PathBuilder, Pixels, Point, SharedString, Window, canvas, div,
@@ -40,15 +42,18 @@ use crate::TogglePalette;
 use crate::ToggleSignalNotify;
 use crate::ToggleWeeklyDigest;
 use crate::dashboard_state::{
-    DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase,
-    fixture_events, freshness, is_trend_signal, mute_remaining_label, signal_label,
-    ui_fixture_enabled,
+    DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase, freshness,
+    is_trend_signal, mute_remaining_label, signal_label,
 };
-use crate::env_sheet::{EnvSheet, auth_label, build_config, credential_blob, credential_captions};
+use crate::env_sheet::{
+    BuildConfig, EnvSheet, auth_label, build_config, credential_blob, credential_captions,
+    url_caption,
+};
 use crate::notifications::{
     notification_body_grouped, notification_title, post_health_notification, select_notification,
 };
 use crate::persistence::{AppSettings, save_app_settings};
+use crate::{fixture_events, ui_fixture_enabled};
 
 const SIDEBAR_WIDTH: f32 = 220.0;
 
@@ -92,6 +97,12 @@ pub struct Daku {
 
 /// Mute durations offered in the Environment header.
 const MUTE_OPTIONS: [(i64, &str); 3] = [(3600, "1h"), (14_400, "4h"), (86_400, "24h")];
+
+/// Upper bound on remembered notification decisions. Health events are
+/// bounded per Environment in SQLite, but this desktop-side dedup set would
+/// otherwise grow one entry per event forever — including entries for
+/// removed Environments that can never match again.
+const NOTIFY_SEEN_CAP: usize = 2000;
 
 impl Daku {
     pub fn new(
@@ -224,6 +235,18 @@ impl Daku {
         }
         let (record, fire) = select_notification(env_id, events, &self.notify_seen, self.boot_now);
         self.notify_seen.extend(record);
+        // Prune decisions for removed Environments, then evict oldest past
+        // the cap so a long-lived desktop process cannot grow without bound.
+        self.notify_seen
+            .retain(|(id, _, _)| self.state.environments().iter().any(|env| env.id == *id));
+        if self.notify_seen.len() > NOTIFY_SEEN_CAP {
+            let mut seen: Vec<_> = self.notify_seen.iter().cloned().collect();
+            seen.sort_by_key(|(_, observed_at, _)| *observed_at);
+            self.notify_seen = seen
+                .into_iter()
+                .skip(self.notify_seen.len() - NOTIFY_SEEN_CAP)
+                .collect();
+        }
         let Some(event) = fire else { return };
         let now = unix_now();
         // One locked read; a poisoned lock fails safe to silent.
@@ -466,15 +489,16 @@ impl Daku {
             thresholds: summary.thresholds.clone(),
             expected_drift: summary.expected_drift.clone(),
         });
-        let config = build_config(
+        let config = build_config(BuildConfig {
             id,
-            values.label.trim().to_owned(),
-            values.url.trim().to_owned(),
-            sheet.auth,
-            sheet.clone_source,
+            label: values.label.trim().to_owned(),
+            instance_url: values.url.trim().to_owned(),
+            auth_method: sheet.auth,
+            platform: sheet.platform,
+            clone_source: sheet.clone_source,
             sort_order,
-            existing_config.as_ref(),
-        );
+            existing: existing_config.as_ref(),
+        });
         let blob = credential_blob(sheet.auth, &values.secret_a, &values.secret_b);
         Some((config, blob))
     }
@@ -494,31 +518,35 @@ impl Daku {
         cx: &App,
     ) -> Option<(daku_protocol::EnvironmentConfig, Option<String>)> {
         let (mut config, blob) = self.read_sheet(cx)?;
-        if let Err(error) =
-            crate::env_sheet::validate_fields(&config.id, &config.label, &config.instance_url)
-        {
+        if let Err(error) = crate::env_sheet::validate_fields(
+            &config.id,
+            &config.label,
+            &config.instance_url,
+            config.platform,
+        ) {
             self.set_sheet_notice(true, error);
             return None;
         }
         let sheet = self.env_sheet.as_ref()?;
-        match sheet.thresholds_result(cx) {
-            Ok(thresholds) => config.thresholds = thresholds,
+        let thresholds = match sheet.thresholds_result(cx) {
+            Ok(thresholds) => thresholds,
             Err(error) => {
                 self.set_sheet_notice(true, error);
                 return None;
             }
-        }
-        match sheet.expected_drift_result(cx) {
-            Ok(expected_drift) => config.expected_drift = expected_drift,
+        };
+        let expected_drift = match sheet.expected_drift_result(cx) {
+            Ok(expected_drift) => expected_drift,
             Err(error) => {
                 self.set_sheet_notice(true, error);
                 return None;
             }
-        }
+        };
+        crate::env_sheet::apply_sheet_tuning(&mut config, thresholds, expected_drift);
         if let Some(blob) = &blob
             && let Err(error) = daku_protocol::validate_credential(config.auth_method, blob)
         {
-            self.set_sheet_notice(true, error);
+            self.set_sheet_notice(true, error.to_string());
             return None;
         }
         Some((config, blob))
@@ -753,29 +781,46 @@ impl Daku {
         };
         let now = unix_now();
         let dir = export_directory(&id, now);
-        let wrote = std::fs::create_dir_all(&dir)
+        let step = |name: &str| format!("{} ({})", dir.join(name).display(), name);
+        let result = std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("mkdir {}: {error:#}", dir.display()))
             .and_then(|_| {
                 std::fs::write(
                     dir.join("snapshots.json"),
                     self.state.export_snapshots_json(),
                 )
+                .map_err(|error| format!("write {}: {error:#}", step("snapshots.json")))
             })
-            .and_then(|_| std::fs::write(dir.join("trends.csv"), self.state.export_trends_csv()))
-            .and_then(|_| std::fs::write(dir.join("summary.md"), self.state.summary_text(now)))
-            .is_ok();
-        if wrote {
-            self.exported_path = Some(dir.display().to_string());
-            cx.notify();
-            cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(4))
-                    .await;
-                let _ = this.update(cx, |this: &mut Self, cx| {
-                    this.exported_path = None;
-                    cx.notify();
-                });
+            .and_then(|_| {
+                std::fs::write(dir.join("trends.csv"), self.state.export_trends_csv())
+                    .map_err(|error| format!("write {}: {error:#}", step("trends.csv")))
             })
-            .detach();
+            .and_then(|_| {
+                std::fs::write(dir.join("summary.md"), self.state.summary_text(now))
+                    .map_err(|error| format!("write {}: {error:#}", step("summary.md")))
+            });
+        match result {
+            Ok(()) => {
+                self.exported_path = Some(dir.display().to_string());
+                cx.notify();
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(4))
+                        .await;
+                    let _ = this.update(cx, |this: &mut Self, cx| {
+                        this.exported_path = None;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            // A partial directory must not look complete: surface the failing
+            // step in the footer and remove what was written.
+            Err(message) => {
+                eprintln!("daku export failed: {message}");
+                let _ = std::fs::remove_dir_all(&dir);
+                self.flash(&format!("Export failed: {message}"), cx, 6);
+            }
         }
     }
 
@@ -851,7 +896,9 @@ impl Daku {
             "mute-24h" => self.mute_selected(86_400, cx),
             "unmute" => self.unmute_selected(cx),
             "open-snow" => {
-                if let Some(url) = self.state.selected().map(|env| env.instance_url.clone()) {
+                if let Some(url) = self.state.selected().map(|env| env.instance_url.clone())
+                    && is_supported_instance_url(&url)
+                {
                     cx.open_url(&url);
                 }
             }
@@ -1251,6 +1298,7 @@ fn edit_button(cx: &mut Context<Daku>) -> gpui::AnyElement {
 #[derive(Clone, Copy, PartialEq)]
 enum SheetToggle {
     Auth(daku_protocol::AuthMethod),
+    Platform(daku_protocol::Platform),
     CloneSource(bool),
 }
 
@@ -1481,7 +1529,27 @@ impl Daku {
                             element.child(EnvSheet::field_row("ID", &sheet.id_field, cx))
                         })
                         .child(EnvSheet::field_row("Label", &sheet.label_field, cx))
-                        .child(EnvSheet::field_row("Instance URL", &sheet.url_field, cx))
+                        .child(EnvSheet::field_row(url_caption(sheet.platform), &sheet.url_field, cx))
+                        .child(self.sheet_toggle_row(
+                            "Platform",
+                            &[
+                                (
+                                    SheetToggle::Platform(
+                                        daku_protocol::Platform::Servicenow,
+                                    ),
+                                    "ServiceNow",
+                                ),
+                                (
+                                    SheetToggle::Platform(daku_protocol::Platform::Http),
+                                    "HTTP probe",
+                                ),
+                                (
+                                    SheetToggle::Platform(daku_protocol::Platform::Github),
+                                    "GitHub Actions",
+                                ),
+                            ],
+                            cx,
+                        ))
                         .child(self.sheet_toggle_row(
                             "Auth",
                             &[
@@ -1726,6 +1794,10 @@ impl Daku {
                                 .env_sheet
                                 .as_ref()
                                 .is_some_and(|sheet| sheet.auth == auth),
+                            SheetToggle::Platform(platform) => self
+                                .env_sheet
+                                .as_ref()
+                                .is_some_and(|sheet| sheet.platform == platform),
                             SheetToggle::CloneSource(flag) => self
                                 .env_sheet
                                 .as_ref()
@@ -1747,6 +1819,9 @@ impl Daku {
                                 if let Some(sheet) = this.env_sheet.as_mut() {
                                     match pick {
                                         SheetToggle::Auth(auth) => sheet.auth = auth,
+                                        SheetToggle::Platform(platform) => {
+                                            sheet.platform = platform
+                                        }
                                         SheetToggle::CloneSource(flag) => sheet.clone_source = flag,
                                     }
                                     sheet.delete_armed = false;
@@ -1839,7 +1914,10 @@ impl Daku {
         let now = unix_now();
         let query = self.timeline_filter.read(cx).value().to_string();
         let entries = self.state.timeline(now, 20, &query);
-        let has_history = !self.state.timeline(now, 1, "").is_empty();
+        // `entries` already answers emptiness for the unfiltered, note-less
+        // case; a second `timeline(…, 1, "")` call would re-merge, re-format,
+        // and re-sort up to 200 events every frame just for this boolean.
+        let has_history = !entries.is_empty() || !query.trim().is_empty();
         if !has_history && query.trim().is_empty() && self.note_target.is_none() {
             return None;
         }
@@ -2526,11 +2604,14 @@ fn disconnected_banner(cx: &App) -> impl IntoElement {
         .child("Disconnected")
 }
 
+/// Card/sidebar status dot. Known words share `health_color`'s mapping so
+/// a theme change lands once; anything else (including `unknown` and
+/// `waiting`) dims instead of guessing a severity.
 fn status_color(status: &str, cx: &App) -> gpui::Hsla {
     match status {
-        "healthy" => cx.theme().success,
-        "degraded" => cx.theme().warning,
-        "down" => cx.theme().danger,
+        "healthy" => health_color(EnvironmentHealth::Healthy, cx),
+        "degraded" => health_color(EnvironmentHealth::Degraded, cx),
+        "down" => health_color(EnvironmentHealth::Down, cx),
         _ => cx.theme().muted_foreground,
     }
 }

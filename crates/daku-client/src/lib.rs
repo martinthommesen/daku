@@ -6,6 +6,4 @@ mod process;
 
 pub use client::DaemonClient;
 pub use daku_protocol::identity;
-pub use process::{
-    DEFAULT_EXPOSED_DAEMON_PORT, DaemonExposureSettings, DaemonSupervisor, parse_allowed_origins,
-};
+pub use process::DaemonSupervisor;

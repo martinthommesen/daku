@@ -57,6 +57,25 @@ impl Platform {
     }
 }
 
+/// `owner/repo` from a GitHub URL, tolerating a trailing slash or `.git`.
+/// Pure URL parsing shared by the daemon loader and the desktop sheet so
+/// both accept the same spellings.
+pub fn split_github_repo(instance_url: &str) -> Option<(String, String)> {
+    let path = instance_url
+        .strip_prefix("https://")?
+        .split('/')
+        .collect::<Vec<_>>();
+    if path.len() < 3 || !path[0].eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let owner = path[1].trim();
+    let repo = path[2].trim().trim_end_matches(".git").trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_owned(), repo.to_owned()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EnvironmentConfig {
     pub id: String,
@@ -153,10 +172,28 @@ pub const NON_VOTING_SIGNALS: [&str; 3] = ["last_clone", "sessions", "table_grow
 /// echoing the blob: OAuth needs non-empty `client_id` + `client_secret`,
 /// basic needs non-empty `username` + `password`. Shared by the daemon
 /// (save path) and the desktop sheet (pre-flight) so both reject the same
-/// garbage with the same message.
-pub fn validate_credential(auth_method: AuthMethod, blob: &str) -> Result<(), String> {
+/// garbage with the same message. A typed error (not `String`) so anyhow
+/// callers keep context chains instead of flattening to one line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialShapeError {
+    reason: String,
+}
+
+impl std::fmt::Display for CredentialShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for CredentialShapeError {}
+
+pub fn validate_credential(
+    auth_method: AuthMethod,
+    blob: &str,
+) -> Result<(), CredentialShapeError> {
+    let err = |reason: String| CredentialShapeError { reason };
     let value: serde_json::Value =
-        serde_json::from_str(blob).map_err(|_| "credential is not valid JSON".to_owned())?;
+        serde_json::from_str(blob).map_err(|_| err("credential is not valid JSON".to_owned()))?;
     let present = |key: &str| {
         value
             .get(key)
@@ -172,9 +209,9 @@ pub fn validate_credential(auth_method: AuthMethod, blob: &str) -> Result<(), St
             AuthMethod::OauthClientCredentials => "client_id and client_secret",
             AuthMethod::Basic => "username and password",
         };
-        return Err(format!(
+        return Err(err(format!(
             "credential does not match its auth method (needs {want})"
-        ));
+        )));
     }
     Ok(())
 }

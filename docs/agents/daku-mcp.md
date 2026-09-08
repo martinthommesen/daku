@@ -22,7 +22,7 @@ respected when the database lives elsewhere.
 |---|---|---|
 | `environments_list` | — | id, label, platform, rolled-up health per Environment |
 | `health_get` | `environment_id` | health, reachability, per-Signal votes |
-| `signals_get` | `environment_id` | per-Signal states (no payloads) |
+| `signals_get` | `environment_id` | per-Signal states plus redacted drill-in rows (`list`, `count`, `names`, `truncated` — display names only, never message bodies, subjects, URLs, or payloads) |
 | `events_recent` | `environment_id`, `limit` (default 20, max 100) | health + Signal transitions, newest first |
 | `digest_week` | `environment_id`, `days` (default 7, max 90) | Markdown review |
 

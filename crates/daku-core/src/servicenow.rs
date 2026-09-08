@@ -16,6 +16,12 @@ const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// shared collector thread for every Environment; the collector will retry
 /// naturally on its next tick.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Upper bound on what one tick thread actually sleeps for a 429. Short
+/// backoffs (the usual `Retry-After: 1`) are absorbed in-tick; longer ones
+/// return the 429 immediately as a transient error (availability already
+/// reads it that way and sustained 429s gate the other Signals) instead of
+/// parking the whole per-Environment chain for up to a minute.
+const MAX_TICK_429_SLEEP: Duration = Duration::from_secs(5);
 /// Longest we will trust an OAuth grant regardless of what the server says.
 const MAX_TOKEN_TTL_SECS: u64 = 24 * 60 * 60;
 /// Shortest OAuth grant we will act on. A server reporting a near-zero
@@ -107,10 +113,7 @@ impl CountingSemaphore {
     }
 
     fn acquire(&self) -> SemaphoreGuard<'_> {
-        let mut used = self
-            .used
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut used = crate::lock_or_poisoned(&self.used);
         while *used >= self.max {
             used = self
                 .changed
@@ -128,11 +131,7 @@ struct SemaphoreGuard<'a> {
 
 impl Drop for SemaphoreGuard<'_> {
     fn drop(&mut self) {
-        let mut used = self
-            .semaphore
-            .used
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut used = crate::lock_or_poisoned(&self.semaphore.used);
         *used = used.saturating_sub(1);
         self.semaphore.changed.notify_one();
     }
@@ -174,6 +173,12 @@ pub struct ServiceNowClient {
     transport: Box<dyn HttpTransport>,
     clock: Box<dyn Clock>,
     tokens: Mutex<HashMap<String, CachedToken>>,
+    /// Memoized credential blobs per Environment, so a healthy tick costs
+    /// one store read per Environment instead of one per probe (Basic auth
+    /// hits the Keychain or re-reads `credentials.json` otherwise). A 401
+    /// drops the entry and retries once (`request`), so rotation is picked
+    /// up on the next probe after at most one stale request.
+    credential_blobs: Mutex<HashMap<String, String>>,
 }
 
 impl ServiceNowClient {
@@ -182,6 +187,7 @@ impl ServiceNowClient {
             transport: Box::new(transport),
             clock: Box::new(clock),
             tokens: Mutex::new(HashMap::new()),
+            credential_blobs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -210,14 +216,15 @@ impl ServiceNowClient {
                 body: body.map(str::to_owned),
             };
             let response = self.send(&request)?;
-            if response.status == 401
-                && environment.auth_method == AuthMethod::OauthClientCredentials
-                && !refreshed
-            {
-                self.tokens
-                    .lock()
-                    .expect("token cache")
-                    .remove(&environment.id);
+            // A 401 means the memoized secret is stale (rotation) or wrong:
+            // drop the cache and retry once. Steady-state wrong credentials
+            // cost one extra request per tick; rotation recovers transparently.
+            if response.status == 401 && !refreshed {
+                if environment.auth_method == AuthMethod::OauthClientCredentials {
+                    crate::lock_or_poisoned(&self.tokens).remove(&environment.id);
+                } else {
+                    crate::lock_or_poisoned(&self.credential_blobs).remove(&environment.id);
+                }
                 refreshed = true;
                 continue;
             }
@@ -235,9 +242,7 @@ impl ServiceNowClient {
         {
             return Ok(vec![("Authorization".into(), format!("Bearer {access}"))]);
         }
-        let blob = credentials
-            .get(&environment.id)?
-            .ok_or_else(|| anyhow!("no credential for environment {}", environment.id))?;
+        let blob = self.credential_blob(environment, credentials)?;
         match environment.auth_method {
             AuthMethod::Basic => {
                 let parsed: BasicCred =
@@ -254,8 +259,29 @@ impl ServiceNowClient {
         }
     }
 
+    /// One store read per Environment until a 401 drops the entry: see the
+    /// field docs for the rotation contract.
+    fn credential_blob(
+        &self,
+        environment: &EnvironmentConfig,
+        credentials: &dyn CredentialStore,
+    ) -> anyhow::Result<String> {
+        if let Some(blob) = crate::lock_or_poisoned(&self.credential_blobs)
+            .get(&environment.id)
+            .cloned()
+        {
+            return Ok(blob);
+        }
+        let blob = credentials
+            .get(&environment.id)?
+            .ok_or_else(|| anyhow!("no credential for environment {}", environment.id))?;
+        crate::lock_or_poisoned(&self.credential_blobs)
+            .insert(environment.id.clone(), blob.clone());
+        Ok(blob)
+    }
+
     fn cached_access_token(&self, environment_id: &str) -> Option<String> {
-        let cache = self.tokens.lock().expect("token cache");
+        let cache = crate::lock_or_poisoned(&self.tokens);
         cache
             .get(environment_id)
             .filter(|cached| self.clock.now() < cached.valid_until)
@@ -302,7 +328,7 @@ impl ServiceNowClient {
             .now()
             .checked_add(Duration::from_secs(expires_in))
             .unwrap_or_else(|| self.clock.now());
-        self.tokens.lock().expect("token cache").insert(
+        crate::lock_or_poisoned(&self.tokens).insert(
             environment.id.clone(),
             CachedToken {
                 access_token: grant.access_token.clone(),
@@ -318,7 +344,7 @@ impl ServiceNowClient {
             let response = self.transport.execute(request)?;
             if response.status == 429 && retries < MAX_429_RETRIES {
                 self.clock
-                    .sleep(retry_after_delay(&response, self.clock.now()));
+                    .sleep(retry_after_delay(&response, self.clock.now()).min(MAX_TICK_429_SLEEP));
                 retries += 1;
                 continue;
             }
@@ -447,7 +473,12 @@ fn retry_after_delay(response: &HttpResponse, now: SystemTime) -> Duration {
 
 fn http_date_delay(value: &str, now: SystemTime) -> Option<Duration> {
     let parsed = httpdate::parse_http_date(value).ok()?;
-    Some(parsed.duration_since(now).unwrap_or(Duration::ZERO))
+    // A past-dated (stale / skewed-clock / cached-429) Retry-After must fall
+    // back to the default backoff, not sleep zero and burn a retry.
+    parsed
+        .duration_since(now)
+        .ok()
+        .filter(|delay| !delay.is_zero())
 }
 
 pub struct UreqTransport {
@@ -765,6 +796,37 @@ mod tests {
     }
 
     #[test]
+    fn servicenow_http_caps_each_429_sleep_at_five_seconds() {
+        let rate_limited = || HttpResponse {
+            status: 429,
+            headers: vec![("Retry-After".into(), "120".into())],
+            body: String::new(),
+        };
+        let transport =
+            ScriptedTransport::new((0..=MAX_429_RETRIES).map(|_| rate_limited()).collect());
+        let clock = Arc::new(RecordingClock::default());
+        let credentials = MemoryCredentialStore::default();
+        credentials.insert("dev", r#"{"username":"reader","password":"secret"}"#);
+        let client = ServiceNowClient::new(transport, clock.clone());
+        let response = client
+            .request(
+                &basic_env(),
+                &credentials,
+                "GET",
+                "/api/now/table/sys_properties",
+                None,
+            )
+            .unwrap();
+        assert_eq!(response.status, 429);
+        // Two retries, five seconds each — never the full two minutes, so
+        // one rate-limited Signal cannot park its Environment's tick.
+        assert_eq!(
+            *clock.sleeps.lock().expect("sleeps"),
+            vec![Duration::from_secs(5); usize::from(MAX_429_RETRIES)]
+        );
+    }
+
+    #[test]
     fn servicenow_http_retries_on_429_http_date() {
         let transport = ScriptedTransport::new(vec![
             HttpResponse {
@@ -791,10 +853,9 @@ mod tests {
                 .status,
             200
         );
-        assert_eq!(
-            *clock.sleeps.lock().expect("sleeps"),
-            [Duration::from_secs(10)]
-        );
+        // The date parses to a 10 s delay, but the tick cap holds the actual
+        // sleep at five seconds.
+        assert_eq!(*clock.sleeps.lock().expect("sleeps"), [MAX_TICK_429_SLEEP]);
     }
 
     #[test]
@@ -960,6 +1021,63 @@ mod tests {
     }
 
     #[test]
+    fn servicenow_http_basic_reads_store_once_per_environment() {
+        let transport = Arc::new(ScriptedTransport::new(vec![ok_table(), ok_table()]));
+        let credentials = CountingCredentialStore::default();
+        credentials
+            .inner
+            .insert("dev", r#"{"username":"reader","password":"secret"}"#);
+        let client = ServiceNowClient::new(
+            SharedTransport(transport.clone()),
+            RecordingClock::default(),
+        );
+        let path = "/api/now/table/sys_properties";
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .request(&basic_env(), &credentials, "GET", path, None)
+                    .unwrap()
+                    .status,
+                200
+            );
+        }
+        assert_eq!(credentials.gets.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn servicenow_http_basic_refreshes_once_on_401() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            HttpResponse {
+                status: 401,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: include_str!("../tests/fixtures/availability/401.json").into(),
+            },
+            ok_table(),
+        ]));
+        let credentials = CountingCredentialStore::default();
+        credentials
+            .inner
+            .insert("dev", r#"{"username":"reader","password":"secret"}"#);
+        let client = ServiceNowClient::new(
+            SharedTransport(transport.clone()),
+            RecordingClock::default(),
+        );
+        let response = client
+            .request(
+                &basic_env(),
+                &credentials,
+                "GET",
+                "/api/now/table/sys_properties",
+                None,
+            )
+            .unwrap();
+        assert_eq!(response.status, 200);
+        // One stale read, one retry after the 401 drops the memo.
+        assert_eq!(credentials.gets.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[test]
     fn servicenow_http_oauth_refreshes_once_on_401() {
         let transport = Arc::new(ScriptedTransport::new(vec![
             token_ok("tok-1"),
@@ -1032,7 +1150,9 @@ mod tests {
                 .status,
             200
         );
-        assert_eq!(*clock.sleeps.lock().expect("sleeps"), [MAX_RETRY_AFTER]);
+        // The parse-level cap is 30 s, but a tick thread never sleeps more
+        // than the tick cap: long backoffs surface as transient 429s.
+        assert_eq!(*clock.sleeps.lock().expect("sleeps"), [MAX_TICK_429_SLEEP]);
     }
 
     #[test]
@@ -1062,7 +1182,9 @@ mod tests {
                 .status,
             200
         );
-        assert_eq!(*clock.sleeps.lock().expect("sleeps"), [MAX_RETRY_AFTER]);
+        // The parse-level cap is 30 s, but a tick thread never sleeps more
+        // than the tick cap: long backoffs surface as transient 429s.
+        assert_eq!(*clock.sleeps.lock().expect("sleeps"), [MAX_TICK_429_SLEEP]);
     }
 
     #[test]
@@ -1169,11 +1291,12 @@ mod tests {
             Some("tok"),
             "a just-above-the-floor grant must not be born expired"
         );
-        // The server said 61 s; the skew makes it 31 s. Step past the skewed
-        // expiry but not the server's, so only the margin can expire it.
-        clock.advance(Duration::from_secs(
-            MIN_TOKEN_TTL_SECS + 1 - TOKEN_TTL_SKEW_SECS + 1,
-        ));
+        // The server said 61 s (MIN_TOKEN_TTL_SECS + 1); the 30 s skew
+        // makes it 31 s. Step 32 s: past the skewed expiry but before the
+        // server's, so only the margin can retire it. Spelled out literally —
+        // deriving the advance from the constants would keep this green if
+        // the skew itself drifted.
+        clock.advance(Duration::from_secs(32));
         assert_eq!(
             client.cached_access_token("prod"),
             None,

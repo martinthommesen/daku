@@ -71,6 +71,16 @@ pub fn publish_dashboard(
     let connection = store.open().context("open state store for dashboard")?;
     let snapshots = persistence::load_all_signal_snapshots(&connection)?;
     let cutoff = now.saturating_sub(SAMPLE_RETENTION_SECS);
+    // One grouping pass: every per-Environment step below reuses it instead
+    // of re-scanning the full snapshot vector twice per Environment.
+    let mut by_environment: std::collections::HashMap<&str, Vec<_>> =
+        std::collections::HashMap::new();
+    for snapshot in &snapshots {
+        by_environment
+            .entry(snapshot.environment_id.as_str())
+            .or_default()
+            .push(snapshot);
+    }
 
     struct Published {
         environment: EnvironmentConfig,
@@ -79,10 +89,10 @@ pub fn publish_dashboard(
 
     let mut published = Vec::with_capacity(environments.len());
     for environment in environments {
-        let env_snaps: Vec<_> = snapshots
-            .iter()
-            .filter(|snapshot| snapshot.environment_id == environment.id)
-            .collect();
+        let env_snaps: &[_] = by_environment
+            .get(environment.id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let reachability = env_snaps
             .iter()
             .find(|snapshot| snapshot.signal_id == AVAILABILITY_SIGNAL_ID)
@@ -129,9 +139,11 @@ pub fn publish_dashboard(
 
     for item in &published {
         let environment = &item.environment;
-        let env_snaps: Vec<SignalSnapshotDto> = snapshots
+        let env_snaps: Vec<SignalSnapshotDto> = by_environment
+            .get(environment.id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
             .iter()
-            .filter(|snapshot| snapshot.environment_id == environment.id)
             .map(|snapshot| SignalSnapshotDto {
                 signal_id: snapshot.signal_id.clone(),
                 state: snapshot.state.clone(),

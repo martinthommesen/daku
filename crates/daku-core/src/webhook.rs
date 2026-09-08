@@ -44,13 +44,32 @@ pub fn webhook_url_allowed(url: &str) -> bool {
     false
 }
 
-/// What a refused webhook URL prints: host and path only. Forwarder URLs
-/// routinely carry tokens in the query string, and daemon stderr is the
-/// most-copied log in the project — the refusal must not become the leak.
-/// Pinned by the redaction audit below.
+/// What a refused webhook URL prints: scheme plus host only. Forwarder URLs
+/// routinely carry tokens in the query string — and some integrations put
+/// the secret in the path itself — so only the host survives into daemon
+/// stderr, the most-copied log in the project. Pinned by the redaction
+/// audit below.
 pub fn refusal_line(url: &str) -> String {
-    let scrubbed = url.split(['?', '#']).next().unwrap_or(url);
-    format!("daku webhook refused (loopback http or any https only): {scrubbed}")
+    format!(
+        "daku webhook refused (loopback http or any https only): {}",
+        redacted_url(url)
+    )
+}
+
+/// Scheme plus authority (`https://host`) with path, query, and fragment
+/// dropped: everything after the host is secret-bearing until proven
+/// otherwise.
+pub fn redacted_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some(pair) => pair,
+        None => return "<unparseable>".into(),
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return "<unparseable>".into();
+    }
+    format!("{scheme}://{authority}")
 }
 
 pub struct WebhookRelay {
@@ -91,9 +110,18 @@ impl WebhookRelay {
     /// a fire-and-forget thread so a slow forwarder never stalls polling.
     /// A disallowed URL logs once per distinct value, never sends.
     pub fn relay_tick(&self, store: &StateStore) {
-        let Some(url) = Self::configured_url() else {
-            return;
-        };
+        self.relay_tick_with(store, Self::configured_url(), &post_json);
+    }
+
+    /// `relay_tick` with the settings read and the sender injected, so tests
+    /// pin the wiring without ambient `DAKU_HOME` or the network.
+    fn relay_tick_with(
+        &self,
+        store: &StateStore,
+        url: Option<String>,
+        post: &dyn Fn(&str, &str) -> anyhow::Result<()>,
+    ) {
+        let Some(url) = url else { return };
         if !webhook_url_allowed(&url) {
             let mut refused = self.last_refused.lock().expect("webhook refusal");
             if refused.as_deref() != Some(url.as_str()) {
@@ -102,7 +130,7 @@ impl WebhookRelay {
             }
             return;
         }
-        if let Err(error) = self.relay_to(store, &url, &post_json) {
+        if let Err(error) = self.relay_to(store, &url, post) {
             eprintln!("daku webhook post failed: {error:#}");
         }
     }
@@ -153,14 +181,23 @@ impl WebhookRelay {
 }
 
 fn post_json(url: &str, body: &str) -> anyhow::Result<()> {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .build();
-    let agent = ureq::Agent::new_with_config(config);
-    let mut response = agent
+    // One process-wide agent: a fresh pool + TLS setup per event POST would
+    // pay a handshake per health event on every tick.
+    static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
+        ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(10)))
+                // Non-2xx is a reportable relay failure with its body, not a
+                // transport error: the manual status check below owns it.
+                .http_status_as_error(false)
+                .build(),
+        )
+    });
+    let mut response = AGENT
         .post(url)
         .header("Content-Type", "application/json")
-        .send(body)?;
+        .send(body)
+        .map_err(|error| anyhow::anyhow!("webhook post failed: {error}"))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         let text = response.body_mut().read_to_string().unwrap_or_default();
@@ -412,6 +449,73 @@ mod tests {
     }
 
     #[test]
+    fn relay_tick_with_unset_or_refused_url_never_posts() {
+        let now = crate::collector::unix_now();
+        let db = seed(now);
+        let relay = WebhookRelay::new();
+        let posted: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let post = |sink: Arc<StdMutex<Vec<String>>>| {
+            move |_url: &str, body: &str| {
+                sink.lock().expect("posted").push(body.to_owned());
+                Ok(())
+            }
+        };
+        // Unset webhook: nothing to do.
+        relay.relay_tick_with(&db.store(), None, &post(posted.clone()));
+        // Disallowed URL twice: refused (dedup logs once), never sent.
+        relay.relay_tick_with(
+            &db.store(),
+            Some("http://192.168.1.10/hook".into()),
+            &post(posted.clone()),
+        );
+        relay.relay_tick_with(
+            &db.store(),
+            Some("http://192.168.1.10/hook".into()),
+            &post(posted.clone()),
+        );
+        assert!(posted.lock().expect("posted").is_empty());
+        // Allowed URL with an injected sender: the tick wiring posts.
+        relay.relay_tick_with(
+            &db.store(),
+            Some("http://127.0.0.1:9/hook".into()),
+            &post(posted.clone()),
+        );
+        assert_eq!(posted.lock().expect("posted").len(), 2);
+    }
+
+    #[test]
+    fn post_json_reports_non_2xx_without_panicking() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            use std::io::BufRead as _;
+            loop {
+                head.clear();
+                reader.read_line(&mut head).unwrap();
+                if head.trim_end().is_empty() {
+                    break;
+                }
+            }
+            let mut body = vec![0u8; 7]; // len(r#"{"a":1}"#)
+            reader.read_exact(&mut body).unwrap();
+            let reply = "HTTP/1.1 500 Oops\r\nContent-Length: 5\r\nConnection: close\r\n\r\nsorry";
+            use std::io::Write as _;
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        let error = post_json(&format!("http://127.0.0.1:{port}/hook"), r#"{"a":1}"#)
+            .unwrap_err()
+            .to_string();
+        server.join().unwrap();
+        assert!(error.contains("HTTP 500"), "{error}");
+        assert!(error.contains("sorry"), "{error}");
+    }
+
+    #[test]
     fn settings_webhook_url_defaults_off_and_round_trips() {
         assert_eq!(DaemonSettings::default().webhook_url, None);
         let parsed: DaemonSettings =
@@ -421,10 +525,18 @@ mod tests {
     }
 
     #[test]
-    fn refusal_line_never_carries_query_or_fragment() {
+    fn refusal_line_never_carries_query_fragment_or_path() {
         let line = refusal_line("http://192.168.1.10/hook?token=CANARY-9#frag");
-        assert!(line.contains("http://192.168.1.10/hook"), "{line}");
+        assert_eq!(
+            line, "daku webhook refused (loopback http or any https only): http://192.168.1.10",
+            "{line}"
+        );
         assert!(!line.contains("CANARY-9"), "refusals must not leak: {line}");
         assert!(!line.contains('#'), "{line}");
+        // Path-secret forwarders: the path is secret-bearing too.
+        let line = refusal_line("https://hooks.example.com/secret/PATH-SECRET-1?x=1");
+        assert!(!line.contains("PATH-SECRET-1"), "{line}");
+        assert!(line.ends_with("https://hooks.example.com"), "{line}");
+        assert_eq!(redacted_url("not a url"), "<unparseable>");
     }
 }

@@ -20,8 +20,7 @@ pub fn rotate_credential(
     secret: &str,
     probe: bool,
 ) -> anyhow::Result<String> {
-    daku_protocol::validate_credential(environment.auth_method, secret)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    daku_protocol::validate_credential(environment.auth_method, secret)?;
     if probe {
         let observation = test_environment(environment, Some(secret), credentials, client)?;
         if observation.reachability == Reachability::Unreachable {

@@ -25,29 +25,41 @@ Release builds keep line-table debuginfo in a separate `.dSYM`
 ```sh
 cargo check --workspace
 bun install  # optional: Bun scripts / lint
+ln -sf ../../scripts/pre-commit.sh .git/hooks/pre-commit  # fast fmt+lint+typecheck on commit
 ```
 
 The first `cargo` build clones the pinned zed repository for GPUI (~0.5 GB) and
 compiles GPUI + gpui-component — expect several minutes; later builds reuse it.
-`bun install` is only needed for the Bun scripts.
+`bun install` is only needed for the Bun scripts. For faster rebuilds, install
+[sccache](https://github.com/mozilla/sccache) and `export SCCACHE_DIR=~/.cache/sccache`
+before building — the zed/GPUI crates rarely change, so warm builds skip them.
 
 The shell is built on [gpui-component](https://github.com/longbridge/gpui-component)
 (ADR-0008), which depends on `gpui = { git = zed }` with no `rev`. Cargo treats
 `git+zed?rev=X` and `git+zed` as different sources, so **`gpui`/`gpui_platform`
 carry no `rev`** — the zed commit is pinned in `Cargo.lock` only, while
 `gpui-component`/`gpui-component-assets` are pinned by `rev` in `Cargo.toml`.
-Bump both together:
+Run all three commands atomically — after the first one zed is unpinned until
+the third re-pins it, so never stop halfway:
 
 ```sh
 cargo update -p gpui-component --precise <rev>
-cargo update -p gpui-component-assets --precise <rev>
 cargo update -p gpui --precise <zed sha from gpui-component's Cargo.lock at that rev>
 ```
+
+(The four longbridge crates share one source id, so no separate
+`-p gpui-component-assets` bump is needed.)
 
 Then run `bun run check` and launch the fixture. Do not run `cargo update`
 casually — it re-resolves every zed crate. Feature unification through
 gpui-component enables `profiler` on `gpui` and `runtime_shaders` on
 `gpui_platform`.
+
+There is no CI, so advisories are found by process, not by accident: once a
+month run `cargo audit` (`cargo install cargo-audit` once) and skim `bun.lock`
+/ `Cargo.lock` diffs for the reachable runtime paths (`ureq` TLS, bundled
+SQLite via `rusqlite`, `tungstenite` on the loopback socket). Report only
+critical/high advisories in reachable code.
 
 Daemon Hello auth uses env **`DAKU_DAEMON_TOKEN`**. Operator data/config lives under **`~/.daku/`** (directory `0700`, SQLite `app.db` `0600`). Override the DB path with **`DAKU_DB_PATH`**.
 
@@ -57,7 +69,7 @@ Copy [`environments.example.json`](environments.example.json) to `~/.daku/enviro
 
 Per-Environment tuning lives in the same file (or in the Environment sheet, which edits the same values): a defaulted `thresholds` object overrides any degrade threshold for that Environment only (`jobs_overdue_degraded_at`, `jobs_error_degraded_at`, `syslog_error_degraded_at`, `outbound_failures_degraded_at`, `flow_error_degraded_at`, `email_failure_degraded_at`, `upgrade_failed_degraded_at`, `transaction_avg_degraded_ms` in ms or `null` to disable, `update_sets_open_degraded_at`, `scan_p1_degraded_at`, `mid_unhealthy_degraded_at`, `ecc_error_degraded_at`, `ecc_output_ready_degraded_at`, `drift_mismatches_degraded_at`, `availability_rtt_degraded_ms` in ms or `null` to disable) — unknown keys are rejected so typos fail fast. `expected_drift` lists plugin ids / store-app scopes that are planned differences; drift shows "N differ · M expected" and only unexpected drift degrades. `daku-daemon doctor` prints the effective values per Environment plus a database census line; `daku-daemon doctor --fix` repairs the directory, a missing file, and lax modes (never Credentials or URLs).
 
-Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settings.json`, e.g. `{"poll_interval_secs": 60}` (default **120**, values below 30 are raised to 30; the daemon reads it at start — relaunch after editing `settings.json`). Inventory and history Signals (drift, last-clone, scan) ride the slow cadence `"slow_poll_interval_secs"` (default **1800**, never faster than the shared one). Optional fan-out: `"webhook_url"` POSTs every health/build event as JSON after each tick — `http` only to loopback, `https` anywhere, anything else refused (also enforced on `UpdateSettings`). One shared `CollectorLoop` polls every Environment; Availability, jobs, syslog, MID/ECC, outbound, flow, email, upgrades, sessions, table growth, slow transactions, update sets, Instance Scan, drift, and last-clone register onto it. After each tick the daemon broadcasts `EnvironmentsUpdated`, `SignalSnapshotsUpdated`, `SignalSamplesUpdated` (jobs/syslog ≤24h), `HealthEventsUpdated` (transitions + builds) and `SignalRollupsUpdated` (90 d hourly) so the GPUI client never opens SQLite. The GPUI shell is sidebar + Environment detail with health notifications, menu-bar dot, Dock badge, per-Environment mutes (header), ⌘R reload, ⌘1–9 switching, ⌘⇧C copy, ⌘⇧E export, and a ⌘K command palette; `DAKU_UI_FIXTURE=1` loads the same events as the dashboard_state tests (no ServiceNow). The Notifications menu holds the master switch, one switch per Signal, quiet-hours presets, and the Monday-09:00 weekly digest toggle; banners group every voting Signal instead of just the worst line. The detail header explains degraded health ("Label: summary" per voting Signal), flags likely clone/upgrade fallout after a recent build change, and trend drill-ins note same-weekday-hour anomalies at 2× baseline. `daku-daemon digest --env <id> [--days 7]` prints a Markdown week-in-review from local history. Agents query the same state without the window: `daku-daemon mcp` serves five read-only tools over stdio (see `docs/agents/daku-mcp.md`), and Copy Agent Context puts redacted JSON on the clipboard.
+Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settings.json`, e.g. `{"poll_interval_secs": 60}` (default **120**, values below 30 are raised to 30; the daemon reads it at start — relaunch after editing `settings.json`). Inventory and history Signals (drift, last-clone, scan) ride the slow cadence `"slow_poll_interval_secs"` (default **1800**, never faster than the shared one). Optional fan-out: `"webhook_url"` POSTs every health/build event as JSON after each tick — `http` only to loopback, `https` anywhere, anything else refused (also enforced on `UpdateSettings`). One shared `CollectorLoop` polls every Environment; Availability, jobs, syslog, MID/ECC, outbound, flow, email, upgrades, sessions, table growth, slow transactions, update sets, Instance Scan, drift, and last-clone register onto it. After each tick the daemon broadcasts `EnvironmentsUpdated`, `SignalSnapshotsUpdated`, `SignalSamplesUpdated` (availability RTT, jobs, syslog ≤24h), `HealthEventsUpdated` (transitions + builds) and `SignalRollupsUpdated` (90 d hourly) so the GPUI client never opens SQLite. The GPUI shell is sidebar + Environment detail with health notifications, menu-bar dot, Dock badge, per-Environment mutes (header), ⌘R reload, ⌘1–9 switching, ⌘⇧C copy, ⌘⇧E export, and a ⌘K command palette; `DAKU_UI_FIXTURE=1` loads the same events as the dashboard_state tests (no ServiceNow). The Notifications menu holds the master switch, one switch per Signal, quiet-hours presets, and the Monday-09:00 weekly digest toggle; banners group every voting Signal instead of just the worst line. The detail header explains degraded health ("Label: summary" per voting Signal), flags likely clone/upgrade fallout after a recent build change, and trend drill-ins note same-weekday-hour anomalies at 2× baseline. `daku-daemon digest --env <id> [--days 7]` prints a Markdown week-in-review from local history (1–90 days, clamped). Agents query the same state without the window: `daku-daemon mcp` serves five read-only tools over stdio (see `docs/agents/daku-mcp.md`), and Copy Agent Context puts redacted JSON on the clipboard.
 
 ### Operator smoke (local)
 
@@ -132,7 +144,8 @@ release-time variables.
 | `DAKU_HOME` | `crates/daku-core` config/persistence/settings | Home override for automation: every default daemon path (`environments.json`, `credentials.json`, `app.db`, `settings.json`) resolves under this dir instead of `~/.daku/`. |
 | `DAKU_CREDENTIAL_STORE` | daemon (`crates/daku-daemon`), `crates/daku-core` config | `file` selects the file store (`~/.daku/credentials.json`, `0600`); anything else selects the macOS Keychain (default). Test/automation and non-macOS hosts. |
 | `DAKU_CREDENTIAL_FILE` | `crates/daku-core` config | Path override for the file credential store (implies file-store use with `--credential-store file`; also honoured via `--credential-file`). |
-| `DAKU_UI_FIXTURE` | app (`src/dashboard_state.rs`) | `=1` loads fixture dashboard events; no ServiceNow calls. |
+| `DAKU_UI_FIXTURE` | app (`src/lib.rs`) | `=1` loads fixture dashboard events; no ServiceNow calls. |
+| `DAKU_BLESS_PAYLOADS` | tests (`crates/daku-core` payload_contract) | `=1` rewrites the blessed `payloads.json` fixtures, then re-checks `fixture_events` parity. Only when the daemon payload shape changed on purpose. |
 | `DAKU_CHANNEL` | app (`src/updater.rs`) | `homebrew` disables Sparkle at runtime. |
 | `DAKU_FORCE_UPDATER` | app (`src/updater.rs`, debug builds) | `=1` runs the real Sparkle flow from a debug bundle. |
 | `CARGO_TARGET_DIR` | `scripts/dev.ts`, `scripts/delete-debug-app.ts` | Cargo's target directory, when it is not `target/`. |

@@ -10,7 +10,7 @@ broadcast by the `CollectorLoop`.
 
 Configuration ownership:
 
-- desktop owns `~/.daku/app.json` (Release) / checkout-local `temp/app.json` (Debug): `daemon_exposure` only
+- desktop owns `~/.daku/app.json` (Release) / checkout-local `temp/app.json` (Debug): mutes, notification switches, quiet hours
 - daemon owns `~/.daku/settings.json`: `poll_interval_secs` (read at start)
 
 ## Migrations
