@@ -96,6 +96,9 @@ impl Backend for EnvironmentsBackend {
             Command::Ping | Command::GetSettings | Command::UpdateSettings { .. } => {
                 bail!("settings commands are served by SettingsBackend")
             }
+            Command::GetDigest { .. } => {
+                bail!("digests are served by the digest handler")
+            }
         }
     }
 }

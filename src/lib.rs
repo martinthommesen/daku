@@ -28,6 +28,7 @@ actions!(
         ReloadDaemon,
         CopySummary,
         ToggleNotifications,
+        ToggleWeeklyDigest,
         AddEnvironment,
         DetachSelectedEnvironment
     ]
@@ -165,6 +166,7 @@ pub fn run() {
                 master: locked.notifications_enabled,
                 signals: locked.notify_signals.clone(),
                 quiet: locked.quiet_hours,
+                digest_weekly: locked.digest_weekly,
             });
             if let Ok(prefs) = prefs {
                 set_app_menus_with_prefs(cx, updater_available, &prefs);
@@ -243,6 +245,7 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
             master: true,
             signals: std::collections::HashMap::new(),
             quiet: None,
+            digest_weekly: false,
         },
     );
 }
@@ -253,6 +256,7 @@ pub(crate) struct NotifyMenuPrefs {
     pub master: bool,
     pub signals: std::collections::HashMap<String, bool>,
     pub quiet: Option<daku_client::persistence::QuietHours>,
+    pub digest_weekly: bool,
 }
 
 pub(crate) fn set_app_menus_with_prefs(
@@ -331,6 +335,12 @@ pub(crate) fn set_app_menus_with_prefs(
                         end_hour: Some(7),
                     }),
                     quiet_is(22, 7),
+                ));
+                items.push(MenuItem::separator());
+                items.push(check(
+                    "Weekly Digest Monday 09:00",
+                    Box::new(ToggleWeeklyDigest),
+                    prefs.digest_weekly,
                 ));
                 items
             },

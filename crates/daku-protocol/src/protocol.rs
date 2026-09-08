@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::environment::{AuthMethod, EnvironmentConfig, Thresholds};
 use crate::settings::DaemonSettings;
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "DAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "DAKU_DAEMON_ADDRESS";
@@ -76,6 +76,14 @@ pub enum Command {
         /// Ephemeral Credential for testing a new Environment before saving.
         /// Falls back to the stored item when `None`.
         credential_json: Option<String>,
+    },
+    /// Renders a Markdown digest of one Environment's local history
+    /// (transitions, builds, current states). Read-only; backs the weekly
+    /// digest notification and any future digest surface.
+    GetDigest {
+        environment_id: String,
+        /// Window in days, clamped to 1–90 by the handler.
+        days: i64,
     },
 }
 
@@ -381,6 +389,9 @@ pub enum ResponsePayload {
         error: Option<String>,
         rtt_ms: u64,
     },
+    Digest {
+        markdown: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -561,7 +572,28 @@ mod tests {
 
     #[test]
     fn protocol_version_is_daku_domain() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
+    }
+
+    #[test]
+    fn digest_command_round_trips() {
+        let command = Command::GetDigest {
+            environment_id: "prod".into(),
+            days: 7,
+        };
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["type"], "getDigest");
+        assert_eq!(json["environmentId"], "prod");
+        assert_eq!(json["days"], 7);
+        let back: Command = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, Command::GetDigest { .. }));
+        let payload = ResponsePayload::Digest {
+            markdown: "# Digest".into(),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["type"], "digest");
+        let back: ResponsePayload = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, ResponsePayload::Digest { .. }));
     }
 
     #[test]

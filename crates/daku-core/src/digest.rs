@@ -110,6 +110,24 @@ fn ago(now: i64, then: i64) -> String {
     }
 }
 
+/// Serves `Command::GetDigest`: finds the Environment by id, clamps the
+/// window to 1–90 days, and renders. Unknown ids are an error (the client
+/// only offers configured Environments).
+pub fn handle_get_digest(
+    environments_path: &std::path::Path,
+    store: &StateStore,
+    environment_id: &str,
+    days: i64,
+) -> anyhow::Result<String> {
+    let environments = crate::config::load_environments(environments_path)?;
+    let environment = environments
+        .iter()
+        .find(|environment| environment.id == environment_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown environment {environment_id}"))?;
+    let now = crate::collector::unix_now();
+    weekly_digest(store, environment, now, days.clamp(1, 90))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +221,31 @@ mod tests {
         assert_eq!(ago(1_000, 1_000 - 90), "1m ago");
         assert_eq!(ago(1_000_000, 1_000_000 - 5 * 3600), "5h ago");
         assert_eq!(ago(1_000_000, 1_000_000 - 3 * 86_400), "3d ago");
+    }
+
+    #[test]
+    fn handle_get_digest_serves_known_ids_and_rejects_unknown() {
+        use crate::test_support::TempFile;
+        let now = crate::collector::unix_now();
+        let db = seed(now);
+        let file = TempFile::with_contents(
+            "digest-envs",
+            serde_json::to_vec(&[serde_json::json!({
+                "id": "prod",
+                "label": "Production",
+                "instance_url": "https://acme-prod.example.service-now.com",
+                "auth_method": "basic",
+                "sort_order": 0,
+            })])
+            .unwrap(),
+        );
+        let text = handle_get_digest(file.path(), &db.store(), "prod", 7).unwrap();
+        assert!(text.contains("# Daku digest: Production (prod)"), "{text}");
+        let error = handle_get_digest(file.path(), &db.store(), "nope", 7)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown environment"), "{error}");
+        // Clamping never fails, even for absurd windows.
+        assert!(handle_get_digest(file.path(), &db.store(), "prod", 9000).is_ok());
     }
 }

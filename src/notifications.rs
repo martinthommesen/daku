@@ -90,13 +90,54 @@ pub fn notification_body_grouped(health: EnvironmentHealth, lines: &[String]) ->
 /// Local hour (0–23) of a unix timestamp, system timezone. Falls back to 0
 /// when the value is out of range for the platform clock.
 pub fn local_hour(unix_secs: i64) -> u8 {
+    local_tm(unix_secs).tm_hour.clamp(0, 23) as u8
+}
+
+/// Local weekday of a unix timestamp, system timezone: 0 is Sunday, 1 is
+/// Monday, per `tm_wday`.
+pub fn local_weekday(unix_secs: i64) -> u8 {
+    local_tm(unix_secs).tm_wday.clamp(0, 6) as u8
+}
+
+fn local_tm(unix_secs: i64) -> libc::tm {
     let timestamp = unix_secs as libc::time_t;
     let mut broken: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe { !libc::localtime_r(&timestamp, &mut broken).is_null() };
     if !ok {
-        return 0;
+        unsafe { std::mem::zeroed() }
+    } else {
+        broken
     }
-    broken.tm_hour.clamp(0, 23) as u8
+}
+
+/// True on Mondays at/after 09:00 local: the weekly digest slot. The caller
+/// also checks the last-sent mark, so this staying true all Monday only
+/// sends once.
+pub fn is_digest_slot(now: i64) -> bool {
+    local_weekday(now) == 1 && local_hour(now) >= 9
+}
+
+/// One-line digest notification body: the first two content lines of the
+/// Markdown (past the `#` title and blanks), joined and capped. Never empty:
+/// a digest with no content lines still names itself a digest.
+pub fn digest_notification_body(markdown: &str) -> String {
+    const CAP: usize = 220;
+    let mut lines = markdown
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .take(2);
+    let body = format!(
+        "{} {}",
+        lines.next().unwrap_or("weekly review"),
+        lines.next().unwrap_or_default()
+    );
+    let body = body.trim_end().to_owned();
+    if body.len() <= CAP {
+        body
+    } else {
+        format!("{}…", body.chars().take(CAP - 1).collect::<String>())
+    }
 }
 
 /// One gating decision for a fireable transition: master switch, mute,
@@ -420,6 +461,34 @@ mod tests {
         // 1970-01-01 00:00 UTC.
         with_tz("UTC", || assert_eq!(local_hour(0), 0));
         with_tz("America/New_York", || assert_eq!(local_hour(0), 19));
+    }
+
+    #[test]
+    fn digest_slot_is_monday_from_nine_local() {
+        // Monday 2026-01-05 09:00 UTC; minus an hour is 08:00; plus a day is
+        // Tuesday 09:00.
+        const MONDAY_9AM: i64 = 1_767_603_600;
+        with_tz("UTC", || {
+            assert_eq!(local_weekday(MONDAY_9AM), 1);
+            assert!(is_digest_slot(MONDAY_9AM));
+            assert!(!is_digest_slot(MONDAY_9AM - 3600));
+            assert!(!is_digest_slot(MONDAY_9AM + 24 * 3600));
+        });
+    }
+
+    #[test]
+    fn digest_bodies_summarise_markdown() {
+        let markdown = "# Daku digest: Production (prod)\n\nLast 7 days · health degraded · reachable\n\n## Health transitions\n- 6d ago: healthy → degraded\n";
+        assert_eq!(
+            digest_notification_body(markdown),
+            "Last 7 days · health degraded · reachable - 6d ago: healthy → degraded"
+        );
+        assert_eq!(
+            digest_notification_body("# Only a title\n"),
+            "weekly review"
+        );
+        let long = format!("# T\n\n{}\n", "x".repeat(500));
+        assert!(digest_notification_body(&long).len() <= 223);
     }
 
     #[test]

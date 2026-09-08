@@ -58,6 +58,12 @@ pub struct AppSettings {
     pub notify_signals: HashMap<String, bool>,
     /// Quiet hours; `None` (the default) notifies around the clock.
     pub quiet_hours: Option<QuietHours>,
+    /// Weekly digest: one Monday-morning notification per Environment with
+    /// the week's transitions. Off by default.
+    pub digest_weekly: bool,
+    /// Last weekly-digest send (unix seconds). Guards the Monday slot so a
+    /// long-running Monday sends once.
+    pub digest_last_sent: Option<i64>,
 }
 
 impl Default for AppSettings {
@@ -68,6 +74,8 @@ impl Default for AppSettings {
             notifications_enabled: true,
             notify_signals: HashMap::new(),
             quiet_hours: None,
+            digest_weekly: false,
+            digest_last_sent: None,
         }
     }
 }

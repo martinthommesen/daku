@@ -33,6 +33,7 @@ use crate::SelectEnvironmentSlot;
 use crate::SetQuietHours;
 use crate::ToggleNotifications;
 use crate::ToggleSignalNotify;
+use crate::ToggleWeeklyDigest;
 use crate::dashboard_state::{
     DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase,
     fixture_events, format_health_event, freshness, is_trend_signal, mute_remaining_label,
@@ -169,6 +170,7 @@ impl Daku {
                     master: settings.notifications_enabled,
                     signals: settings.notify_signals.clone(),
                     quiet: settings.quiet_hours,
+                    digest_weekly: settings.digest_weekly,
                 },
             );
         }
@@ -235,6 +237,90 @@ impl Daku {
             &notification_title(&label),
             &notification_body_grouped(health, &lines),
         );
+    }
+
+    /// Weekly digest slot: on Monday from 09:00 local, once per ~day, every
+    /// configured Environment gets a `GetDigest` RPC and a notification with
+    /// the week's transitions. Opt-in via `digest_weekly`; detached windows
+    /// never send. The sent mark records before firing so a slow RPC cannot
+    /// double-send; a failed RPC keeps the mark and retries next Monday.
+    fn maybe_send_weekly_digest(&mut self, cx: &mut Context<Self>) {
+        if self.detached.is_some() {
+            return;
+        }
+        let now = unix_now();
+        if !crate::notifications::is_digest_slot(now) {
+            return;
+        }
+        let mut fire = false;
+        if let Ok(mut settings) = self.settings.lock() {
+            if !settings.digest_weekly {
+                return;
+            }
+            if settings
+                .digest_last_sent
+                .is_some_and(|sent| now - sent < 20 * 3600)
+            {
+                return;
+            }
+            settings.digest_last_sent = Some(now);
+            fire = true;
+        }
+        if !fire {
+            return;
+        }
+        self.persist_settings();
+        let ids: Vec<String> = self
+            .state
+            .environments()
+            .iter()
+            .map(|environment| environment.id.clone())
+            .collect();
+        for env_id in ids {
+            self.digest_rpc(env_id, cx);
+        }
+        cx.notify();
+    }
+
+    /// One background digest fetch; the notification click selects the
+    /// Environment through the shared health-notification path.
+    fn digest_rpc(&mut self, env_id: String, cx: &mut Context<Self>) {
+        let Some(client) = self
+            .supervisor
+            .as_ref()
+            .map(|supervisor| supervisor.client())
+        else {
+            return;
+        };
+        let notify_id = env_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    client.request(daku_protocol::Command::GetDigest {
+                        environment_id: env_id,
+                        days: 7,
+                    })
+                })
+                .await;
+            let _ = this.update(cx, move |this, cx| {
+                let Ok(daku_protocol::ResponsePayload::Digest { markdown }) = result else {
+                    return;
+                };
+                let label = this
+                    .state
+                    .environment_label(&notify_id)
+                    .unwrap_or(&notify_id)
+                    .to_owned();
+                post_health_notification(
+                    &notify_id,
+                    &format!("{} — weekly digest", notification_title(&label)),
+                    &crate::notifications::digest_notification_body(&markdown),
+                );
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The one "take me there" primitive: selects an Environment and
@@ -695,6 +781,9 @@ fn listen_dashboard(supervisor: &DaemonSupervisor, pinned: Option<String>, cx: &
                                 this.note_health_events(environment_id, events);
                             }
                             this.state.apply(&message);
+                            if matches!(message, ServerMessage::EnvironmentsUpdated { .. }) {
+                                this.maybe_send_weekly_digest(cx);
+                            }
                             // A detached window re-pins after every publish:
                             // the dashboard auto-selects the first Environment
                             // when the selection goes stale.
@@ -815,6 +904,14 @@ impl Render for Daku {
             .on_action(cx.listener(|this, _: &ToggleNotifications, _, cx| {
                 if let Ok(mut settings) = this.settings.lock() {
                     settings.notifications_enabled = !settings.notifications_enabled;
+                }
+                this.persist_settings();
+                this.refresh_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleWeeklyDigest, _, cx| {
+                if let Ok(mut settings) = this.settings.lock() {
+                    settings.digest_weekly = !settings.digest_weekly;
                 }
                 this.persist_settings();
                 this.refresh_menus(cx);

@@ -63,7 +63,7 @@ fn main() -> anyhow::Result<()> {
             .context("could not load daemon settings")?;
     let dashboard_events = daku_core::start_default_loop_with_store(
         &daku_core::default_environments_path(),
-        store,
+        store.clone(),
         &settings.get(),
         shutdown.clone(),
         resolve_credential_store(&arguments),
@@ -84,6 +84,7 @@ fn main() -> anyhow::Result<()> {
                 // daemon may perform them (ADR-0004 amendment).
                 !arguments.allow_non_loopback,
             ),
+            digest_store: store,
         }),
         shutdown,
         daku_core::ServerOptions {
@@ -95,10 +96,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// One wire backend: settings commands go to `SettingsBackend`,
-/// Environment management to `EnvironmentsBackend`.
+/// Environment management and digests to their own handlers.
 struct CombinedBackend {
     settings: daku_core::SettingsBackend,
     environments: daku_core::environments::EnvironmentsBackend,
+    digest_store: daku_core::persistence::StateStore,
 }
 
 impl daku_core::Backend for CombinedBackend {
@@ -114,6 +116,17 @@ impl daku_core::Backend for CombinedBackend {
             Command::SaveEnvironment { .. }
             | Command::DeleteEnvironment { .. }
             | Command::TestEnvironment { .. } => self.environments.handle(command),
+            Command::GetDigest {
+                environment_id,
+                days,
+            } => Ok(daku_protocol::ResponsePayload::Digest {
+                markdown: daku_core::digest::handle_get_digest(
+                    &daku_core::default_environments_path(),
+                    &self.digest_store,
+                    &environment_id,
+                    days,
+                )?,
+            }),
         }
     }
 }

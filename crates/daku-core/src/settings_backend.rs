@@ -39,7 +39,8 @@ impl Backend for SettingsBackend {
             }
             Command::SaveEnvironment { .. }
             | Command::DeleteEnvironment { .. }
-            | Command::TestEnvironment { .. } => {
+            | Command::TestEnvironment { .. }
+            | Command::GetDigest { .. } => {
                 anyhow::bail!("environment management is served by EnvironmentsBackend")
             }
         }
