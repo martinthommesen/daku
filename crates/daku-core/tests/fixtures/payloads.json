@@ -354,6 +354,62 @@
     "signal_id": "syslog",
     "state": "healthy"
   },
+  "table_growth": {
+    "payload": {
+      "tables": [
+        {
+          "count": 41000,
+          "table": "syslog"
+        },
+        {
+          "count": 12000,
+          "table": "sys_email"
+        },
+        {
+          "count": 300,
+          "table": "ecc_queue"
+        },
+        {
+          "count": 8000,
+          "table": "sys_attachment"
+        },
+        {
+          "count": 150000,
+          "table": "task"
+        }
+      ]
+    },
+    "signal_id": "table_growth",
+    "state": "healthy"
+  },
+  "table_growth_quiet": {
+    "payload": {
+      "tables": [
+        {
+          "count": 1200,
+          "table": "syslog"
+        },
+        {
+          "count": 400,
+          "table": "sys_email"
+        },
+        {
+          "count": 12,
+          "table": "ecc_queue"
+        },
+        {
+          "count": 900,
+          "table": "sys_attachment"
+        },
+        {
+          "count": 9500,
+          "table": "task"
+        }
+      ]
+    },
+    "signal_id": "table_growth",
+    "state": "healthy"
+  },
   "upgrade_clean": {
     "payload": {
       "failed_7d": 0,

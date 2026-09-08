@@ -1,9 +1,9 @@
 # Signal reference
 
-What the eleven Signal cards measure, what makes each amber, what the
+What the twelve Signal cards measure, what makes each amber, what the
 Operator can tune, and where each link lands. Code truth lives in
 `crates/daku-core/src/` (`availability.rs`, `jobs.rs`, `syslog.rs`,
-`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `sessions.rs`, `drift.rs`, `last_clone.rs`); rendering truth
+`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `sessions.rs`, `table_growth.rs`, `drift.rs`, `last_clone.rs`); rendering truth
 in `src/dashboard_state.rs`. Research hedges live in
 [`docs/research/servicenow-signals.md`](./research/servicenow-signals.md) —
 this page describes what shipped.
@@ -40,6 +40,7 @@ Shared semantics:
 | Email failures | `sys_email` aggregate, send-failed, 1 h | opt-in (`off` by default) | point-in-time |
 | Upgrades | `sys_upgrade_history` newest rows | ≥1 failed in 7 d | point-in-time |
 | Sessions | `v_user_session` row count, cap 100 | never votes (informational) | point-in-time |
+| Table growth | whole-table Aggregate counts, 5 tables | never votes (informational) | point-in-time |
 | Version / plugins | `sys_plugins` + `sys_store_app` vs clone source | any unexpected mismatch / build differs | point-in-time |
 | Last clone | `clone_instance` on the clone source | never votes (informational) | point-in-time |
 
@@ -154,6 +155,21 @@ Signal, and nothing else: this card **never votes** in the health rollup
 and has no threshold to tune. A failed read still lands as `down` with the
 error, so a lost read ACL is visible instead of silent. No samples, no
 rows, no drill-in beyond the count. Link: logged-in-users list.
+
+## Table growth — row counts on the watched tables
+
+Whole-table Aggregate counts on `syslog`, `sys_email`, `ecc_queue`,
+`sys_attachment`, and `task` — five cheap reads per tick. Absolute counts
+turn "the instance feels slow" into something checkable, and a jump after a
+clone or integration change points at the table to look at first.
+
+Like sessions this card **never votes** and has no threshold. A table the
+monitoring account cannot read lands as `null` (em dash in the drill-in)
+rather than failing the probe; only when every table fails does the Signal
+read `down`. Summary totals the readable tables ("5 tables · 211.3K
+rows"). No samples today — per-table trends join the roll-ups in a later
+wave. Drill-in lists one row per table with links into each list. Link:
+table-definition list.
 
 ## Version / plugins — drift across Environments
 

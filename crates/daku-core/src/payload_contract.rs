@@ -29,6 +29,7 @@ use crate::persistence;
 use crate::servicenow::{HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock};
 use crate::sessions::{SESSIONS_SIGNAL_ID, SessionsCollector};
 use crate::syslog::{SYSLOG_SIGNAL_ID, SyslogCollector};
+use crate::table_growth::{TABLE_GROWTH_SIGNAL_ID, TableGrowthCollector};
 use crate::test_support::{TempDb, prod};
 use crate::upgrade::{UPGRADE_SIGNAL_ID, UpgradeCollector};
 
@@ -47,6 +48,33 @@ impl HttpTransport for ContractTransport {
     fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
         let url = &request.url;
         let source = url.contains("acme-prod");
+        // Whole-table growth counts carry no `sysparm_query`, which sets them
+        // apart from every Signal's date-bounded Aggregate query below.
+        if url.contains("/api/now/stats/") && !url.contains("sysparm_query") {
+            let table = url
+                .split("/api/now/stats/")
+                .nth(1)
+                .and_then(|rest| rest.split('?').next())
+                .unwrap_or("");
+            let count: u64 = match (table, source) {
+                ("syslog", true) => 41_000,
+                ("sys_email", true) => 12_000,
+                ("ecc_queue", true) => 300,
+                ("sys_attachment", true) => 8_000,
+                ("task", true) => 150_000,
+                ("syslog", false) => 1_200,
+                ("sys_email", false) => 400,
+                ("ecc_queue", false) => 12,
+                ("sys_attachment", false) => 900,
+                ("task", false) => 9_500,
+                _ => panic!("unexpected growth table: {url}"),
+            };
+            return Ok(HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: format!(r#"{{"result":{{"stats":{{"count":"{count}"}}}}}}"#),
+            });
+        }
         let body = if url.contains("glide.war") {
             if source {
                 include_str!("../tests/fixtures/availability/ok.json")
@@ -279,6 +307,12 @@ fn generate() -> BTreeMap<String, Value> {
             client(),
             db.store(),
         )),
+        Box::new(TableGrowthCollector::new(
+            environments.clone(),
+            store.clone(),
+            client(),
+            db.store(),
+        )),
         Box::new(MidEccCollector::new(
             environments.clone(),
             store.clone(),
@@ -304,6 +338,8 @@ fn generate() -> BTreeMap<String, Value> {
         ("upgrade_clean", "test", UPGRADE_SIGNAL_ID),
         ("sessions_count", "prod", SESSIONS_SIGNAL_ID),
         ("sessions_zero", "test", SESSIONS_SIGNAL_ID),
+        ("table_growth", "prod", TABLE_GROWTH_SIGNAL_ID),
+        ("table_growth_quiet", "test", TABLE_GROWTH_SIGNAL_ID),
         ("mid_ecc_healthy", "prod", MID_ECC_SIGNAL_ID),
         ("mid_ecc_unhealthy", "test", MID_ECC_SIGNAL_ID),
     ] {
@@ -474,9 +510,10 @@ fn every_known_signal_has_a_pinned_case() {
     use crate::outbound::OUTBOUND_SIGNAL_ID;
     use crate::sessions::SESSIONS_SIGNAL_ID;
     use crate::syslog::SYSLOG_SIGNAL_ID;
+    use crate::table_growth::TABLE_GROWTH_SIGNAL_ID;
     use crate::upgrade::UPGRADE_SIGNAL_ID;
 
-    const KNOWN: [&str; 11] = [
+    const KNOWN: [&str; 12] = [
         AVAILABILITY_SIGNAL_ID,
         JOBS_SIGNAL_ID,
         SYSLOG_SIGNAL_ID,
@@ -486,6 +523,7 @@ fn every_known_signal_has_a_pinned_case() {
         EMAIL_SIGNAL_ID,
         UPGRADE_SIGNAL_ID,
         SESSIONS_SIGNAL_ID,
+        TABLE_GROWTH_SIGNAL_ID,
         DRIFT_SIGNAL_ID,
         LAST_CLONE_SIGNAL_ID,
     ];

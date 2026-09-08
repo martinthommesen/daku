@@ -17,6 +17,7 @@ use crate::persistence::{
 };
 use crate::sessions::SESSIONS_SIGNAL_ID;
 use crate::syslog::SYSLOG_SIGNAL_ID;
+use crate::table_growth::TABLE_GROWTH_SIGNAL_ID;
 
 pub const SERVICENOW_PLATFORM_ID: &str = "servicenow";
 
@@ -41,9 +42,10 @@ pub fn health_rollup(
     let mut health = EnvironmentHealth::Healthy;
     for &(signal_id, state) in signals {
         // Informational Signals never vote: last-clone is history, sessions
-        // are capacity context. Skipped probes never vote either.
+        // and table growth are capacity context. Skipped probes never vote either.
         if signal_id == LAST_CLONE_SIGNAL_ID
             || signal_id == SESSIONS_SIGNAL_ID
+            || signal_id == TABLE_GROWTH_SIGNAL_ID
             || state == SignalState::Skipped
         {
             continue;
@@ -412,6 +414,20 @@ mod tests {
         ] {
             assert_eq!(
                 health_rollup(Reachability::Reachable, &[(SESSIONS_SIGNAL_ID, state)]),
+                EnvironmentHealth::Healthy
+            );
+        }
+    }
+
+    #[test]
+    fn health_rollup_table_growth_never_votes() {
+        for state in [
+            SignalState::Healthy,
+            SignalState::Degraded,
+            SignalState::Down,
+        ] {
+            assert_eq!(
+                health_rollup(Reachability::Reachable, &[(TABLE_GROWTH_SIGNAL_ID, state)]),
                 EnvironmentHealth::Healthy
             );
         }

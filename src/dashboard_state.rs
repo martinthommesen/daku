@@ -7,7 +7,7 @@ use daku_protocol::{
     RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
 };
 
-pub const SIGNAL_IDS: [&str; 11] = [
+pub const SIGNAL_IDS: [&str; 12] = [
     "availability",
     "jobs",
     "syslog",
@@ -17,6 +17,7 @@ pub const SIGNAL_IDS: [&str; 11] = [
     "email",
     "upgrade",
     "sessions",
+    "table_growth",
     "drift",
     "last_clone",
 ];
@@ -39,6 +40,7 @@ pub fn signal_label(signal_id: &str) -> &'static str {
         "email" => "Email failures",
         "upgrade" => "Upgrades",
         "sessions" => "Sessions",
+        "table_growth" => "Table growth",
         "drift" => "Version / plugins",
         "last_clone" => "Last clone",
         _ => "Signal",
@@ -544,6 +546,7 @@ impl DashboardState {
             }
             "upgrade" => "/sys_upgrade_history_list.do",
             "sessions" => "/v_user_session_list.do",
+            "table_growth" => "/sys_db_object_list.do",
             "drift" => "/v_plugin_list.do",
             "last_clone" => "/clone_instance_list.do",
             _ => return None,
@@ -671,6 +674,9 @@ impl DashboardState {
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "upgrade" => self
                 .upgrade_rows(value)
+                .unwrap_or_else(|| self.drill_in_text(signal_id)),
+            "table_growth" => self
+                .table_rows(value)
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "availability" => self.drill_in_trend(signal_id, now),
             _ => self.drill_in_text(signal_id),
@@ -896,6 +902,50 @@ impl DashboardState {
                 .collect(),
             truncated: value.get("upgrades_truncated") == Some(&serde_json::Value::Bool(true))
                 || list.len() > DRILL_IN_ROW_LIMIT,
+        })
+    }
+
+    /// Table-growth rows: one per watched table with its count. Each row
+    /// links the table's list view. Unreadable tables (`null` count) render
+    /// an em dash and link nothing.
+    fn table_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let list = value
+            .get("tables")
+            .and_then(|item| item.as_array())
+            .filter(|list| !list.is_empty())?;
+        let instance_url = self.selected().map(|env| env.instance_url.clone());
+        let list_url = |table: &str| -> Option<String> {
+            let base = instance_url.as_deref()?.trim_end_matches('/');
+            if table.is_empty() || !is_supported_instance_url(base) {
+                return None;
+            }
+            Some(format!("{base}/{table}_list.do"))
+        };
+        Some(DrillIn::Rows {
+            headers: vec!["Table", "Rows"],
+            rows: list
+                .iter()
+                .take(DRILL_IN_ROW_LIMIT)
+                .map(|entry| {
+                    let table = entry
+                        .get("table")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("");
+                    let count = entry
+                        .get("count")
+                        .and_then(|item| item.as_u64())
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "—".to_owned());
+                    DrillInRow {
+                        cells: vec![table.to_owned(), count],
+                        link: entry
+                            .get("count")
+                            .and_then(|item| item.as_u64())
+                            .and(list_url(table)),
+                    }
+                })
+                .collect(),
+            truncated: false,
         })
     }
 
@@ -1350,6 +1400,30 @@ fn drift_mismatch(value: &serde_json::Value) -> bool {
             .is_some_and(|count| count > 0)
 }
 
+/// Compact row counts for the table-growth summary: 950 → "950", 41_000 →
+/// "41K", 1_250_000 → "1.2M".
+fn compact_count(count: u64) -> String {
+    const MILLION: u64 = 1_000_000;
+    const THOUSAND: u64 = 1_000;
+    if count >= MILLION {
+        let rounded = (count as f64 / MILLION as f64 * 10.0).round() / 10.0;
+        if rounded.fract() == 0.0 {
+            format!("{}M", rounded as u64)
+        } else {
+            format!("{rounded:.1}M")
+        }
+    } else if count >= THOUSAND {
+        let rounded = (count as f64 / THOUSAND as f64 * 10.0).round() / 10.0;
+        if rounded.fract() == 0.0 {
+            format!("{}K", rounded as u64)
+        } else {
+            format!("{rounded:.1}K")
+        }
+    } else {
+        count.to_string()
+    }
+}
+
 /// `Value::Null` stands in for a payload that did not parse, and an
 /// unreadable payload has nothing to summarize — without this guard the
 /// counting arms below would report a confident "0 overdue · 0 error".
@@ -1467,6 +1541,23 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
             } else {
                 format!("{count} active sessions")
             }
+        }
+        "table_growth" => {
+            let total: u64 = value
+                .get("tables")
+                .and_then(|item| item.as_array())
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| row.get("count")?.as_u64())
+                        .sum()
+                })
+                .unwrap_or(0);
+            let tables = value
+                .get("tables")
+                .and_then(|item| item.as_array())
+                .map(|rows| rows.len())
+                .unwrap_or(0);
+            format!("{tables} tables · {} rows", compact_count(total))
         }
         "drift" => {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
@@ -1625,6 +1716,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "email_count",
                 "upgrade_failed",
                 "sessions_count",
+                "table_growth",
                 "drift_source",
             ]
             .map(pinned)
@@ -1642,6 +1734,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "email_zero",
                 "upgrade_clean",
                 "sessions_zero",
+                "table_growth_quiet",
                 "drift_compare",
                 "last_clone_target_completed",
             ]
@@ -1790,7 +1883,7 @@ mod tests {
     /// `card_summary`, `card_detail`). Add a pinned case there and
     /// `pinned_payloads_render` fails until it is listed here — that is the
     /// point of the pin.
-    const RENDERED: [(&str, &str, &str); 35] = [
+    const RENDERED: [(&str, &str, &str); 37] = [
         ("availability_asleep", "142 ms", ""),
         // The build string is shown with the plugin inventory (drift), not
         // under the latency number.
@@ -1829,6 +1922,8 @@ mod tests {
         ("upgrade_clean", "Zurich P1 \u{b7} today", ""),
         ("sessions_count", "3 active sessions", ""),
         ("sessions_zero", "0 active sessions", ""),
+        ("table_growth", "5 tables \u{b7} 211.3K rows", ""),
+        ("table_growth_quiet", "5 tables \u{b7} 12K rows", ""),
         ("skipped_asleep", "", "Environment asleep"),
         ("skipped_clone_source_asleep", "", "clone source asleep"),
         (
@@ -2006,7 +2101,13 @@ mod tests {
             lines.iter().any(|line| line.contains("Sessions: healthy")),
             "{text}"
         );
-        assert_eq!(lines.len(), 13, "{text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Table growth: healthy")),
+            "{text}"
+        );
+        assert_eq!(lines.len(), 14, "{text}");
     }
 
     #[test]
@@ -2264,6 +2365,61 @@ mod tests {
                 truncated: false,
             }
         );
+    }
+
+    #[test]
+    fn drill_in_lists_table_counts_with_list_links() {
+        let state = loaded();
+        assert_eq!(
+            state.drill_in("table_growth", TEST_NOW),
+            DrillIn::Rows {
+                headers: vec!["Table", "Rows"],
+                rows: vec![
+                    DrillInRow {
+                        cells: vec!["syslog".to_owned(), "41000".to_owned()],
+                        link: Some(
+                            "https://prod.example.service-now.com/syslog_list.do".to_owned()
+                        ),
+                    },
+                    DrillInRow {
+                        cells: vec!["sys_email".to_owned(), "12000".to_owned()],
+                        link: Some(
+                            "https://prod.example.service-now.com/sys_email_list.do".to_owned()
+                        ),
+                    },
+                    DrillInRow {
+                        cells: vec!["ecc_queue".to_owned(), "300".to_owned()],
+                        link: Some(
+                            "https://prod.example.service-now.com/ecc_queue_list.do".to_owned()
+                        ),
+                    },
+                    DrillInRow {
+                        cells: vec!["sys_attachment".to_owned(), "8000".to_owned()],
+                        link: Some(
+                            "https://prod.example.service-now.com/sys_attachment_list.do"
+                                .to_owned()
+                        ),
+                    },
+                    DrillInRow {
+                        cells: vec!["task".to_owned(), "150000".to_owned()],
+                        link: Some("https://prod.example.service-now.com/task_list.do".to_owned()),
+                    },
+                ],
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn compact_count_trims_trailing_point_zero() {
+        assert_eq!(compact_count(0), "0");
+        assert_eq!(compact_count(950), "950");
+        assert_eq!(compact_count(1_000), "1K");
+        assert_eq!(compact_count(12_012), "12K");
+        assert_eq!(compact_count(41_000), "41K");
+        assert_eq!(compact_count(211_300), "211.3K");
+        assert_eq!(compact_count(1_250_000), "1.3M");
+        assert_eq!(compact_count(2_000_000), "2M");
     }
 
     #[test]
