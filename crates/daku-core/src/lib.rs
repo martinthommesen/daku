@@ -5,6 +5,7 @@ pub mod collector;
 pub mod config;
 pub mod drift;
 pub mod environments;
+pub mod flow;
 pub mod health;
 pub mod jobs;
 pub mod last_clone;

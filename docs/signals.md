@@ -1,9 +1,9 @@
 # Signal reference
 
-What the seven Signal cards measure, what makes each amber, what the
+What the eight Signal cards measure, what makes each amber, what the
 Operator can tune, and where each link lands. Code truth lives in
 `crates/daku-core/src/` (`availability.rs`, `jobs.rs`, `syslog.rs`,
-`mid_ecc.rs`, `outbound.rs`, `drift.rs`, `last_clone.rs`); rendering truth
+`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `drift.rs`, `last_clone.rs`); rendering truth
 in `src/dashboard_state.rs`. Research hedges live in
 [`docs/research/servicenow-signals.md`](./research/servicenow-signals.md) —
 this page describes what shipped.
@@ -36,6 +36,7 @@ Shared semantics:
 | Syslog errors | `syslog` aggregate, level 2, 1 h | ≥1 error | 24 h raw + 30 d hourly |
 | MID / ECC | `ecc_agent` table + `ecc_queue` aggregates | any unhealthy/error, queue ≥100 | point-in-time |
 | Outbound | `sys_outbound_http_log` aggregate, 4xx+, 1 h | ≥1 failure | point-in-time |
+| Flow errors | `sys_flow_context` aggregate, state ERROR, 1 h | ≥1 error | point-in-time |
 | Version / plugins | `sys_plugins` + `sys_store_app` vs clone source | any unexpected mismatch / build differs | point-in-time |
 | Last clone | `clone_instance` on the clone source | never votes (informational) | point-in-time |
 
@@ -102,6 +103,18 @@ Rows (only while non-zero, 10, newest first): time, URL, status. Stored
 URLs drop query and fragment — paths identify the integration, query
 strings can carry third-party secrets. Drill-in rows or text. Link:
 filtered log list.
+
+## Flow errors — IntegrationHub / Flow Designer failures
+
+Aggregate on `sys_flow_context`: `state=ERROR` updated in the last hour.
+Flow failures are silent by default (no email, no incident), so this is
+often the Operator's first notice before a downstream ticket.
+
+Threshold: `flow_error_degraded_at` (1). No samples.
+
+Rows (only while non-zero, 10, newest first): flow name, last update.
+Each row links its `sys_flow_context` record. Drill-in rows or text. Link:
+filtered flow-context list.
 
 ## Version / plugins — drift across Environments
 

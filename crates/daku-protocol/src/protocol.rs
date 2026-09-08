@@ -56,8 +56,10 @@ pub enum Command {
     /// Validates and persists an Environment plus, optionally, its Credential.
     /// New ids are added; known ids are updated. Ends with a client-side
     /// reload (`070`), which re-reads the file this writes.
+    /// `environment` is boxed: the config grows a field per threshold wave
+    /// and must not inflate every `ClientMessage` by value.
     SaveEnvironment {
-        environment: EnvironmentConfig,
+        environment: Box<EnvironmentConfig>,
         /// Exact Keychain blob (`{"client_id","client_secret"}` for OAuth,
         /// `{"username","password"}` for basic). `None` leaves the stored
         /// Credential untouched. Refused when the daemon allows non-loopback
@@ -70,7 +72,7 @@ pub enum Command {
     },
     /// Dry-run availability probe for unsaved edits. Writes nothing.
     TestEnvironment {
-        environment: EnvironmentConfig,
+        environment: Box<EnvironmentConfig>,
         /// Ephemeral Credential for testing a new Environment before saving.
         /// Falls back to the stored item when `None`.
         credential_json: Option<String>,

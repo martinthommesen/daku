@@ -17,6 +17,7 @@ use crate::availability::{classify_availability_response, persist_availability_s
 use crate::collector::SignalCollector;
 use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore, Thresholds};
 use crate::drift::{DRIFT_SIGNAL_ID, DriftCollector};
+use crate::flow::{FLOW_SIGNAL_ID, FlowCollector};
 use crate::jobs::{JOBS_SIGNAL_ID, JobsCollector};
 use crate::last_clone::{
     CloneRow, LAST_CLONE_SIGNAL_ID, persist_clone_source, persist_clone_target,
@@ -87,6 +88,16 @@ impl HttpTransport for ContractTransport {
             } else {
                 include_str!("../tests/fixtures/outbound/count_0.json")
             }
+        } else if url.contains("/api/now/stats/sys_flow_context") {
+            if source {
+                include_str!("../tests/fixtures/flow/count_2.json")
+            } else {
+                include_str!("../tests/fixtures/flow/count_0.json")
+            }
+        } else if url.contains("/api/now/table/sys_flow_context") {
+            r#"{"result":[
+                {"sys_id":"flow-1","name":"Sync orders","state":"ERROR","sys_updated_on":"2026-01-27 00:12:00"}
+            ]}"#
         } else if url.contains("/api/now/table/ecc_agent") {
             if source {
                 include_str!("../tests/fixtures/mid_ecc/agents_healthy.json")
@@ -214,6 +225,12 @@ fn generate() -> BTreeMap<String, Value> {
             client(),
             db.store(),
         )),
+        Box::new(FlowCollector::new(
+            environments.clone(),
+            store.clone(),
+            client(),
+            db.store(),
+        )),
         Box::new(MidEccCollector::new(
             environments.clone(),
             store.clone(),
@@ -231,6 +248,8 @@ fn generate() -> BTreeMap<String, Value> {
         ("syslog_zero", "test", SYSLOG_SIGNAL_ID),
         ("outbound_count", "prod", OUTBOUND_SIGNAL_ID),
         ("outbound_zero", "test", OUTBOUND_SIGNAL_ID),
+        ("flow_count", "prod", FLOW_SIGNAL_ID),
+        ("flow_zero", "test", FLOW_SIGNAL_ID),
         ("mid_ecc_healthy", "prod", MID_ECC_SIGNAL_ID),
         ("mid_ecc_unhealthy", "test", MID_ECC_SIGNAL_ID),
     ] {
@@ -393,18 +412,20 @@ fn pinned_payloads_match_what_the_collectors_write() {
 fn every_known_signal_has_a_pinned_case() {
     use crate::availability::AVAILABILITY_SIGNAL_ID;
     use crate::drift::DRIFT_SIGNAL_ID;
+    use crate::flow::FLOW_SIGNAL_ID;
     use crate::jobs::JOBS_SIGNAL_ID;
     use crate::last_clone::LAST_CLONE_SIGNAL_ID;
     use crate::mid_ecc::MID_ECC_SIGNAL_ID;
     use crate::outbound::OUTBOUND_SIGNAL_ID;
     use crate::syslog::SYSLOG_SIGNAL_ID;
 
-    const KNOWN: [&str; 7] = [
+    const KNOWN: [&str; 8] = [
         AVAILABILITY_SIGNAL_ID,
         JOBS_SIGNAL_ID,
         SYSLOG_SIGNAL_ID,
         MID_ECC_SIGNAL_ID,
         OUTBOUND_SIGNAL_ID,
+        FLOW_SIGNAL_ID,
         DRIFT_SIGNAL_ID,
         LAST_CLONE_SIGNAL_ID,
     ];

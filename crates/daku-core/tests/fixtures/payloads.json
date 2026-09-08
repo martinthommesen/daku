@@ -82,6 +82,31 @@
     "signal_id": "drift",
     "state": "healthy"
   },
+  "flow_count": {
+    "payload": {
+      "error_rows": [
+        {
+          "name": "Sync orders",
+          "state": "ERROR",
+          "sys_id": "flow-1",
+          "sys_updated_on": "2026-01-27 00:12:00"
+        }
+      ],
+      "error_rows_truncated": false,
+      "flow_error_1h": 2
+    },
+    "signal_id": "flow",
+    "state": "degraded"
+  },
+  "flow_zero": {
+    "payload": {
+      "error_rows": [],
+      "error_rows_truncated": false,
+      "flow_error_1h": 0
+    },
+    "signal_id": "flow",
+    "state": "healthy"
+  },
   "jobs_counts": {
     "payload": {
       "error": 0,

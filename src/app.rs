@@ -396,7 +396,7 @@ impl Daku {
         };
         self.sheet_rpc(
             daku_protocol::Command::TestEnvironment {
-                environment: config,
+                environment: Box::new(config),
                 credential_json: blob,
             },
             cx,
@@ -444,7 +444,7 @@ impl Daku {
         let id = config.id.clone();
         self.sheet_rpc(
             daku_protocol::Command::SaveEnvironment {
-                environment: config,
+                environment: Box::new(config),
                 credential_json: blob,
             },
             cx,
@@ -1107,6 +1107,11 @@ impl Daku {
                         .child(EnvSheet::field_row(
                             "Outbound failures ≥",
                             &sheet.threshold_outbound,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "Flow errors ≥",
+                            &sheet.threshold_flow,
                             cx,
                         ))
                         .child(EnvSheet::field_row(

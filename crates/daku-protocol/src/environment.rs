@@ -36,7 +36,7 @@ pub struct EnvironmentConfig {
 
 /// Degrade thresholds per Environment. Defaults preserve the historical
 /// hard-coded behaviour exactly: one overdue job, one syslog error, one
-/// outbound failure, any unhealthy MID or ECC error, ECC output-ready ≥ 100,
+/// outbound failure, one flow error, any unhealthy MID or ECC error, ECC output-ready ≥ 100,
 /// any plugin/build mismatch degrades. Availability RTT never degraded before
 /// (`None` = disabled); jobs error count never voted before (`u64::MAX`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -46,6 +46,7 @@ pub struct Thresholds {
     pub jobs_error_degraded_at: u64,
     pub syslog_error_degraded_at: u64,
     pub outbound_failures_degraded_at: u64,
+    pub flow_error_degraded_at: u64,
     pub mid_unhealthy_degraded_at: u64,
     pub ecc_error_degraded_at: u64,
     pub ecc_output_ready_degraded_at: u64,
@@ -60,6 +61,7 @@ impl Default for Thresholds {
             jobs_error_degraded_at: u64::MAX,
             syslog_error_degraded_at: 1,
             outbound_failures_degraded_at: 1,
+            flow_error_degraded_at: 1,
             mid_unhealthy_degraded_at: 1,
             ecc_error_degraded_at: 1,
             ecc_output_ready_degraded_at: 100,
@@ -114,11 +116,12 @@ impl Thresholds {
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "off".to_owned());
         format!(
-            "jobs≥{}/err≥{} syslog≥{} outbound≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{}",
+            "jobs≥{}/err≥{} syslog≥{} outbound≥{} flow≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{}",
             self.jobs_overdue_degraded_at,
             off(self.jobs_error_degraded_at),
             self.syslog_error_degraded_at,
             self.outbound_failures_degraded_at,
+            self.flow_error_degraded_at,
             self.mid_unhealthy_degraded_at,
             self.ecc_error_degraded_at,
             self.ecc_output_ready_degraded_at,

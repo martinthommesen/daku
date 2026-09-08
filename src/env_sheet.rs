@@ -29,6 +29,7 @@ pub struct EnvSheet {
     pub threshold_jobs_error: Entity<InputState>,
     pub threshold_syslog: Entity<InputState>,
     pub threshold_outbound: Entity<InputState>,
+    pub threshold_flow: Entity<InputState>,
     pub threshold_mid: Entity<InputState>,
     pub threshold_ecc_error: Entity<InputState>,
     pub threshold_ecc_queue: Entity<InputState>,
@@ -84,6 +85,12 @@ impl EnvSheet {
                 window,
                 cx,
                 &format_u64_threshold(defaults.outbound_failures_degraded_at),
+                false,
+            ),
+            threshold_flow: Self::field(
+                window,
+                cx,
+                &format_u64_threshold(defaults.flow_error_degraded_at),
                 false,
             ),
             threshold_mid: Self::field(
@@ -157,6 +164,12 @@ impl EnvSheet {
                 &format_u64_threshold(env.thresholds.outbound_failures_degraded_at),
                 false,
             ),
+            threshold_flow: Self::field(
+                window,
+                cx,
+                &format_u64_threshold(env.thresholds.flow_error_degraded_at),
+                false,
+            ),
             threshold_mid: Self::field(
                 window,
                 cx,
@@ -210,7 +223,7 @@ impl EnvSheet {
         }
     }
 
-    /// Parses the nine threshold fields into effective values. Empty means
+    /// Parses the ten threshold fields into effective values. Empty means
     /// default; `jobs_error` and `rtt` also accept `off`.
     pub fn thresholds_result(&self, cx: &App) -> Result<Thresholds, String> {
         parse_thresholds(&ThresholdTexts {
@@ -218,6 +231,7 @@ impl EnvSheet {
             jobs_error: self.threshold_jobs_error.read(cx).value().to_string(),
             syslog: self.threshold_syslog.read(cx).value().to_string(),
             outbound: self.threshold_outbound.read(cx).value().to_string(),
+            flow: self.threshold_flow.read(cx).value().to_string(),
             mid: self.threshold_mid.read(cx).value().to_string(),
             ecc_error: self.threshold_ecc_error.read(cx).value().to_string(),
             ecc_queue: self.threshold_ecc_queue.read(cx).value().to_string(),
@@ -296,13 +310,14 @@ fn parse_count_field(
         .map_err(|_| format!("{caption} must be a whole number or empty"))
 }
 
-/// The nine threshold fields as edited text. One struct instead of nine
+/// The ten threshold fields as edited text. One struct instead of ten
 /// positional arguments.
 pub struct ThresholdTexts {
     pub jobs_overdue: String,
     pub jobs_error: String,
     pub syslog: String,
     pub outbound: String,
+    pub flow: String,
     pub mid: String,
     pub ecc_error: String,
     pub ecc_queue: String,
@@ -318,6 +333,7 @@ impl ThresholdTexts {
             jobs_error: String::new(),
             syslog: String::new(),
             outbound: String::new(),
+            flow: String::new(),
             mid: String::new(),
             ecc_error: String::new(),
             ecc_queue: String::new(),
@@ -327,7 +343,7 @@ impl ThresholdTexts {
     }
 }
 
-/// Parses the nine threshold fields. Empty means default; `jobs_error` and
+/// Parses the ten threshold fields. Empty means default; `jobs_error` and
 /// `rtt` also accept `off` (never vote).
 pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
     let defaults = Thresholds::default();
@@ -365,6 +381,12 @@ pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
             "Outbound failures",
             &texts.outbound,
             defaults.outbound_failures_degraded_at,
+            None,
+        )?,
+        flow_error_degraded_at: parse_count_field(
+            "Flow errors",
+            &texts.flow,
+            defaults.flow_error_degraded_at,
             None,
         )?,
         mid_unhealthy_degraded_at: parse_count_field(
@@ -572,6 +594,7 @@ mod tests {
             jobs_error: "off".into(),
             syslog: "10".into(),
             outbound: "5".into(),
+            flow: "4".into(),
             mid: "3".into(),
             ecc_error: "2".into(),
             ecc_queue: "500".into(),
@@ -582,6 +605,7 @@ mod tests {
         assert_eq!(parsed.jobs_overdue_degraded_at, 5);
         assert_eq!(parsed.jobs_error_degraded_at, u64::MAX);
         assert_eq!(parsed.syslog_error_degraded_at, 10);
+        assert_eq!(parsed.flow_error_degraded_at, 4);
         assert_eq!(parsed.availability_rtt_degraded_ms, None);
         let rtt = ThresholdTexts {
             rtt: "500".into(),
@@ -620,6 +644,7 @@ mod tests {
             jobs_error: format_u64_threshold(tuned.jobs_error_degraded_at),
             syslog: format_u64_threshold(tuned.syslog_error_degraded_at),
             outbound: format_u64_threshold(tuned.outbound_failures_degraded_at),
+            flow: format_u64_threshold(tuned.flow_error_degraded_at),
             mid: format_u64_threshold(tuned.mid_unhealthy_degraded_at),
             ecc_error: format_u64_threshold(tuned.ecc_error_degraded_at),
             ecc_queue: format_u64_threshold(tuned.ecc_output_ready_degraded_at),
