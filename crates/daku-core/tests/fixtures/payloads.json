@@ -264,6 +264,22 @@
     "signal_id": "outbound",
     "state": "healthy"
   },
+  "sessions_count": {
+    "payload": {
+      "active_sessions": 3,
+      "truncated": false
+    },
+    "signal_id": "sessions",
+    "state": "healthy"
+  },
+  "sessions_zero": {
+    "payload": {
+      "active_sessions": 0,
+      "truncated": false
+    },
+    "signal_id": "sessions",
+    "state": "healthy"
+  },
   "skipped_asleep": {
     "payload": {
       "skipped": "asleep"

@@ -23,6 +23,7 @@ use crate::mid_ecc::MidEccCollector;
 use crate::outbound::OutboundCollector;
 use crate::persistence::{self, StateStore};
 use crate::servicenow::{Clock, ServiceNowClient, SystemClock, UreqTransport};
+use crate::sessions::SessionsCollector;
 use crate::syslog::SyslogCollector;
 use crate::upgrade::UpgradeCollector;
 
@@ -403,6 +404,12 @@ pub fn build_default_loop(
                 store.clone(),
             )),
             Box::new(UpgradeCollector::new(
+                one.clone(),
+                credentials.clone(),
+                client.clone(),
+                store.clone(),
+            )),
+            Box::new(SessionsCollector::new(
                 one,
                 credentials.clone(),
                 client.clone(),
@@ -927,7 +934,7 @@ mod tests {
             ServiceNowClient::new(FixtureTransport, SystemClock),
         );
         assert_eq!(loop_.groups.len(), 2);
-        assert_eq!(loop_.groups[0].len(), 8);
+        assert_eq!(loop_.groups[0].len(), 9);
         assert_eq!(loop_.shared.len(), 2, "drift and last-clone stay shared");
     }
 

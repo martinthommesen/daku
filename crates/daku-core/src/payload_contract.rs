@@ -27,6 +27,7 @@ use crate::mid_ecc::{MID_ECC_SIGNAL_ID, MidEccCollector};
 use crate::outbound::{OUTBOUND_SIGNAL_ID, OutboundCollector};
 use crate::persistence;
 use crate::servicenow::{HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock};
+use crate::sessions::{SESSIONS_SIGNAL_ID, SessionsCollector};
 use crate::syslog::{SYSLOG_SIGNAL_ID, SyslogCollector};
 use crate::test_support::{TempDb, prod};
 use crate::upgrade::{UPGRADE_SIGNAL_ID, UpgradeCollector};
@@ -120,6 +121,12 @@ impl HttpTransport for ContractTransport {
                 r#"{"result":[
                     {"sys_id":"up-1","from_version":"Zurich P0","to_version":"Zurich P1","state":"Completed","upgrade_started":"2099-01-01 01:00:00","upgrade_finished":"2099-01-01 02:00:00"}
                 ]}"#
+            }
+        } else if url.contains("/api/now/table/v_user_session") {
+            if source {
+                r#"{"result":[{"sys_id":"s1"},{"sys_id":"s2"},{"sys_id":"s3"}]}"#
+            } else {
+                r#"{"result":[]}"#
             }
         } else if url.contains("/api/now/table/ecc_agent") {
             if source {
@@ -266,6 +273,12 @@ fn generate() -> BTreeMap<String, Value> {
             client(),
             db.store(),
         )),
+        Box::new(SessionsCollector::new(
+            environments.clone(),
+            store.clone(),
+            client(),
+            db.store(),
+        )),
         Box::new(MidEccCollector::new(
             environments.clone(),
             store.clone(),
@@ -289,6 +302,8 @@ fn generate() -> BTreeMap<String, Value> {
         ("email_zero", "test", EMAIL_SIGNAL_ID),
         ("upgrade_failed", "prod", UPGRADE_SIGNAL_ID),
         ("upgrade_clean", "test", UPGRADE_SIGNAL_ID),
+        ("sessions_count", "prod", SESSIONS_SIGNAL_ID),
+        ("sessions_zero", "test", SESSIONS_SIGNAL_ID),
         ("mid_ecc_healthy", "prod", MID_ECC_SIGNAL_ID),
         ("mid_ecc_unhealthy", "test", MID_ECC_SIGNAL_ID),
     ] {
@@ -457,10 +472,11 @@ fn every_known_signal_has_a_pinned_case() {
     use crate::last_clone::LAST_CLONE_SIGNAL_ID;
     use crate::mid_ecc::MID_ECC_SIGNAL_ID;
     use crate::outbound::OUTBOUND_SIGNAL_ID;
+    use crate::sessions::SESSIONS_SIGNAL_ID;
     use crate::syslog::SYSLOG_SIGNAL_ID;
     use crate::upgrade::UPGRADE_SIGNAL_ID;
 
-    const KNOWN: [&str; 10] = [
+    const KNOWN: [&str; 11] = [
         AVAILABILITY_SIGNAL_ID,
         JOBS_SIGNAL_ID,
         SYSLOG_SIGNAL_ID,
@@ -469,6 +485,7 @@ fn every_known_signal_has_a_pinned_case() {
         FLOW_SIGNAL_ID,
         EMAIL_SIGNAL_ID,
         UPGRADE_SIGNAL_ID,
+        SESSIONS_SIGNAL_ID,
         DRIFT_SIGNAL_ID,
         LAST_CLONE_SIGNAL_ID,
     ];

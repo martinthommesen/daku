@@ -7,7 +7,7 @@ use daku_protocol::{
     RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
 };
 
-pub const SIGNAL_IDS: [&str; 10] = [
+pub const SIGNAL_IDS: [&str; 11] = [
     "availability",
     "jobs",
     "syslog",
@@ -16,6 +16,7 @@ pub const SIGNAL_IDS: [&str; 10] = [
     "flow",
     "email",
     "upgrade",
+    "sessions",
     "drift",
     "last_clone",
 ];
@@ -37,6 +38,7 @@ pub fn signal_label(signal_id: &str) -> &'static str {
         "flow" => "Flow errors",
         "email" => "Email failures",
         "upgrade" => "Upgrades",
+        "sessions" => "Sessions",
         "drift" => "Version / plugins",
         "last_clone" => "Last clone",
         _ => "Signal",
@@ -541,6 +543,7 @@ impl DashboardState {
                 "/sys_email_list.do?sysparm_query=type=send-failed^sys_created_on>javascript:gs.hoursAgoStart(1)"
             }
             "upgrade" => "/sys_upgrade_history_list.do",
+            "sessions" => "/v_user_session_list.do",
             "drift" => "/v_plugin_list.do",
             "last_clone" => "/clone_instance_list.do",
             _ => return None,
@@ -1452,6 +1455,19 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 "no upgrades found".into()
             }
         }
+        "sessions" => {
+            let count = value
+                .get("active_sessions")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0);
+            if value.get("truncated").and_then(|item| item.as_bool()) == Some(true) {
+                "100+ active sessions".into()
+            } else if count == 1 {
+                "1 active session".into()
+            } else {
+                format!("{count} active sessions")
+            }
+        }
         "drift" => {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
                 "source of truth".into()
@@ -1608,6 +1624,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "flow_count",
                 "email_count",
                 "upgrade_failed",
+                "sessions_count",
                 "drift_source",
             ]
             .map(pinned)
@@ -1624,6 +1641,7 @@ pub fn fixture_events() -> Vec<ServerMessage> {
                 "flow_zero",
                 "email_zero",
                 "upgrade_clean",
+                "sessions_zero",
                 "drift_compare",
                 "last_clone_target_completed",
             ]
@@ -1772,7 +1790,7 @@ mod tests {
     /// `card_summary`, `card_detail`). Add a pinned case there and
     /// `pinned_payloads_render` fails until it is listed here — that is the
     /// point of the pin.
-    const RENDERED: [(&str, &str, &str); 33] = [
+    const RENDERED: [(&str, &str, &str); 35] = [
         ("availability_asleep", "142 ms", ""),
         // The build string is shown with the plugin inventory (drift), not
         // under the latency number.
@@ -1809,6 +1827,8 @@ mod tests {
         ("email_zero", "0 email failures \u{b7} last hour", ""),
         ("upgrade_failed", "1 failed \u{b7} last 7d", ""),
         ("upgrade_clean", "Zurich P1 \u{b7} today", ""),
+        ("sessions_count", "3 active sessions", ""),
+        ("sessions_zero", "0 active sessions", ""),
         ("skipped_asleep", "", "Environment asleep"),
         ("skipped_clone_source_asleep", "", "clone source asleep"),
         (
@@ -1982,7 +2002,11 @@ mod tests {
             lines.iter().any(|line| line.contains("Upgrades: degraded")),
             "{text}"
         );
-        assert_eq!(lines.len(), 12, "{text}");
+        assert!(
+            lines.iter().any(|line| line.contains("Sessions: healthy")),
+            "{text}"
+        );
+        assert_eq!(lines.len(), 13, "{text}");
     }
 
     #[test]

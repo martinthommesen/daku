@@ -14,6 +14,7 @@ pub mod mid_ecc;
 pub mod outbound;
 pub mod persistence;
 pub mod servicenow;
+pub mod sessions;
 pub mod settings;
 pub mod settings_backend;
 pub mod syslog;

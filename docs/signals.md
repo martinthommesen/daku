@@ -1,9 +1,9 @@
 # Signal reference
 
-What the ten Signal cards measure, what makes each amber, what the
+What the eleven Signal cards measure, what makes each amber, what the
 Operator can tune, and where each link lands. Code truth lives in
 `crates/daku-core/src/` (`availability.rs`, `jobs.rs`, `syslog.rs`,
-`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `drift.rs`, `last_clone.rs`); rendering truth
+`mid_ecc.rs`, `outbound.rs`, `flow.rs`, `email.rs`, `upgrade.rs`, `sessions.rs`, `drift.rs`, `last_clone.rs`); rendering truth
 in `src/dashboard_state.rs`. Research hedges live in
 [`docs/research/servicenow-signals.md`](./research/servicenow-signals.md) —
 this page describes what shipped.
@@ -39,6 +39,7 @@ Shared semantics:
 | Flow errors | `sys_flow_context` aggregate, state ERROR, 1 h | ≥1 error | point-in-time |
 | Email failures | `sys_email` aggregate, send-failed, 1 h | opt-in (`off` by default) | point-in-time |
 | Upgrades | `sys_upgrade_history` newest rows | ≥1 failed in 7 d | point-in-time |
+| Sessions | `v_user_session` row count, cap 100 | never votes (informational) | point-in-time |
 | Version / plugins | `sys_plugins` + `sys_store_app` vs clone source | any unexpected mismatch / build differs | point-in-time |
 | Last clone | `clone_instance` on the clone source | never votes (informational) | point-in-time |
 
@@ -144,6 +145,15 @@ vote; unreadable timestamps count fail-loud. No samples.
 Summary names the last target build with its age ("Zurich P1 · 3 days
 ago"), or "1 failed · last 7d", or "no upgrades found". Drill-in lists the
 rows with links into the history table. Link: upgrade-history list.
+
+## Sessions — who is logged in
+
+Row count on `v_user_session` (the Logged-in-users list), capped at 100 —
+"100+ active sessions" past the cap. Capacity context for every other
+Signal, and nothing else: this card **never votes** in the health rollup
+and has no threshold to tune. A failed read still lands as `down` with the
+error, so a lost read ACL is visible instead of silent. No samples, no
+rows, no drill-in beyond the count. Link: logged-in-users list.
 
 ## Version / plugins — drift across Environments
 

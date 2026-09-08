@@ -15,6 +15,7 @@ use crate::persistence::{
     self, HealthEvent, PublishState, ROLLUP_BUCKET_SECS, ROLLUP_RETENTION_SECS,
     SAMPLE_RETENTION_SECS, StateStore,
 };
+use crate::sessions::SESSIONS_SIGNAL_ID;
 use crate::syslog::SYSLOG_SIGNAL_ID;
 
 pub const SERVICENOW_PLATFORM_ID: &str = "servicenow";
@@ -39,7 +40,12 @@ pub fn health_rollup(
     }
     let mut health = EnvironmentHealth::Healthy;
     for &(signal_id, state) in signals {
-        if signal_id == LAST_CLONE_SIGNAL_ID || state == SignalState::Skipped {
+        // Informational Signals never vote: last-clone is history, sessions
+        // are capacity context. Skipped probes never vote either.
+        if signal_id == LAST_CLONE_SIGNAL_ID
+            || signal_id == SESSIONS_SIGNAL_ID
+            || state == SignalState::Skipped
+        {
             continue;
         }
         if matches!(state, SignalState::Down | SignalState::Degraded) {
@@ -390,6 +396,22 @@ mod tests {
         for state in [SignalState::Degraded, SignalState::Down] {
             assert_eq!(
                 health_rollup(Reachability::Reachable, &[(LAST_CLONE_SIGNAL_ID, state)]),
+                EnvironmentHealth::Healthy
+            );
+        }
+    }
+
+    #[test]
+    fn health_rollup_sessions_never_votes() {
+        // Informational capacity context: even down (lost read ACL) must not
+        // flip the Environment — the card itself shows the error.
+        for state in [
+            SignalState::Healthy,
+            SignalState::Degraded,
+            SignalState::Down,
+        ] {
+            assert_eq!(
+                health_rollup(Reachability::Reachable, &[(SESSIONS_SIGNAL_ID, state)]),
                 EnvironmentHealth::Healthy
             );
         }

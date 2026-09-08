@@ -13,7 +13,7 @@ One concrete deployable instance of a Platform (e.g. ServiceNow prod, test, or d
 _Avoid_: instance (ambiguous with "ServiceNow instance" in casual speech — prefer Environment when talking about daku's model), stage, tier
 
 **Signal**:
-A named observation daku collects from an Environment (availability, job backlog, error rate, …). v1 shipped seven for ServiceNow (availability/build, scheduled jobs, MID/ECC, syslog error rate, version/plugin drift, last-clone, outbound/integration failures); flow errors, email failures, and upgrade history joined after.
+A named observation daku collects from an Environment (availability, job backlog, error rate, …). v1 shipped seven for ServiceNow (availability/build, scheduled jobs, MID/ECC, syslog error rate, version/plugin drift, last-clone, outbound/integration failures); flow errors, email failures, upgrade history, and sessions joined after.
 _Avoid_: metric, check, probe, KPI
 
 **Credential**:
