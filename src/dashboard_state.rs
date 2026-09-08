@@ -3,8 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use daku_protocol::{
-    EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, Reachability,
-    RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto, is_supported_instance_url,
+    EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, NON_VOTING_SIGNALS,
+    Reachability, RollupPoint, SamplePoint, ServerMessage, SignalSnapshotDto,
+    is_supported_instance_url,
 };
 
 pub const SIGNAL_IDS: [&str; 15] = [
@@ -526,6 +527,14 @@ impl DashboardState {
             "Build: {}",
             environment_build(&self.snapshots, &selected.id).unwrap_or_else(|| "—".to_owned())
         ));
+        for line in self.health_explain() {
+            lines.push(format!("Because: {line}"));
+        }
+        if let Some(build) = self.correlation_build(now) {
+            lines.push(format!(
+                "Likely clone/upgrade fallout — started after build {build}"
+            ));
+        }
         lines.join("\n")
     }
 
@@ -1248,6 +1257,128 @@ impl DashboardState {
         }
     }
 
+    /// Why the selected Environment is degraded or down: one
+    /// "Label: summary" line per voting Signal currently degraded or down,
+    /// in `SIGNAL_IDS` order. Empty when healthy, unreachable (reachability
+    /// is its own pill), or unobserved. Shares `NON_VOTING_SIGNALS` with the
+    /// daemon rollup so it never names a Signal that did not vote.
+    pub fn health_explain(&self) -> Vec<String> {
+        let Some(environment_id) = self.selected_id.as_deref() else {
+            return Vec::new();
+        };
+        let Some(snapshots) = self.snapshots.get(environment_id) else {
+            return Vec::new();
+        };
+        SIGNAL_IDS
+            .iter()
+            .filter(|signal_id| !NON_VOTING_SIGNALS.contains(signal_id))
+            .filter_map(|signal_id| {
+                let snapshot = snapshots.get(*signal_id)?;
+                if !matches!(snapshot.dto.state.as_str(), "degraded" | "down") {
+                    return None;
+                }
+                let summary = summarize_value(signal_id, &snapshot.payload);
+                let detail = detail_from_value(signal_id, &snapshot.payload);
+                let body = if !summary.is_empty() { summary } else { detail };
+                Some(if body.is_empty() {
+                    signal_label(signal_id).to_owned()
+                } else {
+                    format!("{}: {body}", signal_label(signal_id))
+                })
+            })
+            .collect()
+    }
+
+    /// Clone/upgrade-fallout correlation: when the selected Environment is
+    /// degraded, a build change in the last 48 h and a currently-voting error
+    /// Signal (jobs, syslog, outbound, flow, MID/ECC) suggest the new build
+    /// broke something. Returns the build string to name, else `None`.
+    pub fn correlation_build(&self, now: i64) -> Option<String> {
+        const WINDOW_SECS: i64 = 48 * 3600;
+        let environment_id = self.selected_id.as_deref()?;
+        if !self
+            .environments
+            .iter()
+            .any(|env| env.id == environment_id && env.health == EnvironmentHealth::Degraded)
+        {
+            return None;
+        }
+        let build_event = self
+            .health_events
+            .get(environment_id)?
+            .iter()
+            .filter(|event| event.kind == HealthEventKind::Build && event.build.is_some())
+            .filter(|event| now.saturating_sub(event.observed_at) <= WINDOW_SECS)
+            .max_by_key(|event| event.observed_at)?;
+        let snapshots = self.snapshots.get(environment_id)?;
+        let error_voting = ["jobs", "syslog", "outbound", "flow", "mid_ecc"]
+            .iter()
+            .any(|id| {
+                snapshots.get(*id).is_some_and(|snapshot| {
+                    matches!(snapshot.dto.state.as_str(), "degraded" | "down")
+                })
+            });
+        if error_voting {
+            build_event.build.clone()
+        } else {
+            None
+        }
+    }
+
+    /// How unusual the latest sample is for a trend Signal: latest raw value
+    /// over the same-weekday-hour baseline mean from the 30-day hourly
+    /// roll-ups. `Some(factor)` at 2× and above, else `None` (too few
+    /// baseline buckets, a zero baseline, no samples, or a non-trend
+    /// Signal). Pure read of published history — the daemon sends nothing
+    /// new. Threshold crossings still own alerting; this is context.
+    pub fn anomaly_factor(&self, signal_id: &str, now: i64) -> Option<f64> {
+        const MIN_BASELINE_BUCKETS: usize = 4;
+        const ANOMALY_AT: f64 = 2.0;
+        if !is_trend_signal(signal_id) {
+            return None;
+        }
+        let environment_id = self.selected_id.as_deref()?;
+        let latest = self
+            .samples
+            .get(&(environment_id.to_owned(), signal_id.to_owned()))?
+            .iter()
+            .filter_map(|point| point.value_real)
+            .next_back()?;
+        let (weekday, hour) = weekday_hour(now);
+        let baseline: Vec<f64> = self
+            .rollups
+            .get(&(environment_id.to_owned(), signal_id.to_owned()))?
+            .iter()
+            .filter(|point| weekday_hour(point.hour_start) == (weekday, hour))
+            .filter_map(|point| point.avg_real)
+            .collect();
+        if baseline.len() < MIN_BASELINE_BUCKETS {
+            return None;
+        }
+        let mean = baseline.iter().sum::<f64>() / baseline.len() as f64;
+        if mean <= 0.0 {
+            return None;
+        }
+        let factor = latest / mean;
+        if factor >= ANOMALY_AT {
+            Some(factor)
+        } else {
+            None
+        }
+    }
+
+    /// One-line anomaly context for the drill-in ("3.2× normal for a Monday
+    /// 09:00"). `None` mirrors `anomaly_factor`.
+    pub fn anomaly_note(&self, signal_id: &str, now: i64) -> Option<String> {
+        let factor = self.anomaly_factor(signal_id, now)?;
+        let (weekday, hour) = weekday_hour(now);
+        Some(format!(
+            "{factor:.1}× normal for a {} {:02}:00",
+            weekday_name(weekday),
+            hour
+        ))
+    }
+
     /// The worst health across observed, unmuted Environments — what the
     /// menu-bar dot, Dock badge and notifications consult. `None` when
     /// disconnected, nothing polled yet, or everything muted.
@@ -1525,6 +1656,27 @@ fn compact_count(count: u64) -> String {
         }
     } else {
         count.to_string()
+    }
+}
+
+/// Weekday (0 = Monday) and hour of a unix timestamp, UTC. 1970-01-01 was a
+/// Thursday, so day 0 of the epoch is weekday index 3.
+fn weekday_hour(epoch_secs: i64) -> (u32, u32) {
+    let days = epoch_secs.div_euclid(86_400);
+    let weekday = ((days + 3).rem_euclid(7)) as u32;
+    let hour = (epoch_secs.rem_euclid(86_400) / 3600) as u32;
+    (weekday, hour)
+}
+
+fn weekday_name(weekday: u32) -> &'static str {
+    match weekday {
+        0 => "Monday",
+        1 => "Tuesday",
+        2 => "Wednesday",
+        3 => "Thursday",
+        4 => "Friday",
+        5 => "Saturday",
+        _ => "Sunday",
     }
 }
 
@@ -2235,7 +2387,10 @@ mod tests {
                 .any(|line| line.contains("Scheduled jobs: degraded")),
             "{text}"
         );
-        assert!(lines.last().unwrap().starts_with("Build: "), "{text}");
+        assert!(
+            lines.iter().any(|line| line.starts_with("Build: ")),
+            "{text}"
+        );
         assert!(
             lines
                 .iter()
@@ -2280,7 +2435,172 @@ mod tests {
                 .any(|line| line.contains("Instance Scan: degraded")),
             "{text}"
         );
-        assert_eq!(lines.len(), 17, "{text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("Because: Scheduled jobs: 2 overdue · 0 in error")),
+            "{text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("Because: Instance Scan: 1 P1 · 1 P2")),
+            "{text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("Likely clone/upgrade fallout — started after build")),
+            "{text}"
+        );
+        assert_eq!(lines.len(), 26, "{text}");
+    }
+
+    #[test]
+    fn health_explain_names_every_voting_signal_in_order() {
+        let state = loaded();
+        assert_eq!(
+            state.health_explain(),
+            vec![
+                "Scheduled jobs: 2 overdue · 0 in error".to_owned(),
+                "Syslog errors: 4 errors · last hour".to_owned(),
+                "Outbound: 3 HTTP failures · last hour".to_owned(),
+                "Flow errors: 2 flow errors · last hour".to_owned(),
+                "Upgrades: 1 failed · last 7d".to_owned(),
+                "Slow transactions: 842 ms avg · last hour".to_owned(),
+                "Update sets: 2 open update sets".to_owned(),
+                "Instance Scan: 1 P1 · 1 P2".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn health_explain_lists_test_env_votes_and_never_names_non_voters() {
+        let mut state = loaded();
+        state.select("test");
+        assert_eq!(
+            state.health_explain(),
+            vec![
+                "MID / ECC: 1/3 MID up · queue 2".to_owned(),
+                "Outbound: HTTP 429".to_owned(),
+                "Version / plugins: 3 plugins differ".to_owned(),
+            ]
+        );
+        // Sessions, table growth, and last-clone never appear even when they
+        // would read degraded: they never vote.
+        for signal_id in ["sessions", "table_growth", "last_clone"] {
+            assert!(
+                !state
+                    .health_explain()
+                    .iter()
+                    .any(|line| line.starts_with(&format!("{}:", signal_label(signal_id)))),
+                "{signal_id} must never appear in the explainer"
+            );
+        }
+    }
+
+    #[test]
+    fn correlation_build_names_a_recent_build_behind_error_signals() {
+        let state = loaded();
+        assert_eq!(
+            state.correlation_build(TEST_NOW).as_deref(),
+            Some("glide-zurich-12-18-2025__patch0-hotfix1")
+        );
+    }
+
+    #[test]
+    fn correlation_build_stays_quiet_without_a_recent_build_or_errors() {
+        let mut healthy = loaded();
+        healthy.select("test");
+        assert_eq!(healthy.correlation_build(TEST_NOW), None);
+        // 48 h + 1 s after the build event: outside the window.
+        let stale = loaded();
+        assert_eq!(stale.correlation_build(1_699_913_600 + 48 * 3600 + 1), None);
+    }
+
+    /// Monday 2026-01-05 09:00 UTC. Synthetic samples + rollups for one
+    /// Environment, so the baseline weekday-hour is exact.
+    const MONDAY_9AM: i64 = 1_767_603_600;
+
+    fn anomaly_state(latest: f64, baseline_avgs: &[f64]) -> DashboardState {
+        let mut state = DashboardState::new();
+        state.set_connected(true);
+        state.apply_all(&[ServerMessage::EnvironmentsUpdated {
+            environments: vec![env(
+                "e",
+                "E",
+                EnvironmentHealth::Healthy,
+                Reachability::Reachable,
+            )],
+        }]);
+        state.select("e");
+        state.apply_all(&[ServerMessage::SignalSamplesUpdated {
+            environment_id: "e".into(),
+            signal_id: "jobs".into(),
+            points: vec![SamplePoint {
+                observed_at: MONDAY_9AM,
+                value_real: Some(latest),
+            }],
+        }]);
+        state.apply_all(&[ServerMessage::SignalRollupsUpdated {
+            environment_id: "e".into(),
+            signal_id: "jobs".into(),
+            points: baseline_avgs
+                .iter()
+                .enumerate()
+                .map(|(weeks_ago, avg)| RollupPoint {
+                    hour_start: MONDAY_9AM - (weeks_ago as i64 + 1) * 7 * 86_400,
+                    avg_real: Some(*avg),
+                    max_real: Some(*avg),
+                    sample_count: 30,
+                })
+                .collect(),
+        }]);
+        state
+    }
+
+    #[test]
+    fn weekday_hour_anchors_on_the_epoch_thursday() {
+        assert_eq!(weekday_hour(0), (3, 0));
+        assert_eq!(weekday_hour(MONDAY_9AM), (0, 9));
+        assert_eq!(weekday_name(0), "Monday");
+        assert_eq!(weekday_name(6), "Sunday");
+    }
+
+    #[test]
+    fn anomaly_note_fires_at_twice_the_baseline() {
+        let state = anomaly_state(8.0, &[2.0, 2.0, 2.0, 2.0, 2.0]);
+        assert_eq!(state.anomaly_factor("jobs", MONDAY_9AM), Some(4.0));
+        assert_eq!(
+            state.anomaly_note("jobs", MONDAY_9AM).as_deref(),
+            Some("4.0× normal for a Monday 09:00")
+        );
+    }
+
+    #[test]
+    fn anomaly_note_stays_quiet_without_evidence() {
+        // Below the 2× line.
+        assert_eq!(
+            anomaly_state(3.0, &[2.0, 2.0, 2.0, 2.0]).anomaly_note("jobs", MONDAY_9AM),
+            None
+        );
+        // Fewer than four baseline buckets.
+        assert_eq!(
+            anomaly_state(8.0, &[2.0, 2.0, 2.0]).anomaly_note("jobs", MONDAY_9AM),
+            None
+        );
+        // Zero baseline never divides.
+        assert_eq!(
+            anomaly_state(8.0, &[0.0, 0.0, 0.0, 0.0]).anomaly_note("jobs", MONDAY_9AM),
+            None
+        );
+        // Non-trend Signals have no baseline series.
+        assert_eq!(
+            anomaly_state(8.0, &[2.0, 2.0, 2.0, 2.0]).anomaly_note("outbound", MONDAY_9AM),
+            None
+        );
+        // Nothing selected, nothing to compare.
+        assert_eq!(DashboardState::new().anomaly_note("jobs", MONDAY_9AM), None);
     }
 
     #[test]

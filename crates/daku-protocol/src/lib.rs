@@ -9,7 +9,9 @@ pub mod theme;
 
 mod protocol;
 
-pub use environment::{AuthMethod, EnvironmentConfig, Thresholds, validate_credential};
+pub use environment::{
+    AuthMethod, EnvironmentConfig, NON_VOTING_SIGNALS, Thresholds, validate_credential,
+};
 pub use protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, MAX_WIRE_MESSAGE_BYTES,

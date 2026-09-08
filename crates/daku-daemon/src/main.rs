@@ -15,6 +15,9 @@ fn main() -> anyhow::Result<()> {
     if arguments.doctor {
         return run_doctor_command(arguments.doctor_fix, &arguments);
     }
+    if let Some(env_id) = arguments.digest_env.clone() {
+        return run_digest_command(&env_id, arguments.digest_days);
+    }
     let auth = require_token(std::env::var(DAEMON_TOKEN_ENV))?;
     // The bearer capability belongs only to this server process. Remove it
     // before any provider or workspace subprocess can inherit the daemon's
@@ -125,6 +128,35 @@ fn run_probe_availability(arguments: &Arguments) -> anyhow::Result<()> {
         resolve_credential_store(arguments),
     )?;
     println!("availability probe complete");
+    Ok(())
+}
+
+/// Prints a Markdown digest of one Environment's local history: health
+/// transitions, builds, and current Signal states over the last `days`.
+/// Read-only over SQLite; needs no token and writes nothing.
+fn run_digest_command(environment_id: &str, days: i64) -> anyhow::Result<()> {
+    let environments =
+        daku_core::config::load_environments(&daku_core::default_environments_path())
+            .with_context(|| "could not load environments.json")?;
+    let environment = environments
+        .iter()
+        .find(|environment| environment.id == environment_id)
+        .ok_or_else(|| anyhow!("unknown environment {environment_id}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    print!(
+        "{}",
+        daku_core::digest::weekly_digest(
+            &daku_core::persistence::StateStore::daemon(
+                daku_core::persistence::StateStore::default_path(),
+            ),
+            environment,
+            now,
+            days,
+        )?
+    );
     Ok(())
 }
 
@@ -247,6 +279,8 @@ struct Arguments {
     doctor_fix: bool,
     credential_store: Option<String>,
     credential_file: Option<std::path::PathBuf>,
+    digest_env: Option<String>,
+    digest_days: i64,
 }
 
 impl Arguments {
@@ -260,6 +294,8 @@ impl Arguments {
         let mut doctor_fix = false;
         let mut credential_store = None;
         let mut credential_file = None;
+        let mut digest_env = None;
+        let mut digest_days = 7;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -268,6 +304,25 @@ impl Arguments {
                 }
                 "doctor" => {
                     doctor = true;
+                }
+                "digest" => {
+                    digest_env = Some(String::new());
+                }
+                "--env" => {
+                    let id = arguments
+                        .next()
+                        .ok_or_else(|| anyhow!("--env requires an environment id"))?;
+                    if digest_env.is_none() {
+                        bail!("--env requires the digest command");
+                    }
+                    digest_env = Some(id);
+                }
+                "--days" => {
+                    digest_days = arguments
+                        .next()
+                        .ok_or_else(|| anyhow!("--days requires a number"))?
+                        .parse()
+                        .context("--days is not a whole number")?;
                 }
                 "--fix" => {
                     doctor_fix = true;
@@ -313,7 +368,7 @@ impl Arguments {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [probe-availability] [doctor [--fix]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
+                        "usage: {} [probe-availability] [doctor [--fix]] [digest --env ID [--days N]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -327,6 +382,12 @@ impl Arguments {
         if credential_file.is_some() && credential_store.as_deref() != Some("file") {
             bail!("--credential-file requires --credential-store file");
         }
+        if digest_env.as_deref() == Some("") || digest_env.is_none() && digest_days != 7 {
+            bail!("digest requires --env <id>");
+        }
+        if digest_days < 1 {
+            bail!("--days must be at least 1");
+        }
         Ok(Self {
             bind,
             parent_pid,
@@ -337,6 +398,8 @@ impl Arguments {
             doctor_fix,
             credential_store,
             credential_file,
+            digest_env,
+            digest_days,
         })
     }
 }
@@ -422,6 +485,32 @@ mod tests {
         let arguments = Arguments::parse(["doctor".into(), "--fix".into()]).unwrap();
         assert!(arguments.doctor_fix);
         assert!(Arguments::parse(["--fix".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_digest_with_env_and_days() {
+        let arguments = Arguments::parse([
+            "digest".into(),
+            "--env".into(),
+            "prod".into(),
+            "--days".into(),
+            "3".into(),
+        ])
+        .unwrap();
+        assert_eq!(arguments.digest_env.as_deref(), Some("prod"));
+        assert_eq!(arguments.digest_days, 3);
+        assert!(Arguments::parse(["digest".into()]).is_err());
+        assert!(Arguments::parse(["--days".into(), "3".into()]).is_err());
+        assert!(
+            Arguments::parse([
+                "digest".into(),
+                "--env".into(),
+                "prod".into(),
+                "--days".into(),
+                "0".into()
+            ])
+            .is_err()
+        );
     }
 
     #[test]

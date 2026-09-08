@@ -3,6 +3,7 @@
 pub mod availability;
 pub mod collector;
 pub mod config;
+pub mod digest;
 pub mod drift;
 pub mod email;
 pub mod environments;

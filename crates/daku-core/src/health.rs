@@ -10,14 +10,12 @@ use daku_protocol::{
 use crate::availability::AVAILABILITY_SIGNAL_ID;
 use crate::config::EnvironmentConfig;
 use crate::jobs::JOBS_SIGNAL_ID;
-use crate::last_clone::LAST_CLONE_SIGNAL_ID;
 use crate::persistence::{
     self, HealthEvent, PublishState, ROLLUP_BUCKET_SECS, ROLLUP_RETENTION_SECS,
     SAMPLE_RETENTION_SECS, StateStore,
 };
-use crate::sessions::SESSIONS_SIGNAL_ID;
 use crate::syslog::SYSLOG_SIGNAL_ID;
-use crate::table_growth::TABLE_GROWTH_SIGNAL_ID;
+use daku_protocol::NON_VOTING_SIGNALS;
 
 pub const SERVICENOW_PLATFORM_ID: &str = "servicenow";
 
@@ -41,13 +39,9 @@ pub fn health_rollup(
     }
     let mut health = EnvironmentHealth::Healthy;
     for &(signal_id, state) in signals {
-        // Informational Signals never vote: last-clone is history, sessions
-        // and table growth are capacity context. Skipped probes never vote either.
-        if signal_id == LAST_CLONE_SIGNAL_ID
-            || signal_id == SESSIONS_SIGNAL_ID
-            || signal_id == TABLE_GROWTH_SIGNAL_ID
-            || state == SignalState::Skipped
-        {
+        // Informational Signals never vote (`NON_VOTING_SIGNALS`: history and
+        // capacity context). Skipped probes never vote either.
+        if NON_VOTING_SIGNALS.contains(&signal_id) || state == SignalState::Skipped {
             continue;
         }
         if matches!(state, SignalState::Down | SignalState::Degraded) {
@@ -394,42 +388,22 @@ mod tests {
     }
 
     #[test]
-    fn health_rollup_last_clone_never_votes_degraded() {
-        for state in [SignalState::Degraded, SignalState::Down] {
-            assert_eq!(
-                health_rollup(Reachability::Reachable, &[(LAST_CLONE_SIGNAL_ID, state)]),
-                EnvironmentHealth::Healthy
-            );
-        }
-    }
-
-    #[test]
-    fn health_rollup_sessions_never_votes() {
-        // Informational capacity context: even down (lost read ACL) must not
-        // flip the Environment — the card itself shows the error.
-        for state in [
-            SignalState::Healthy,
-            SignalState::Degraded,
-            SignalState::Down,
-        ] {
-            assert_eq!(
-                health_rollup(Reachability::Reachable, &[(SESSIONS_SIGNAL_ID, state)]),
-                EnvironmentHealth::Healthy
-            );
-        }
-    }
-
-    #[test]
-    fn health_rollup_table_growth_never_votes() {
-        for state in [
-            SignalState::Healthy,
-            SignalState::Degraded,
-            SignalState::Down,
-        ] {
-            assert_eq!(
-                health_rollup(Reachability::Reachable, &[(TABLE_GROWTH_SIGNAL_ID, state)]),
-                EnvironmentHealth::Healthy
-            );
+    fn health_rollup_non_voting_signals_never_vote() {
+        // Informational Signals (history and capacity context): even down
+        // (lost read ACL) must not flip the Environment — the card itself
+        // shows the error.
+        for signal_id in NON_VOTING_SIGNALS {
+            for state in [
+                SignalState::Healthy,
+                SignalState::Degraded,
+                SignalState::Down,
+            ] {
+                assert_eq!(
+                    health_rollup(Reachability::Reachable, &[(signal_id, state)]),
+                    EnvironmentHealth::Healthy,
+                    "{signal_id} must not vote"
+                );
+            }
         }
     }
 

@@ -90,6 +90,12 @@ impl Default for Thresholds {
     }
 }
 
+/// Signals that never vote in the Environment health rollup: history and
+/// capacity context (`health.rs`), no matter their state. The desktop's
+/// health explainer uses the same list so "Degraded because" never names a
+/// Signal that did not vote.
+pub const NON_VOTING_SIGNALS: [&str; 3] = ["last_clone", "sessions", "table_growth"];
+
 /// Shape-checks a Credential blob against its auth method without ever
 /// echoing the blob: OAuth needs non-empty `client_id` + `client_secret`,
 /// basic needs non-empty `username` + `password`. Shared by the daemon

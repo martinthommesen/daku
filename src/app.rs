@@ -1513,7 +1513,26 @@ impl Daku {
                                             age_phrase(unix_now().saturating_sub(since))
                                         )),
                                 )
-                            }),
+                            })
+                            .children(self.state.health_explain().into_iter().map(|line| {
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().warning)
+                                    .child(line)
+                            }))
+                            .when_some(
+                                self.state.correlation_build(unix_now()),
+                                |element, build| {
+                                    element.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "Started after build {build} — likely clone/upgrade fallout"
+                                            )),
+                                    )
+                                },
+                            ),
                     )
                     .child(
                         div()
@@ -1823,9 +1842,26 @@ impl Daku {
                                 .child("\u{2026} more on the instance"),
                         )
                     }),
-                DrillIn::Trend(points) => element.child(div().px(px(14.0)).child(
-                    sparkline_with_scale(&points, color, px(80.0), unit_suffix(signal_id), cx),
-                )),
+                DrillIn::Trend(points) => element
+                    .when_some(
+                        self.state.anomaly_note(signal_id, unix_now()),
+                        |element, note| {
+                            element.child(
+                                div()
+                                    .px(px(14.0))
+                                    .text_xs()
+                                    .text_color(cx.theme().warning)
+                                    .child(note),
+                            )
+                        },
+                    )
+                    .child(div().px(px(14.0)).child(sparkline_with_scale(
+                        &points,
+                        color,
+                        px(80.0),
+                        unit_suffix(signal_id),
+                        cx,
+                    ))),
                 DrillIn::Text(text) => element.child(
                     div()
                         .px(px(14.0))
