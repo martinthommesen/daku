@@ -252,6 +252,38 @@ fn parse_glide_war(body: &str) -> Option<String> {
     Some(build.to_owned())
 }
 
+/// Runs a platform probe for the sheet's Test button and doctor, mapping its
+/// outcome onto the availability shape: reachable when the probe answered,
+/// with the probe state, else unreachable/down with the error.
+pub(crate) fn observe_probe_signal(
+    signal: &impl crate::collector::Signal,
+    client: &ServiceNowClient,
+    store: &dyn CredentialStore,
+    environment: &EnvironmentConfig,
+) -> AvailabilityObservation {
+    use daku_protocol::{Reachability, SignalState};
+    match signal.probe(client, store, environment) {
+        Ok(observation) => AvailabilityObservation {
+            reachability: Reachability::Reachable,
+            state: observation.state,
+            build: None,
+            rtt_ms: observation
+                .payload
+                .get("rtt_ms")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
+            error: None,
+        },
+        Err(error) => AvailabilityObservation {
+            reachability: Reachability::Unreachable,
+            state: SignalState::Down,
+            build: None,
+            rtt_ms: 0,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

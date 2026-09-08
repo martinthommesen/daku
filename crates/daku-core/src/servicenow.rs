@@ -100,6 +100,13 @@ impl ServiceNowClient {
         }
     }
 
+    /// Raw request without auth, retry, or refresh: platform probes (HTTP,
+    /// GitHub) that carry their own credentials. No `Retry-After` handling —
+    /// a rate-limited probe reads `down` and retries next tick.
+    pub fn execute_raw(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+        self.transport.execute(request)
+    }
+
     pub fn request(
         &self,
         environment: &EnvironmentConfig,
@@ -254,7 +261,7 @@ struct AccessGrant {
     expires_in: Option<u64>,
 }
 
-fn basic_authorization(username: &str, password: &str) -> String {
+pub(crate) fn basic_authorization(username: &str, password: &str) -> String {
     let encoded =
         base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
     format!("Basic {encoded}")
@@ -461,7 +468,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::config::{MemoryCredentialStore, Thresholds};
+    use crate::config::{MemoryCredentialStore, Platform, Thresholds};
 
     #[test]
     fn parse_aggregate_count_reads_stats_count_string() {
@@ -571,6 +578,7 @@ mod tests {
             auth_method: AuthMethod::Basic,
             sort_order: 0,
             clone_source: false,
+            platform: Platform::Servicenow,
             thresholds: Thresholds::default(),
             expected_drift: Vec::new(),
         }
@@ -584,6 +592,7 @@ mod tests {
             auth_method: AuthMethod::OauthClientCredentials,
             sort_order: 0,
             clone_source: false,
+            platform: Platform::Servicenow,
             thresholds: Thresholds::default(),
             expected_drift: Vec::new(),
         }

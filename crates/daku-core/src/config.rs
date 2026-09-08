@@ -36,7 +36,7 @@ pub fn daku_home_dir() -> PathBuf {
         .join(format!(".{DATA_DIRECTORY_NAME}"))
 }
 
-pub use daku_protocol::{AuthMethod, EnvironmentConfig, Thresholds};
+pub use daku_protocol::{AuthMethod, EnvironmentConfig, Platform, Thresholds};
 
 pub fn default_environments_path() -> PathBuf {
     daku_home_dir().join("environments.json")
@@ -59,6 +59,7 @@ pub fn load_environments(path: &Path) -> anyhow::Result<Vec<EnvironmentConfig>> 
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
     for environment in &environments {
         validate_instance_url(&environment.id, &environment.instance_url)?;
+        validate_platform_url(environment)?;
     }
     environments.sort_by_key(|environment| environment.sort_order);
     Ok(environments)
@@ -141,6 +142,37 @@ fn validate_instance_url(id: &str, url: &str) -> anyhow::Result<()> {
         Some(reason) => Err(anyhow!("environment {id}: {reason}")),
         None => Ok(()),
     }
+}
+
+/// Per-platform URL shape on top of the generic https rule: a GitHub
+/// Environment must point at one `owner/repo`.
+fn validate_platform_url(environment: &EnvironmentConfig) -> anyhow::Result<()> {
+    if environment.platform == Platform::Github
+        && split_github_repo(&environment.instance_url).is_none()
+    {
+        return Err(anyhow!(
+            "environment {}: github instance_url must look like https://github.com/<owner>/<repo>",
+            environment.id
+        ));
+    }
+    Ok(())
+}
+
+/// `owner/repo` from a GitHub URL, tolerating a trailing slash or `.git`.
+pub fn split_github_repo(instance_url: &str) -> Option<(String, String)> {
+    let path = instance_url
+        .strip_prefix("https://")?
+        .split('/')
+        .collect::<Vec<_>>();
+    if path.len() < 3 || !path[0].eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let owner = path[1].trim();
+    let repo = path[2].trim().trim_end_matches(".git").trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_owned(), repo.to_owned()))
 }
 
 /// Looks up the secret blob for an Environment id.
@@ -497,6 +529,8 @@ mod tests {
         assert_eq!(thresholds.transaction_avg_degraded_ms, None);
         assert_eq!(thresholds.update_sets_open_degraded_at, u64::MAX);
         assert_eq!(thresholds.scan_p1_degraded_at, 1);
+        assert_eq!(thresholds.actions_failed_degraded_at, 1);
+        assert_eq!(thresholds.http_probe_rtt_degraded_ms, None);
         assert!(thresholds.summary().contains("updates≥off"));
         assert_eq!(thresholds.ecc_output_ready_degraded_at, 100);
         assert_eq!(thresholds.availability_rtt_degraded_ms, None);
@@ -533,6 +567,75 @@ mod tests {
         let environments = load_environments(file.path()).unwrap();
         assert_eq!(environments[0].thresholds, Thresholds::default());
         assert!(environments[0].expected_drift.is_empty());
+    }
+
+    #[test]
+    fn environments_default_to_the_servicenow_platform() {
+        let file = write_temp(&one_environment("https://acme.example.service-now.com"));
+        let environments = load_environments(file.path()).unwrap();
+        assert_eq!(environments[0].platform, Platform::Servicenow);
+    }
+
+    #[test]
+    fn environments_parse_named_platforms_and_reject_unknown_ones() {
+        let file = write_temp(
+            r#"[{"id":"a","label":"A","instance_url":"https://status.example.com/","auth_method":"basic","sort_order":0,"platform":"http"}]"#,
+        );
+        assert_eq!(
+            load_environments(file.path()).unwrap()[0].platform,
+            Platform::Http
+        );
+        let file = write_temp(
+            r#"[{"id":"r","label":"R","instance_url":"https://github.com/acme/app","auth_method":"basic","sort_order":0,"platform":"github"}]"#,
+        );
+        assert_eq!(
+            load_environments(file.path()).unwrap()[0].platform,
+            Platform::Github
+        );
+        let file = write_temp(
+            r#"[{"id":"dev","label":"Dev","instance_url":"https://acme.example.service-now.com","auth_method":"basic","sort_order":0,"platform":"jira"}]"#,
+        );
+        assert!(load_environments(file.path()).is_err());
+    }
+
+    #[test]
+    fn github_environments_require_an_owner_repo_url() {
+        let entry = |url: &str| {
+            format!(
+                r#"[{{"id":"repo","label":"Repo","instance_url":"{url}","auth_method":"basic","sort_order":0,"platform":"github"}}]"#
+            )
+        };
+        assert!(
+            load_environments(write_temp(&entry("https://github.com/acme/app")).path()).is_ok()
+        );
+        for bad in [
+            "https://github.com/acme",
+            "https://github.com//app",
+            "https://example.com/acme/app",
+        ] {
+            let error = load_environments(write_temp(&entry(bad)).path())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("owner"), "{error}");
+        }
+    }
+
+    #[test]
+    fn split_github_repo_tolerates_slash_and_dot_git() {
+        assert_eq!(
+            split_github_repo("https://github.com/acme/app"),
+            Some(("acme".into(), "app".into()))
+        );
+        assert_eq!(
+            split_github_repo("https://github.com/acme/app/"),
+            Some(("acme".into(), "app".into()))
+        );
+        assert_eq!(
+            split_github_repo("https://github.com/acme/app.git"),
+            Some(("acme".into(), "app".into()))
+        );
+        assert_eq!(split_github_repo("https://github.com/acme"), None);
+        assert_eq!(split_github_repo("https://example.com/acme/app"), None);
     }
 
     #[test]

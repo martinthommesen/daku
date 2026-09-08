@@ -577,7 +577,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::collector::SignalCollector;
-    use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore, Thresholds};
+    use crate::config::{
+        AuthMethod, EnvironmentConfig, MemoryCredentialStore, Platform, Thresholds,
+    };
     use crate::persistence::{self, StateStore};
     use crate::servicenow::{
         HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
@@ -721,6 +723,7 @@ mod tests {
             auth_method: AuthMethod::Basic,
             sort_order: if clone_source { 0 } else { 1 },
             clone_source,
+            platform: Platform::Servicenow,
             thresholds: Thresholds::default(),
             expected_drift: Vec::new(),
         }

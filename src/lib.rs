@@ -309,12 +309,15 @@ pub(crate) fn set_app_menus_with_prefs(
                     prefs.master,
                 )];
                 items.push(MenuItem::separator());
-                for signal_id in crate::dashboard_state::SIGNAL_IDS {
+                for signal_id in crate::dashboard_state::SIGNAL_IDS
+                    .iter()
+                    .chain(crate::dashboard_state::PLATFORM_SIGNAL_IDS.iter())
+                {
                     let label = crate::dashboard_state::signal_label(signal_id);
                     items.push(check(
                         &format!("Notify: {label}"),
                         Box::new(ToggleSignalNotify {
-                            signal_id: signal_id.into(),
+                            signal_id: (*signal_id).into(),
                         }),
                         signal_on(signal_id),
                     ));

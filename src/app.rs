@@ -374,6 +374,8 @@ impl Daku {
                     auth_method: summary.auth_method,
                     sort_order: summary.sort_order,
                     clone_source: summary.clone_source,
+                    platform: daku_protocol::Platform::parse(&summary.platform_id)
+                        .unwrap_or(daku_protocol::Platform::Servicenow),
                     thresholds: summary.thresholds,
                     expected_drift: summary.expected_drift,
                 },
@@ -414,6 +416,8 @@ impl Daku {
             auth_method: summary.auth_method,
             sort_order: summary.sort_order,
             clone_source: summary.clone_source,
+            platform: daku_protocol::Platform::parse(&summary.platform_id)
+                .unwrap_or(daku_protocol::Platform::Servicenow),
             thresholds: summary.thresholds.clone(),
             expected_drift: summary.expected_drift.clone(),
         });
@@ -1025,30 +1029,41 @@ fn sheet_button(
 }
 
 impl Daku {
+    fn sidebar_menu_item(
+        &self,
+        row: crate::dashboard_state::SidebarRow,
+        selected_id: &Option<String>,
+        cx: &mut Context<Self>,
+    ) -> SidebarMenuItem {
+        let selected = selected_id.as_deref() == Some(row.id.as_str());
+        let id = row.id.clone();
+        let quiet = row.dimmed || row.muted;
+        let color = if quiet {
+            cx.theme().muted_foreground
+        } else {
+            health_color(row.health, cx)
+        };
+        SidebarMenuItem::new(row.label.clone())
+            .active(selected)
+            .suffix(move |_, _| div().size(px(8.0)).rounded_full().bg(color))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.state.select(&id);
+                cx.notify();
+            }))
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let selected_id = self.state.selected_id().map(str::to_owned);
-        let items: Vec<SidebarMenuItem> = self
-            .state
-            .sidebar(unix_now())
-            .into_iter()
-            .map(|row| {
-                let selected = selected_id.as_deref() == Some(row.id.as_str());
-                let id = row.id.clone();
-                let quiet = row.dimmed || row.muted;
-                let color = if quiet {
-                    cx.theme().muted_foreground
-                } else {
-                    health_color(row.health, cx)
-                };
-                SidebarMenuItem::new(row.label.clone())
-                    .active(selected)
-                    .suffix(move |_, _| div().size(px(8.0)).rounded_full().bg(color))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.state.select(&id);
-                        cx.notify();
-                    }))
-            })
-            .collect();
+        let groups = self.state.sidebar_platforms(unix_now());
+        // Single platform keeps the flat list; more platforms group up.
+        let header_label: SharedString = if groups.len() > 1 {
+            "Platforms".into()
+        } else {
+            groups
+                .first()
+                .map(|group| group.label.clone().into())
+                .unwrap_or("ServiceNow".into())
+        };
         // Roll-up: the worst unmuted Environment colours the header dot.
         // Muted Environments stay quiet on every attention surface.
         let roll_up = self
@@ -1071,7 +1086,7 @@ impl Daku {
             )
         };
 
-        Sidebar::new("daku-sidebar")
+        let mut sidebar = Sidebar::new("daku-sidebar")
             .collapsible(SidebarCollapsible::None)
             .w(px(SIDEBAR_WIDTH))
             .bg(gpui::transparent_black())
@@ -1082,10 +1097,30 @@ impl Daku {
                         .items_center()
                         .gap(px(8.0))
                         .child(div().size(px(10.0)).rounded_full().bg(roll_up))
-                        .child(div().text_sm().child("ServiceNow")),
+                        .child(div().text_sm().child(header_label)),
                 ),
-            )
-            .child(SidebarGroup::new("Environments").child(SidebarMenu::new().children(items)))
+            );
+        if groups.len() > 1 {
+            for group in groups {
+                let items: Vec<SidebarMenuItem> = group
+                    .rows
+                    .into_iter()
+                    .map(|row| self.sidebar_menu_item(row, &selected_id, cx))
+                    .collect();
+                sidebar = sidebar.child(
+                    SidebarGroup::new(group.label).child(SidebarMenu::new().children(items)),
+                );
+            }
+        } else {
+            let items: Vec<SidebarMenuItem> = groups
+                .into_iter()
+                .flat_map(|group| group.rows)
+                .map(|row| self.sidebar_menu_item(row, &selected_id, cx))
+                .collect();
+            sidebar = sidebar
+                .child(SidebarGroup::new("Environments").child(SidebarMenu::new().children(items)));
+        }
+        sidebar
             .footer(
                 SidebarFooter::new().child(
                     div()
@@ -1244,7 +1279,7 @@ impl Daku {
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(
-                                    "Thresholds — empty means default. Jobs errors, email, update sets, RTT and transaction avg accept off.",
+                                    "Thresholds — empty means default. Jobs errors, email, update sets, RTT, transaction avg and probe RTT accept off.",
                                 ),
                         )
                         .child(EnvSheet::field_row(
@@ -1295,6 +1330,16 @@ impl Daku {
                         .child(EnvSheet::field_row(
                             "Scan P1 findings ≥",
                             &sheet.threshold_scan,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "Failed Actions runs ≥",
+                            &sheet.threshold_actions,
+                            cx,
+                        ))
+                        .child(EnvSheet::field_row(
+                            "Probe RTT ms (off)",
+                            &sheet.threshold_probe_rtt,
                             cx,
                         ))
                         .child(EnvSheet::field_row(

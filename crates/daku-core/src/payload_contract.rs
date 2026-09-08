@@ -15,10 +15,12 @@ use serde_json::{Value, json};
 
 use crate::availability::{classify_availability_response, persist_availability_snapshot};
 use crate::collector::SignalCollector;
-use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore, Thresholds};
+use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore, Platform, Thresholds};
 use crate::drift::{DRIFT_SIGNAL_ID, DriftCollector};
 use crate::email::{EMAIL_SIGNAL_ID, EmailCollector};
 use crate::flow::{FLOW_SIGNAL_ID, FlowCollector};
+use crate::github::{ACTIONS_SIGNAL_ID, ActionsCollector};
+use crate::http_probe::{HTTP_PROBE_SIGNAL_ID, HttpProbeCollector};
 use crate::jobs::{JOBS_SIGNAL_ID, JobsCollector};
 use crate::last_clone::{
     CloneRow, LAST_CLONE_SIGNAL_ID, persist_clone_source, persist_clone_target,
@@ -211,6 +213,21 @@ impl HttpTransport for ContractTransport {
             } else {
                 include_str!("../tests/fixtures/mid_ecc/count_2.json")
             }
+        } else if url == "https://status-ok.example.com/health" {
+            r#"ok"#
+        } else if url == "https://status-down.example.com/health" {
+            return Ok(HttpResponse {
+                status: 503,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: "maintenance".into(),
+            });
+        } else if url.contains("api.github.com/repos/acme/app/actions/runs") {
+            r#"{"workflow_runs":[
+                {"name":"ci","conclusion":"failure","created_at":"2099-01-01T00:12:00Z","html_url":"https://github.com/acme/app/actions/runs/1"},
+                {"name":"lint","conclusion":"success","created_at":"2099-01-01T01:12:00Z","html_url":"https://github.com/acme/app/actions/runs/2"}
+            ]}"#
+        } else if url.contains("api.github.com/repos/acme/quiet/actions/runs") {
+            r#"{"workflow_runs":[]}"#
         } else {
             panic!("unexpected URL: {url}");
         };
@@ -242,6 +259,21 @@ fn env(id: &str, host: &str, clone_source: bool) -> EnvironmentConfig {
         auth_method: AuthMethod::Basic,
         sort_order: if clone_source { 0 } else { 1 },
         clone_source,
+        platform: Platform::Servicenow,
+        thresholds: Thresholds::default(),
+        expected_drift: Vec::new(),
+    }
+}
+
+fn platform_env(id: &str, instance_url: &str, platform: Platform) -> EnvironmentConfig {
+    EnvironmentConfig {
+        id: id.into(),
+        label: id.into(),
+        instance_url: instance_url.into(),
+        auth_method: AuthMethod::Basic,
+        sort_order: 0,
+        clone_source: false,
+        platform,
         thresholds: Thresholds::default(),
         expected_drift: Vec::new(),
     }
@@ -445,6 +477,45 @@ fn generate() -> BTreeMap<String, Value> {
     );
     drop(connection);
 
+    // Platform probes, through their real collectors over their own
+    // Environments, so the ServiceNow contract above stays untouched. Each
+    // collector runs only its platform's Environments: the probe hits
+    // `instance_url` verbatim, which no other platform's transport serves.
+    let db = TempDb::new("payload-platforms");
+    let http_envs = vec![
+        platform_env(
+            "status-ok",
+            "https://status-ok.example.com/health",
+            Platform::Http,
+        ),
+        platform_env(
+            "status-down",
+            "https://status-down.example.com/health",
+            Platform::Http,
+        ),
+    ];
+    let github_envs = vec![
+        platform_env("repo", "https://github.com/acme/app", Platform::Github),
+        platform_env("quiet", "https://github.com/acme/quiet", Platform::Github),
+    ];
+    let platform_store = credentials(&["status-ok", "status-down", "repo", "quiet"]);
+    HttpProbeCollector::new(http_envs, platform_store.clone(), client(), db.store())
+        .collect()
+        .unwrap();
+    ActionsCollector::new(github_envs, platform_store, client(), db.store())
+        .collect()
+        .unwrap();
+    let connection = db.store().open().unwrap();
+    for (name, id, signal_id) in [
+        ("http_probe_ok", "status-ok", HTTP_PROBE_SIGNAL_ID),
+        ("http_probe_down", "status-down", HTTP_PROBE_SIGNAL_ID),
+        ("actions_failed", "repo", ACTIONS_SIGNAL_ID),
+        ("actions_clean", "quiet", ACTIONS_SIGNAL_ID),
+    ] {
+        cases.insert(name.into(), case(&connection, id, signal_id));
+    }
+    drop(connection);
+
     // Last clone: the collector's writers, called with a fixed `observed_at`
     // (it takes its own from `unix_now()`, which `age_days` would follow).
     let db = TempDb::new("payload-last-clone");
@@ -576,6 +647,8 @@ fn every_known_signal_has_a_pinned_case() {
     use crate::drift::DRIFT_SIGNAL_ID;
     use crate::email::EMAIL_SIGNAL_ID;
     use crate::flow::FLOW_SIGNAL_ID;
+    use crate::github::ACTIONS_SIGNAL_ID;
+    use crate::http_probe::HTTP_PROBE_SIGNAL_ID;
     use crate::jobs::JOBS_SIGNAL_ID;
     use crate::last_clone::LAST_CLONE_SIGNAL_ID;
     use crate::mid_ecc::MID_ECC_SIGNAL_ID;
@@ -587,7 +660,7 @@ fn every_known_signal_has_a_pinned_case() {
     use crate::update_sets::UPDATE_SETS_SIGNAL_ID;
     use crate::upgrade::UPGRADE_SIGNAL_ID;
 
-    const KNOWN: [&str; 15] = [
+    const KNOWN: [&str; 17] = [
         AVAILABILITY_SIGNAL_ID,
         JOBS_SIGNAL_ID,
         SYSLOG_SIGNAL_ID,
@@ -601,6 +674,8 @@ fn every_known_signal_has_a_pinned_case() {
         TRANSACTION_SIGNAL_ID,
         UPDATE_SETS_SIGNAL_ID,
         SCAN_SIGNAL_ID,
+        HTTP_PROBE_SIGNAL_ID,
+        ACTIONS_SIGNAL_ID,
         DRIFT_SIGNAL_ID,
         LAST_CLONE_SIGNAL_ID,
     ];

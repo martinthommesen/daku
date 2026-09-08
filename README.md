@@ -1,8 +1,8 @@
 # daku
 
-macOS operator console for ServiceNow Environments. Native GPUI client + Rust daemon (GPL-3.0-only).
+macOS operator console for ServiceNow Environments — plus HTTP and GitHub probes. Native GPUI client + Rust daemon (GPL-3.0-only).
 
-Product spec: [`docs/spec/v1.md`](docs/spec/v1.md) (v1.1 scope included). Domain vocabulary: [`CONTEXT.md`](CONTEXT.md). Signal reference: [`docs/signals.md`](docs/signals.md).
+Product spec: [`docs/spec/v1.md`](docs/spec/v1.md) (v1.1 scope included). Domain vocabulary: [`CONTEXT.md`](CONTEXT.md). Signal reference: [`docs/signals.md`](docs/signals.md). Platforms: [`docs/platforms.md`](docs/platforms.md).
 
 ## One-time upstream pin
 

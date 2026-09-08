@@ -220,6 +220,8 @@ pub fn delete_environment(
 
 /// Dry-run availability probe for unsaved edits. Writes nothing: an explicit
 /// blob is held in an ephemeral store, otherwise the stored item is used.
+/// Non-ServiceNow Environments probe their own platform signal and map the
+/// outcome onto the availability shape the sheet renders.
 pub fn test_environment(
     environment: &EnvironmentConfig,
     credential_json: Option<&str>,
@@ -240,13 +242,29 @@ pub fn test_environment(
         }
         None => credentials,
     };
-    Ok(AvailabilitySignal.observe(client, store, environment))
+    match environment.platform {
+        daku_protocol::Platform::Servicenow => {
+            Ok(AvailabilitySignal.observe(client, store, environment))
+        }
+        daku_protocol::Platform::Http => Ok(crate::availability::observe_probe_signal(
+            &crate::http_probe::HttpProbeSignal,
+            client,
+            store,
+            environment,
+        )),
+        daku_protocol::Platform::Github => Ok(crate::availability::observe_probe_signal(
+            &crate::github::ActionsSignal,
+            client,
+            store,
+            environment,
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::MemoryCredentialStore;
+    use crate::config::{MemoryCredentialStore, Platform};
     use crate::test_support::TempFile;
     use daku_protocol::AuthMethod;
 
@@ -261,6 +279,7 @@ mod tests {
             auth_method: AuthMethod::Basic,
             sort_order: 0,
             clone_source: false,
+            platform: Platform::Servicenow,
             thresholds: daku_protocol::Thresholds::default(),
             expected_drift: Vec::new(),
         }
@@ -414,6 +433,74 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("username and password"), "{error}");
+    }
+
+    #[test]
+    fn test_environment_probes_each_platform_its_own_way() {
+        use crate::config::Platform;
+        use crate::servicenow::{HttpRequest, HttpResponse, HttpTransport, SystemClock};
+
+        struct ProbeTransport;
+        impl HttpTransport for ProbeTransport {
+            fn execute(&self, request: &HttpRequest) -> anyhow::Result<HttpResponse> {
+                if request.url.contains("status.example.com") {
+                    return Ok(HttpResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: String::new(),
+                    });
+                }
+                assert!(
+                    request
+                        .url
+                        .starts_with("https://api.github.com/repos/acme/app/"),
+                    "github test probes the runs API: {}",
+                    request.url
+                );
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![("content-type".into(), "application/json".into())],
+                    body: r#"{"workflow_runs":[]}"#.into(),
+                })
+            }
+        }
+
+        fn platform_env(id: &str, url: &str, platform: Platform) -> EnvironmentConfig {
+            EnvironmentConfig {
+                id: id.into(),
+                label: id.into(),
+                instance_url: url.into(),
+                auth_method: AuthMethod::Basic,
+                sort_order: 0,
+                clone_source: false,
+                platform,
+                thresholds: daku_protocol::Thresholds::default(),
+                expected_drift: Vec::new(),
+            }
+        }
+
+        let credentials = MemoryCredentialStore::default();
+        let client = ServiceNowClient::new(ProbeTransport, SystemClock);
+        let http = test_environment(
+            &platform_env("status", "https://status.example.com/", Platform::Http),
+            None,
+            &credentials,
+            &client,
+        )
+        .unwrap();
+        assert_eq!(http.reachability, daku_protocol::Reachability::Reachable);
+        assert_eq!(http.state, daku_protocol::SignalState::Healthy);
+        assert!(http.build.is_none());
+
+        let github = test_environment(
+            &platform_env("repo", "https://github.com/acme/app", Platform::Github),
+            Some(r#"{"username":"token","password":"test-pat-x"}"#),
+            &credentials,
+            &client,
+        )
+        .unwrap();
+        assert_eq!(github.reachability, daku_protocol::Reachability::Reachable);
+        assert_eq!(github.state, daku_protocol::SignalState::Healthy);
     }
 
     #[test]

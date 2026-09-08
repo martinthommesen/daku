@@ -26,6 +26,32 @@ pub const SIGNAL_IDS: [&str; 15] = [
     "last_clone",
 ];
 
+/// Signals outside the ServiceNow set, per platform id. The desktop renders
+/// `signal_ids_for(environment.platform_id)` so a platform shows its own
+/// cards; unknown platforms fall back to the ServiceNow set.
+pub const PLATFORM_SIGNAL_IDS: [&str; 2] = ["http_probe", "actions"];
+
+/// Card ids for one platform: the ServiceNow set, one probe, or one Actions
+/// feed. Unknown platform ids read as ServiceNow (the config default), so a
+/// newer daemon never blanks an older desktop.
+pub fn signal_ids_for(platform_id: &str) -> &'static [&'static str] {
+    match platform_id {
+        "http" => &["http_probe"],
+        "github" => &["actions"],
+        _ => &SIGNAL_IDS,
+    }
+}
+
+/// Any id the desktop can render a card for, across platforms. Card
+/// selection validates against this, not the ServiceNow set alone.
+pub fn known_signal_id(signal_id: &str) -> Option<&'static str> {
+    SIGNAL_IDS
+        .iter()
+        .chain(PLATFORM_SIGNAL_IDS.iter())
+        .find(|&&id| id == signal_id)
+        .copied()
+}
+
 pub const WAITING: &str = "Waiting";
 
 /// True for the Signals with trends (raw 24 h samples + hourly roll-ups).
@@ -48,6 +74,8 @@ pub fn signal_label(signal_id: &str) -> &'static str {
         "slow_txn" => "Slow transactions",
         "update_sets" => "Update sets",
         "scan" => "Instance Scan",
+        "http_probe" => "HTTP probe",
+        "actions" => "Actions",
         "drift" => "Version / plugins",
         "last_clone" => "Last clone",
         _ => "Signal",
@@ -55,6 +83,23 @@ pub fn signal_label(signal_id: &str) -> &'static str {
 }
 
 const TREND_SIGNALS: [&str; 3] = ["availability", "jobs", "syslog"];
+
+/// Display name for a sidebar platform group. Unknown ids title-case
+/// themselves so a newer daemon never blanks an older desktop.
+pub fn platform_label(platform_id: &str) -> String {
+    match platform_id {
+        "servicenow" => "ServiceNow".into(),
+        "http" => "HTTP".into(),
+        "github" => "GitHub".into(),
+        other => {
+            let mut title = other.replace(['_', '-'], " ");
+            if let Some(first) = title.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            title
+        }
+    }
+}
 
 /// The daemon keeps samples this long (`persistence::SAMPLE_RETENTION_SECS`);
 /// every sparkline spans it.
@@ -187,6 +232,14 @@ pub struct SidebarRow {
     pub dimmed: bool,
     /// Operator mute (`074`): grey and silent on attention surfaces.
     pub muted: bool,
+}
+
+/// One sidebar platform section: the group id is the wire `platform_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlatformGroup {
+    pub id: String,
+    pub label: String,
+    pub rows: Vec<SidebarRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,7 +486,7 @@ impl DashboardState {
     /// Clicking the open card closes the Drill-in; selecting an Environment
     /// keeps the card open so the same Signal can be compared across them.
     pub fn select_card(&mut self, signal_id: &str) {
-        let Some(&id) = SIGNAL_IDS.iter().find(|&&id| id == signal_id) else {
+        let Some(id) = known_signal_id(signal_id) else {
             return;
         };
         self.selected_card = if self.selected_card == Some(id) {
@@ -478,8 +531,8 @@ impl DashboardState {
     /// Environment from the compare strip, a notification or the menu bar
     /// always lands on the drift card, never closes it.
     pub fn open_card(&mut self, signal_id: &str) {
-        if SIGNAL_IDS.contains(&signal_id) {
-            self.selected_card = SIGNAL_IDS.iter().find(|&&id| id == signal_id).copied();
+        if let Some(id) = known_signal_id(signal_id) {
+            self.selected_card = Some(id);
         }
     }
 
@@ -507,7 +560,7 @@ impl DashboardState {
             },
             format!(", {}", fresh.label),
         )];
-        for signal_id in SIGNAL_IDS {
+        for signal_id in signal_ids_for(&selected.platform_id).iter().copied() {
             let status = self
                 .snapshots
                 .get(&selected.id)
@@ -567,6 +620,24 @@ impl DashboardState {
             }
             "update_sets" => "/sys_update_set_list.do",
             "scan" => "/scan_finding_list.do",
+            // Platform probes link out, not into a list: the probe target
+            // itself, or the repo's Actions page. Both re-check the URL
+            // against the https-only policy (attached daemons are untrusted).
+            "http_probe" => {
+                let url = self.selected()?.instance_url.clone();
+                return is_supported_instance_url(&url).then_some(url);
+            }
+            "actions" => {
+                let base = self
+                    .selected()?
+                    .instance_url
+                    .trim_end_matches('/')
+                    .to_owned();
+                if !is_supported_instance_url(&base) {
+                    return None;
+                }
+                return Some(format!("{base}/actions"));
+            }
             "drift" => "/v_plugin_list.do",
             "last_clone" => "/clone_instance_list.do",
             _ => return None,
@@ -706,6 +777,10 @@ impl DashboardState {
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "scan" => self
                 .scan_rows(value)
+                .unwrap_or_else(|| self.drill_in_text(signal_id)),
+            "http_probe" => self.drill_in_text(signal_id),
+            "actions" => self
+                .actions_rows(value)
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "availability" => self.drill_in_trend(signal_id, now),
             _ => self.drill_in_text(signal_id),
@@ -1062,6 +1137,38 @@ impl DashboardState {
         })
     }
 
+    /// Failed GitHub Actions runs. Each row links the run page, which is an
+    /// absolute `html_url` from the API — not an instance record — so the
+    /// link passes through verbatim after an https check.
+    fn actions_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let list = value
+            .get("run_rows")
+            .and_then(|item| item.as_array())
+            .filter(|list| !list.is_empty())?;
+        Some(DrillIn::Rows {
+            headers: vec!["Run", "Result", "Time"],
+            rows: list
+                .iter()
+                .take(DRILL_IN_ROW_LIMIT)
+                .map(|entry| {
+                    let url = entry.get("html_url").and_then(|item| item.as_str());
+                    DrillInRow {
+                        cells: vec![
+                            cell(entry, "name"),
+                            cell(entry, "conclusion"),
+                            cell(entry, "created_at"),
+                        ],
+                        link: url
+                            .filter(|url| is_supported_instance_url(url))
+                            .map(str::to_owned),
+                    }
+                })
+                .collect(),
+            truncated: value.get("run_rows_truncated") == Some(&serde_json::Value::Bool(true))
+                || list.len() > DRILL_IN_ROW_LIMIT,
+        })
+    }
+
     /// Deep link to one ServiceNow record. `None` without a selected
     /// Environment, an untrusted URL, or an empty id.
     fn record_url(&self, table: &str, sys_id: &str) -> Option<String> {
@@ -1098,6 +1205,34 @@ impl DashboardState {
             .collect()
     }
 
+    /// Sidebar rows grouped by platform, in first-seen platform order. The
+    /// shell renders groups only when more than one platform is configured;
+    /// single-platform installs keep the flat list.
+    pub fn sidebar_platforms(&self, now: i64) -> Vec<PlatformGroup> {
+        let mut groups: Vec<PlatformGroup> = Vec::new();
+        for environment in &self.environments {
+            let row = SidebarRow {
+                id: environment.id.clone(),
+                label: environment.label.clone(),
+                health: environment.health,
+                dimmed: !self.connected || environment.last_observed_at.is_none(),
+                muted: self.is_muted(&environment.id, now),
+            };
+            match groups
+                .iter_mut()
+                .find(|group| group.id == environment.platform_id)
+            {
+                Some(group) => group.rows.push(row),
+                None => groups.push(PlatformGroup {
+                    id: environment.platform_id.clone(),
+                    label: platform_label(&environment.platform_id),
+                    rows: vec![row],
+                }),
+            }
+        }
+        groups
+    }
+
     pub fn cards(&self, now: i64) -> Vec<SignalCard> {
         let environment_id = self.selected_id.as_deref().unwrap_or("");
         let snapshots = self.snapshots.get(environment_id);
@@ -1105,9 +1240,14 @@ impl DashboardState {
             .selected_id
             .as_deref()
             .is_some_and(|id| self.is_muted(id, now));
-        let mut cards = SIGNAL_IDS
+        let platform_id = self
+            .selected()
+            .map(|env| env.platform_id.as_str())
+            .unwrap_or("servicenow");
+        let mut cards = signal_ids_for(platform_id)
             .iter()
-            .map(|&signal_id| {
+            .copied()
+            .map(|signal_id| {
                 let snapshot = snapshots.and_then(|map| map.get(signal_id));
                 let sparkline = if TREND_SIGNALS.contains(&signal_id) {
                     self.samples
@@ -1272,14 +1412,21 @@ impl DashboardState {
     /// Same lines for any Environment id. Notifications use this: the
     /// firing Environment is not necessarily the selected one.
     pub fn health_explain_for(&self, environment_id: &str) -> Vec<String> {
+        let platform_id = self
+            .environments
+            .iter()
+            .find(|env| env.id == environment_id)
+            .map(|env| env.platform_id.as_str())
+            .unwrap_or("servicenow");
         let Some(snapshots) = self.snapshots.get(environment_id) else {
             return Vec::new();
         };
-        SIGNAL_IDS
+        signal_ids_for(platform_id)
             .iter()
+            .copied()
             .filter(|signal_id| !NON_VOTING_SIGNALS.contains(signal_id))
             .filter_map(|signal_id| {
-                let snapshot = snapshots.get(*signal_id)?;
+                let snapshot = snapshots.get(signal_id)?;
                 if !matches!(snapshot.dto.state.as_str(), "degraded" | "down") {
                     return None;
                 }
@@ -1410,7 +1557,7 @@ impl DashboardState {
     pub fn headline_for(&self, env_id: &str) -> Option<(EnvironmentHealth, String)> {
         let environment = self.environments.iter().find(|env| env.id == env_id)?;
         let snapshots = self.snapshots.get(env_id)?;
-        for signal_id in SIGNAL_IDS {
+        for signal_id in signal_ids_for(&environment.platform_id).iter().copied() {
             let snapshot = snapshots.get(signal_id)?;
             if !matches!(snapshot.dto.state.as_str(), "degraded" | "down") {
                 continue;
@@ -1433,8 +1580,14 @@ impl DashboardState {
     /// notification switch: the banner posts only when this Signal is
     /// enabled.
     pub fn worst_signal_id(&self, env_id: &str) -> Option<&'static str> {
+        let platform_id = self
+            .environments
+            .iter()
+            .find(|env| env.id == env_id)
+            .map(|env| env.platform_id.as_str())
+            .unwrap_or("servicenow");
         let snapshots = self.snapshots.get(env_id)?;
-        SIGNAL_IDS.iter().find_map(|signal_id| {
+        signal_ids_for(platform_id).iter().find_map(|signal_id| {
             snapshots
                 .get(*signal_id)
                 .filter(|snapshot| matches!(snapshot.dto.state.as_str(), "degraded" | "down"))?;
@@ -1873,6 +2026,28 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 "no open findings".into()
             }
         }
+        "http_probe" => {
+            let status = value
+                .get("http_status")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0);
+            let ms = value
+                .get("rtt_ms")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0);
+            format!("{ms} ms · HTTP {status}")
+        }
+        "actions" => {
+            let failed = value
+                .get("failed_24h")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0);
+            if failed == 1 {
+                "1 failed run · 24h".into()
+            } else {
+                format!("{failed} failed runs · 24h")
+            }
+        }
         "drift" => {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
                 "source of truth".into()
@@ -2204,7 +2379,7 @@ mod tests {
     /// `card_summary`, `card_detail`). Add a pinned case there and
     /// `pinned_payloads_render` fails until it is listed here — that is the
     /// point of the pin.
-    const RENDERED: [(&str, &str, &str); 43] = [
+    const RENDERED: [(&str, &str, &str); 47] = [
         ("availability_asleep", "142 ms", ""),
         // The build string is shown with the plugin inventory (drift), not
         // under the latency number.
@@ -2251,6 +2426,10 @@ mod tests {
         ("update_sets_clean", "no open update sets", ""),
         ("scan_open", "1 P1 \u{b7} 1 P2", ""),
         ("scan_clean", "no open findings", ""),
+        ("http_probe_ok", "0 ms \u{b7} HTTP 200", ""),
+        ("http_probe_down", "0 ms \u{b7} HTTP 503", ""),
+        ("actions_failed", "1 failed run \u{b7} 24h", ""),
+        ("actions_clean", "0 failed runs \u{b7} 24h", ""),
         ("skipped_asleep", "", "Environment asleep"),
         ("skipped_clone_source_asleep", "", "clone source asleep"),
         (
@@ -2546,6 +2725,126 @@ mod tests {
         // Test's first degraded Signal is MID/ECC (jobs/syslog read zero).
         assert_eq!(state.worst_signal_id("test"), Some("mid_ecc"));
         assert_eq!(state.worst_signal_id("nope"), None);
+    }
+
+    #[test]
+    fn signal_ids_for_cover_each_platform_with_a_fallback() {
+        assert_eq!(signal_ids_for("servicenow"), SIGNAL_IDS.as_slice());
+        assert_eq!(signal_ids_for("http"), &["http_probe"]);
+        assert_eq!(signal_ids_for("github"), &["actions"]);
+        assert_eq!(signal_ids_for("bteq"), SIGNAL_IDS.as_slice());
+    }
+
+    #[test]
+    fn platform_labels_title_themselves() {
+        assert_eq!(platform_label("servicenow"), "ServiceNow");
+        assert_eq!(platform_label("http"), "HTTP");
+        assert_eq!(platform_label("github"), "GitHub");
+        assert_eq!(platform_label("bteq"), "Bteq");
+    }
+
+    /// One synthetic Environment on another platform, selected, carrying the
+    /// given pinned snapshots.
+    fn platform_loaded(id: &str, platform_id: &str, cases: &[&str]) -> DashboardState {
+        let mut environment = env(id, id, EnvironmentHealth::Degraded, Reachability::Reachable);
+        environment.platform_id = platform_id.into();
+        environment.instance_url = if platform_id == "github" {
+            "https://github.com/acme/app".into()
+        } else {
+            "https://status.example.com/health".into()
+        };
+        let mut state = DashboardState::new();
+        state.set_connected(true);
+        state.apply_all(&[ServerMessage::EnvironmentsUpdated {
+            environments: vec![environment],
+        }]);
+        state.select(id);
+        state.apply_all(&[ServerMessage::SignalSnapshotsUpdated {
+            environment_id: id.into(),
+            snapshots: cases.iter().map(|case| pinned(case)).collect(),
+        }]);
+        state
+    }
+
+    #[test]
+    fn http_platform_renders_one_probe_card() {
+        let state = platform_loaded("status", "http", &["http_probe_ok"]);
+        let cards = state.cards(TEST_NOW);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].signal_id, "http_probe");
+        assert_eq!(state.card_summary("http_probe"), "0 ms · HTTP 200");
+        assert_eq!(
+            state.signal_url("http_probe").as_deref(),
+            Some("https://status.example.com/health")
+        );
+        assert_eq!(state.worst_signal_id("status"), None);
+        assert!(state.health_explain().is_empty());
+    }
+
+    #[test]
+    fn github_platform_renders_actions_with_run_links() {
+        let state = platform_loaded("repo", "github", &["actions_failed"]);
+        let cards = state.cards(TEST_NOW);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(state.card_summary("actions"), "1 failed run · 24h");
+        assert_eq!(
+            state.signal_url("actions").as_deref(),
+            Some("https://github.com/acme/app/actions")
+        );
+        assert_eq!(state.worst_signal_id("repo"), Some("actions"));
+        assert_eq!(
+            state.health_explain(),
+            vec!["Actions: 1 failed run · 24h".to_owned()]
+        );
+        assert_eq!(
+            state.drill_in("actions", TEST_NOW),
+            DrillIn::Rows {
+                headers: vec!["Run", "Result", "Time"],
+                rows: vec![DrillInRow {
+                    cells: vec![
+                        "ci".to_owned(),
+                        "failure".to_owned(),
+                        "2099-01-01T00:12:00Z".to_owned(),
+                    ],
+                    link: Some("https://github.com/acme/app/actions/runs/1".to_owned()),
+                }],
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn sidebar_groups_platforms_in_first_seen_order() {
+        let single = loaded();
+        let groups = single.sidebar_platforms(TEST_NOW);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "servicenow");
+        assert_eq!(groups[0].rows.len(), 2);
+
+        let mut mixed = loaded();
+        let mut repo = env(
+            "repo",
+            "Repo",
+            EnvironmentHealth::Degraded,
+            Reachability::Reachable,
+        );
+        repo.platform_id = "github".into();
+        mixed.apply_all(&[ServerMessage::EnvironmentsUpdated {
+            environments: vec![
+                env(
+                    "prod",
+                    "Production",
+                    EnvironmentHealth::Degraded,
+                    Reachability::Reachable,
+                ),
+                repo,
+            ],
+        }]);
+        let groups = mixed.sidebar_platforms(TEST_NOW);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].label, "ServiceNow");
+        assert_eq!(groups[1].label, "GitHub");
+        assert_eq!(groups[1].rows[0].id, "repo");
     }
 
     /// Monday 2026-01-05 09:00 UTC. Synthetic samples + rollups for one

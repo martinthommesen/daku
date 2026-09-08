@@ -252,9 +252,10 @@ fn format_doctor_row(row: &daku_core::DoctorRow) -> String {
         (false, Some(error)) => format!("credential: ERROR {error}"),
     };
     format!(
-        "{} ({}) · {} · {} {} · build {} · {} ms{} · thresholds {}{}",
+        "{} ({}) [{}] · {} · {} {} · build {} · {} ms{} · thresholds {}{}",
         row.id,
         row.label,
+        row.platform,
         credential,
         row.reachability,
         row.state,
@@ -581,6 +582,7 @@ mod tests {
         daku_core::DoctorRow {
             id: "prod".into(),
             label: "Production".into(),
+            platform: "servicenow".into(),
             credential_present,
             credential_error: None,
             reachability: if credential_present {

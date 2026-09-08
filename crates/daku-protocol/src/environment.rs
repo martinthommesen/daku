@@ -14,6 +14,49 @@ pub enum AuthMethod {
     Basic,
 }
 
+/// Monitored product family. v1 was ServiceNow-only; the collector
+/// dispatches per-Environment on this, and the sidebar groups by it once a
+/// second platform is configured. Unknown values are rejected so typos fail
+/// fast; missing values read as ServiceNow so v1 files keep loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    #[default]
+    Servicenow,
+    /// Generic HTTPS probe: status + latency on any URL.
+    Http,
+    /// GitHub Actions failures for one `owner/repo` via the REST API.
+    Github,
+}
+
+impl Platform {
+    /// Wire/sidebar id: what `EnvironmentSummary.platform_id` carries.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Servicenow => "servicenow",
+            Self::Http => "http",
+            Self::Github => "github",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Servicenow => "ServiceNow",
+            Self::Http => "HTTP",
+            Self::Github => "GitHub",
+        }
+    }
+
+    pub fn parse(id: &str) -> Option<Self> {
+        Some(match id {
+            "servicenow" => Self::Servicenow,
+            "http" => Self::Http,
+            "github" => Self::Github,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EnvironmentConfig {
     pub id: String,
@@ -23,6 +66,10 @@ pub struct EnvironmentConfig {
     pub sort_order: i64,
     #[serde(default)]
     pub clone_source: bool,
+    /// Monitored product family. Missing reads as ServiceNow so v1
+    /// `environments.json` files keep loading.
+    #[serde(default)]
+    pub platform: Platform,
     /// Per-Environment threshold overrides; missing keys fall back to the
     /// defaults below. Unknown keys are rejected so typos fail fast.
     #[serde(default)]
@@ -52,6 +99,8 @@ pub struct Thresholds {
     pub transaction_avg_degraded_ms: Option<u64>,
     pub update_sets_open_degraded_at: u64,
     pub scan_p1_degraded_at: u64,
+    pub http_probe_rtt_degraded_ms: Option<u64>,
+    pub actions_failed_degraded_at: u64,
     pub mid_unhealthy_degraded_at: u64,
     pub ecc_error_degraded_at: u64,
     pub ecc_output_ready_degraded_at: u64,
@@ -77,6 +126,10 @@ impl Default for Thresholds {
             // until the Operator sets a ceiling.
             update_sets_open_degraded_at: u64::MAX,
             scan_p1_degraded_at: 1,
+            // Generic probes vary per target, so the ceiling is opt-in like
+            // the other RTT ceilings: `None` never votes.
+            http_probe_rtt_degraded_ms: None,
+            actions_failed_degraded_at: 1,
             // Transaction slowness varies wildly per instance (PDI hardware vs
             // prod), so this Signal is opt-in like the availability RTT
             // ceiling: `None` never votes until the Operator sets a ceiling.
@@ -145,7 +198,7 @@ impl Thresholds {
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "off".to_owned());
         format!(
-            "jobs≥{}/err≥{} syslog≥{} outbound≥{} flow≥{} email≥{} upgrade≥{} updates≥{} scan≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{} txn>{}",
+            "jobs≥{}/err≥{} syslog≥{} outbound≥{} flow≥{} email≥{} upgrade≥{} updates≥{} scan≥{} actions≥{} mid≥{}/ecc-err≥{}/queue≥{} drift≥{} rtt>{} txn>{} probe>{}",
             self.jobs_overdue_degraded_at,
             off(self.jobs_error_degraded_at),
             self.syslog_error_degraded_at,
@@ -155,12 +208,16 @@ impl Thresholds {
             self.upgrade_failed_degraded_at,
             off(self.update_sets_open_degraded_at),
             self.scan_p1_degraded_at,
+            self.actions_failed_degraded_at,
             self.mid_unhealthy_degraded_at,
             self.ecc_error_degraded_at,
             self.ecc_output_ready_degraded_at,
             self.drift_mismatches_degraded_at,
             rtt,
             txn,
+            self.http_probe_rtt_degraded_ms
+                .map(|ms| format!("{ms}ms"))
+                .unwrap_or_else(|| "off".to_owned()),
         )
     }
 }
@@ -181,5 +238,24 @@ mod tests {
         assert_eq!(wire["instance_url"], "https://x.example.service-now.com");
         let back: EnvironmentConfig = serde_json::from_value(wire).unwrap();
         assert_eq!(back, from_file);
+        // v1 files without a platform read as ServiceNow.
+        assert_eq!(from_file.platform, Platform::Servicenow);
+    }
+
+    #[test]
+    fn platform_ids_round_trip_and_reject_unknowns() {
+        for (id, platform) in [
+            ("servicenow", Platform::Servicenow),
+            ("http", Platform::Http),
+            ("github", Platform::Github),
+        ] {
+            assert_eq!(Platform::parse(id), Some(platform));
+            assert_eq!(platform.id(), id);
+            let json = serde_json::to_value(platform).unwrap();
+            assert_eq!(json, serde_json::Value::String(id.into()));
+            assert_eq!(serde_json::from_value::<Platform>(json).unwrap(), platform);
+        }
+        assert_eq!(Platform::parse("jira"), None);
+        assert_eq!(Platform::default(), Platform::Servicenow);
     }
 }

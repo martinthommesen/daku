@@ -5,11 +5,11 @@ Infrastructure monitoring for platforms the owner/team runs — ServiceNow first
 ## Language
 
 **Platform**:
-A product or system family daku can monitor. v1 is ServiceNow only.
+A product or system family daku can monitor: ServiceNow (the fifteen-Signal suite), generic HTTP probes, and GitHub Actions. Declared per Environment; the sidebar groups by platform once a second one is configured.
 _Avoid_: integration, tool, vendor
 
 **Environment**:
-One concrete deployable instance of a Platform (e.g. ServiceNow prod, test, or dev). The Operator's config defines the list — defaults to prod/test/dev; not a fixed ceiling. A Personal Developer Instance (PDI) is a temporary stand-in for building daku, not a monitored Environment the team relies on.
+One concrete deployable instance of a Platform (e.g. ServiceNow prod, test, or dev; a status-page URL; a GitHub `owner/repo`). The Operator's config defines the list — defaults to prod/test/dev; not a fixed ceiling. A Personal Developer Instance (PDI) is a temporary stand-in for building daku, not a monitored Environment the team relies on.
 _Avoid_: instance (ambiguous with "ServiceNow instance" in casual speech — prefer Environment when talking about daku's model), stage, tier
 
 **Signal**:

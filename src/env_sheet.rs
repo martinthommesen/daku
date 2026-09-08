@@ -24,8 +24,8 @@ pub struct EnvSheet {
     pub secret_a: Entity<InputState>,
     pub secret_b: Entity<InputState>,
     /// Per-Environment threshold overrides, as edited text. Empty means
-    /// default; `jobs_error`, `email`, `updates`, `rtt` and `txn` also accept
-    /// `off`.
+    /// default; `jobs_error`, `email`, `updates`, `rtt`, `txn` and
+    /// `probe_rtt` also accept `off`.
     pub threshold_jobs_overdue: Entity<InputState>,
     pub threshold_jobs_error: Entity<InputState>,
     pub threshold_syslog: Entity<InputState>,
@@ -36,6 +36,8 @@ pub struct EnvSheet {
     pub threshold_txn: Entity<InputState>,
     pub threshold_updates: Entity<InputState>,
     pub threshold_scan: Entity<InputState>,
+    pub threshold_actions: Entity<InputState>,
+    pub threshold_probe_rtt: Entity<InputState>,
     pub threshold_mid: Entity<InputState>,
     pub threshold_ecc_error: Entity<InputState>,
     pub threshold_ecc_queue: Entity<InputState>,
@@ -127,6 +129,18 @@ impl EnvSheet {
                 window,
                 cx,
                 &format_u64_threshold(defaults.scan_p1_degraded_at),
+                false,
+            ),
+            threshold_actions: Self::field(
+                window,
+                cx,
+                &format_u64_threshold(defaults.actions_failed_degraded_at),
+                false,
+            ),
+            threshold_probe_rtt: Self::field(
+                window,
+                cx,
+                &format_rtt_threshold(defaults.http_probe_rtt_degraded_ms),
                 false,
             ),
             threshold_mid: Self::field(
@@ -236,6 +250,18 @@ impl EnvSheet {
                 &format_u64_threshold(env.thresholds.scan_p1_degraded_at),
                 false,
             ),
+            threshold_actions: Self::field(
+                window,
+                cx,
+                &format_u64_threshold(env.thresholds.actions_failed_degraded_at),
+                false,
+            ),
+            threshold_probe_rtt: Self::field(
+                window,
+                cx,
+                &format_rtt_threshold(env.thresholds.http_probe_rtt_degraded_ms),
+                false,
+            ),
             threshold_mid: Self::field(
                 window,
                 cx,
@@ -289,9 +315,9 @@ impl EnvSheet {
         }
     }
 
-    /// Parses the fifteen threshold fields into effective values. Empty means
-    /// default; `jobs_error`, `email`, `updates`, `rtt` and `txn` also accept
-    /// `off`.
+    /// Parses the seventeen threshold fields into effective values. Empty means
+    /// default; `jobs_error`, `email`, `updates`, `rtt`, `txn` and `probe_rtt`
+    /// also accept `off`.
     pub fn thresholds_result(&self, cx: &App) -> Result<Thresholds, String> {
         parse_thresholds(&ThresholdTexts {
             jobs_overdue: self.threshold_jobs_overdue.read(cx).value().to_string(),
@@ -304,6 +330,8 @@ impl EnvSheet {
             txn: self.threshold_txn.read(cx).value().to_string(),
             updates: self.threshold_updates.read(cx).value().to_string(),
             scan: self.threshold_scan.read(cx).value().to_string(),
+            actions: self.threshold_actions.read(cx).value().to_string(),
+            probe_rtt: self.threshold_probe_rtt.read(cx).value().to_string(),
             mid: self.threshold_mid.read(cx).value().to_string(),
             ecc_error: self.threshold_ecc_error.read(cx).value().to_string(),
             ecc_queue: self.threshold_ecc_queue.read(cx).value().to_string(),
@@ -361,6 +389,21 @@ pub fn format_rtt_threshold(value: Option<u64>) -> String {
     value.map(|ms| ms.to_string()).unwrap_or_default()
 }
 
+/// Parses an ms-ceiling field. Empty and `off` mean unset (never votes).
+fn parse_rtt_field(caption: &str, text: &str) -> Result<Option<u64>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
+        Ok(None)
+    } else {
+        Some(
+            trimmed
+                .parse::<u64>()
+                .map_err(|_| format!("{caption} must be a whole number of ms, off, or empty")),
+        )
+        .transpose()
+    }
+}
+
 fn parse_count_field(
     caption: &'static str,
     text: &str,
@@ -382,8 +425,8 @@ fn parse_count_field(
         .map_err(|_| format!("{caption} must be a whole number or empty"))
 }
 
-/// The fifteen threshold fields as edited text. One struct instead of
-/// fifteen positional arguments.
+/// The seventeen threshold fields as edited text. One struct instead of
+/// seventeen positional arguments.
 pub struct ThresholdTexts {
     pub jobs_overdue: String,
     pub jobs_error: String,
@@ -395,6 +438,8 @@ pub struct ThresholdTexts {
     pub txn: String,
     pub updates: String,
     pub scan: String,
+    pub actions: String,
+    pub probe_rtt: String,
     pub mid: String,
     pub ecc_error: String,
     pub ecc_queue: String,
@@ -416,6 +461,8 @@ impl ThresholdTexts {
             txn: String::new(),
             updates: String::new(),
             scan: String::new(),
+            actions: String::new(),
+            probe_rtt: String::new(),
             mid: String::new(),
             ecc_error: String::new(),
             ecc_queue: String::new(),
@@ -425,32 +472,14 @@ impl ThresholdTexts {
     }
 }
 
-/// Parses the fifteen threshold fields. Empty means default; `jobs_error`,
-/// `email`, `updates`, `rtt` and `txn` also accept `off` (never vote).
+/// Parses the seventeen threshold fields. Empty means default; `jobs_error`,
+/// `email`, `updates`, `rtt`, `txn` and `probe_rtt` also accept `off`
+/// (never vote).
 pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
     let defaults = Thresholds::default();
-    let rtt_trimmed = texts.rtt.trim();
-    let availability_rtt_degraded_ms =
-        if rtt_trimmed.is_empty() || rtt_trimmed.eq_ignore_ascii_case("off") {
-            None
-        } else {
-            Some(
-                rtt_trimmed
-                    .parse::<u64>()
-                    .map_err(|_| "RTT ceiling must be a whole number of ms, off, or empty")?,
-            )
-        };
-    let txn_trimmed = texts.txn.trim();
-    let transaction_avg_degraded_ms =
-        if txn_trimmed.is_empty() || txn_trimmed.eq_ignore_ascii_case("off") {
-            None
-        } else {
-            Some(
-                txn_trimmed.parse::<u64>().map_err(
-                    |_| "Transaction average must be a whole number of ms, off, or empty",
-                )?,
-            )
-        };
+    let availability_rtt_degraded_ms = parse_rtt_field("RTT ceiling", &texts.rtt)?;
+    let transaction_avg_degraded_ms = parse_rtt_field("Transaction average", &texts.txn)?;
+    let http_probe_rtt_degraded_ms = parse_rtt_field("Probe RTT ceiling", &texts.probe_rtt)?;
     Ok(Thresholds {
         jobs_overdue_degraded_at: parse_count_field(
             "Jobs overdue",
@@ -506,6 +535,12 @@ pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
             defaults.scan_p1_degraded_at,
             None,
         )?,
+        actions_failed_degraded_at: parse_count_field(
+            "Failed Actions runs",
+            &texts.actions,
+            defaults.actions_failed_degraded_at,
+            None,
+        )?,
         mid_unhealthy_degraded_at: parse_count_field(
             "Unhealthy MIDs",
             &texts.mid,
@@ -532,6 +567,7 @@ pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
         )?,
         availability_rtt_degraded_ms,
         transaction_avg_degraded_ms,
+        http_probe_rtt_degraded_ms,
     })
 }
 
@@ -596,6 +632,10 @@ pub fn build_config(
         auth_method,
         sort_order,
         clone_source,
+        // The sheet has no platform picker (v1): edits keep the stored
+        // platform, new Environments start as ServiceNow. Other platforms
+        // are hand-declared in environments.json (see docs/platforms.md).
+        platform: existing.map(|env| env.platform).unwrap_or_default(),
         thresholds: existing
             .map(|env| env.thresholds.clone())
             .unwrap_or_default(),
@@ -718,6 +758,8 @@ mod tests {
             txn: "250".into(),
             updates: "4".into(),
             scan: "2".into(),
+            actions: "2".into(),
+            probe_rtt: "300".into(),
             mid: "3".into(),
             ecc_error: "2".into(),
             ecc_queue: "500".into(),
@@ -734,6 +776,8 @@ mod tests {
         assert_eq!(parsed.transaction_avg_degraded_ms, Some(250));
         assert_eq!(parsed.update_sets_open_degraded_at, 4);
         assert_eq!(parsed.scan_p1_degraded_at, 2);
+        assert_eq!(parsed.actions_failed_degraded_at, 2);
+        assert_eq!(parsed.http_probe_rtt_degraded_ms, Some(300));
         assert_eq!(parsed.availability_rtt_degraded_ms, None);
         let rtt = ThresholdTexts {
             rtt: "500".into(),
@@ -778,6 +822,8 @@ mod tests {
             txn: format_rtt_threshold(tuned.transaction_avg_degraded_ms),
             updates: format_u64_threshold(tuned.update_sets_open_degraded_at),
             scan: format_u64_threshold(tuned.scan_p1_degraded_at),
+            actions: format_u64_threshold(tuned.actions_failed_degraded_at),
+            probe_rtt: format_rtt_threshold(tuned.http_probe_rtt_degraded_ms),
             mid: format_u64_threshold(tuned.mid_unhealthy_degraded_at),
             ecc_error: format_u64_threshold(tuned.ecc_error_degraded_at),
             ecc_queue: format_u64_threshold(tuned.ecc_output_ready_degraded_at),

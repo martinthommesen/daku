@@ -10,7 +10,7 @@ pub mod theme;
 mod protocol;
 
 pub use environment::{
-    AuthMethod, EnvironmentConfig, NON_VOTING_SIGNALS, Thresholds, validate_credential,
+    AuthMethod, EnvironmentConfig, NON_VOTING_SIGNALS, Platform, Thresholds, validate_credential,
 };
 pub use protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,

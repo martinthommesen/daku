@@ -104,7 +104,8 @@ fn first_label(host: &str) -> &str {
 /// `YYYY-MM-DD HH:MM:SS`. Shared with the upgrade-history Signal, which ages
 /// `upgrade_finished` the same way.
 pub(crate) fn age_days(completed: &str, observed_at: i64) -> Option<i64> {
-    let mut parts = completed.split(' ').next()?.split('-');
+    let date = completed.split(' ').next()?.split('T').next()?;
+    let mut parts = date.split('-');
     let year = parts.next()?.parse::<i64>().ok()?;
     let month = parts.next()?.parse::<i64>().ok()?;
     let day = parts.next()?.parse::<i64>().ok()?;
@@ -379,7 +380,9 @@ mod tests {
     use std::sync::Arc;
 
     use crate::collector::SignalCollector;
-    use crate::config::{AuthMethod, EnvironmentConfig, MemoryCredentialStore, Thresholds};
+    use crate::config::{
+        AuthMethod, EnvironmentConfig, MemoryCredentialStore, Platform, Thresholds,
+    };
     use crate::persistence::{self, StateStore};
     use crate::servicenow::{
         HttpRequest, HttpResponse, HttpTransport, ServiceNowClient, SystemClock,
@@ -462,6 +465,9 @@ mod tests {
         let observed_at = days_from_civil(2026, 1, 27) * 86_400 + 3_600;
         assert_eq!(age_days("2026-01-15 12:00:00", observed_at), Some(12));
         assert_eq!(age_days("2026-01-27 23:00:00", observed_at), Some(0));
+        // ISO-8601 timestamps (GitHub API) age by the same date part.
+        assert_eq!(age_days("2026-01-27T00:12:00Z", observed_at), Some(0));
+        assert_eq!(age_days("2026-01-15T00:12:00Z", observed_at), Some(12));
         // A source clock ahead of the daemon must not render a negative age.
         assert_eq!(age_days("2026-02-01 00:00:00", observed_at), Some(0));
         assert_eq!(age_days("not a date", observed_at), None);
@@ -515,6 +521,7 @@ mod tests {
             auth_method: AuthMethod::Basic,
             sort_order: if clone_source { 0 } else { 1 },
             clone_source,
+            platform: Platform::Servicenow,
             thresholds: Thresholds::default(),
             expected_drift: Vec::new(),
         }

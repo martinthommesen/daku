@@ -109,7 +109,7 @@ pub fn publish_dashboard(
                 id: environment.id.clone(),
                 label: environment.label.clone(),
                 instance_url: environment.instance_url.clone(),
-                platform_id: SERVICENOW_PLATFORM_ID.into(),
+                platform_id: environment.platform.id().into(),
                 health,
                 reachability,
                 last_observed_at: env_snaps.iter().map(|snapshot| snapshot.observed_at).max(),

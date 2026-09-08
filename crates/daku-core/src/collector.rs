@@ -12,11 +12,13 @@ use daku_protocol::{Reachability, ServerMessage, SignalState};
 use rusqlite::Connection;
 
 use crate::availability::{AvailabilityCollector, REACHABILITY_REUSE_SECS, recent_reachability};
-use crate::config::{CredentialStore, EnvironmentConfig, load_environments};
+use crate::config::{CredentialStore, EnvironmentConfig, Platform, load_environments};
 use crate::drift::DriftCollector;
 use crate::email::EmailCollector;
 use crate::flow::FlowCollector;
+use crate::github::ActionsCollector;
 use crate::health::publish_dashboard;
+use crate::http_probe::HttpProbeCollector;
 use crate::jobs::JobsCollector;
 use crate::last_clone::LastCloneCollector;
 use crate::mid_ecc::MidEccCollector;
@@ -365,100 +367,125 @@ pub fn build_default_loop(
     let mut loop_ = CollectorLoop::new(interval);
     for environment in &environments {
         let one = vec![environment.clone()];
-        loop_.register_group(vec![
-            Box::new(AvailabilityCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(JobsCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(SyslogCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(MidEccCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(OutboundCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(FlowCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(EmailCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(UpgradeCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(SessionsCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(TableGrowthCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(TransactionCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(UpdateSetsCollector::new(
-                one.clone(),
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            )),
-            Box::new(ScanCollector::new(
+        match environment.platform {
+            Platform::Servicenow => loop_.register_group(vec![
+                Box::new(AvailabilityCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(JobsCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(SyslogCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(MidEccCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(OutboundCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(FlowCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(EmailCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(UpgradeCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(SessionsCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(TableGrowthCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(TransactionCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(UpdateSetsCollector::new(
+                    one.clone(),
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+                Box::new(ScanCollector::new(
+                    one,
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                )),
+            ]),
+            // Other platforms register only their own probe: no ServiceNow
+            // semantics, no availability gating, no shared collectors.
+            Platform::Http => loop_.register_group(vec![Box::new(HttpProbeCollector::new(
                 one,
                 credentials.clone(),
                 client.clone(),
                 store.clone(),
-            )),
-        ]);
+            ))]),
+            Platform::Github => loop_.register_group(vec![Box::new(ActionsCollector::new(
+                one,
+                credentials.clone(),
+                client.clone(),
+                store.clone(),
+            ))]),
+        }
     }
-    loop_.register(DriftCollector::new(
-        environments.clone(),
-        credentials.clone(),
-        client.clone(),
-        store.clone(),
-        interval,
-    ));
-    loop_.register(LastCloneCollector::new(
-        environments,
-        credentials,
-        client,
-        store,
-    ));
+    // Drift and last-clone compare ServiceNow Environments against their
+    // clone source; other platforms never join that comparison.
+    let servicenow: Vec<EnvironmentConfig> = environments
+        .iter()
+        .filter(|environment| environment.platform == Platform::Servicenow)
+        .cloned()
+        .collect();
+    if !servicenow.is_empty() {
+        loop_.register(DriftCollector::new(
+            servicenow.clone(),
+            credentials.clone(),
+            client.clone(),
+            store.clone(),
+            interval,
+        ));
+        loop_.register(LastCloneCollector::new(
+            servicenow,
+            credentials,
+            client,
+            store,
+        ));
+    }
     loop_
 }
 
@@ -575,6 +602,7 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 pub struct DoctorRow {
     pub id: String,
     pub label: String,
+    pub platform: String,
     pub credential_present: bool,
     pub credential_error: Option<String>,
     pub reachability: &'static str,
@@ -623,10 +651,27 @@ pub fn run_doctor(
                 Ok(None) => (false, None),
                 Err(error) => (false, Some(error.to_string())),
             };
-            let observation = probe.probe(environment);
+            let observation = match environment.platform {
+                // Each platform probes its own way; the row shape stays one
+                // line per Environment either way.
+                Platform::Servicenow => probe.probe(environment),
+                Platform::Http => crate::availability::observe_probe_signal(
+                    &crate::http_probe::HttpProbeSignal,
+                    probe.client(),
+                    probe.credentials(),
+                    environment,
+                ),
+                Platform::Github => crate::availability::observe_probe_signal(
+                    &crate::github::ActionsSignal,
+                    probe.client(),
+                    probe.credentials(),
+                    environment,
+                ),
+            };
             DoctorRow {
                 id: environment.id.clone(),
                 label: environment.label.clone(),
+                platform: environment.platform.id().to_owned(),
                 credential_present,
                 credential_error,
                 reachability: observation.reachability.as_str(),
@@ -976,6 +1021,47 @@ mod tests {
         assert_eq!(loop_.groups.len(), 2);
         assert_eq!(loop_.groups[0].len(), 13);
         assert_eq!(loop_.shared.len(), 2, "drift and last-clone stay shared");
+    }
+
+    #[test]
+    fn build_default_loop_dispatches_other_platforms_to_their_probes() {
+        let db = TempDb::new("groups-platforms");
+        let mut probe = prod();
+        probe.id = "status".into();
+        probe.platform = Platform::Http;
+        let mut repo = prod();
+        repo.id = "repo".into();
+        repo.platform = Platform::Github;
+        let loop_ = build_default_loop(
+            vec![prod(), probe, repo],
+            Arc::new(MemoryCredentialStore::default()),
+            db.store(),
+            Duration::from_secs(120),
+            ServiceNowClient::new(FixtureTransport, SystemClock),
+        );
+        assert_eq!(loop_.groups.len(), 3);
+        assert_eq!(loop_.groups[0].len(), 13, "servicenow keeps every Signal");
+        assert_eq!(loop_.groups[1].len(), 1, "http registers only its probe");
+        assert_eq!(loop_.groups[2].len(), 1, "github registers only actions");
+        // Shared collectors follow the ServiceNow subset only.
+        assert_eq!(loop_.shared.len(), 2);
+    }
+
+    #[test]
+    fn build_default_loop_without_servicenow_registers_no_shared_collectors() {
+        let db = TempDb::new("groups-no-snow");
+        let mut probe = prod();
+        probe.id = "status".into();
+        probe.platform = Platform::Http;
+        let loop_ = build_default_loop(
+            vec![probe],
+            Arc::new(MemoryCredentialStore::default()),
+            db.store(),
+            Duration::from_secs(120),
+            ServiceNowClient::new(FixtureTransport, SystemClock),
+        );
+        assert_eq!(loop_.groups.len(), 1);
+        assert!(loop_.shared.is_empty());
     }
 
     enum Behaviour {
