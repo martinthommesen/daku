@@ -24,6 +24,7 @@ pub mod table_growth;
 pub mod transaction;
 pub mod update_sets;
 pub mod upgrade;
+pub mod webhook;
 
 mod server;
 

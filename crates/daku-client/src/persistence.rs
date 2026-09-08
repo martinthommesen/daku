@@ -17,6 +17,29 @@ fn default_notifications_on() -> bool {
     true
 }
 
+/// Quiet hours in local time: notifications that would fire with a local
+/// hour in `[start_hour, end_hour)` stay silent. Wraps midnight (`22..7`
+/// quiets 22:00–06:59). Out-of-range hours read as unset — a hand-edited
+/// `app.json` can never silence everything by typo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct QuietHours {
+    pub start_hour: u8,
+    pub end_hour: u8,
+}
+
+impl QuietHours {
+    pub fn contains(&self, hour: u8) -> bool {
+        if self.start_hour > 23 || self.end_hour > 23 {
+            return false;
+        }
+        if self.start_hour <= self.end_hour {
+            (self.start_hour..self.end_hour).contains(&hour)
+        } else {
+            hour >= self.start_hour || hour < self.end_hour
+        }
+    }
+}
+
 /// Desktop-owned preferences (`app.json`). The daemon owns `settings.json`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -30,6 +53,11 @@ pub struct AppSettings {
     /// per-Environment when this is on.
     #[serde(default = "default_notifications_on")]
     pub notifications_enabled: bool,
+    /// Per-signal notification switches: signal id → enabled. Absent reads
+    /// as on, so a new Signal notifies until the Operator mutes it.
+    pub notify_signals: HashMap<String, bool>,
+    /// Quiet hours; `None` (the default) notifies around the clock.
+    pub quiet_hours: Option<QuietHours>,
 }
 
 impl Default for AppSettings {
@@ -38,6 +66,8 @@ impl Default for AppSettings {
             daemon_exposure: DaemonExposureSettings::default(),
             mutes: HashMap::new(),
             notifications_enabled: true,
+            notify_signals: HashMap::new(),
+            quiet_hours: None,
         }
     }
 }
@@ -49,6 +79,19 @@ impl AppSettings {
         self.mutes
             .get(environment_id)
             .is_some_and(|until| now < *until)
+    }
+
+    /// Per-signal switch; absent reads as on.
+    pub fn signal_notify_enabled(&self, signal_id: &str) -> bool {
+        self.notify_signals.get(signal_id).copied().unwrap_or(true)
+    }
+
+    pub fn set_signal_notify(&mut self, signal_id: &str, enabled: bool) {
+        if enabled {
+            self.notify_signals.remove(signal_id);
+        } else {
+            self.notify_signals.insert(signal_id.to_owned(), false);
+        }
     }
 
     pub fn mute_until(&mut self, environment_id: &str, until: i64) {
@@ -244,6 +287,53 @@ mod tests {
         settings.prune_mutes(400);
         assert!(!settings.is_muted("test", 400));
         assert!(settings.mutes.is_empty());
+    }
+
+    #[test]
+    fn signal_switches_default_on_and_store_only_off() {
+        let mut settings = AppSettings::default();
+        assert!(settings.signal_notify_enabled("jobs"));
+        settings.set_signal_notify("jobs", false);
+        assert!(!settings.signal_notify_enabled("jobs"));
+        assert!(settings.signal_notify_enabled("syslog"));
+        // Re-enabling removes the entry: absent reads as on.
+        settings.set_signal_notify("jobs", true);
+        assert!(settings.signal_notify_enabled("jobs"));
+        assert!(!settings.notify_signals.contains_key("jobs"));
+    }
+
+    #[test]
+    fn quiet_hours_and_switches_round_trip() {
+        let settings_file = TempSettings::new();
+        let path = settings_file.path();
+        let mut settings = load_or_create_app_settings_at(path).unwrap();
+        settings.set_signal_notify("syslog", false);
+        settings.quiet_hours = Some(QuietHours {
+            start_hour: 22,
+            end_hour: 7,
+        });
+        save_app_settings_at(path, &settings).unwrap();
+        let reloaded = load_or_create_app_settings_at(path).unwrap();
+        assert!(!reloaded.signal_notify_enabled("syslog"));
+        assert!(reloaded.signal_notify_enabled("jobs"));
+        assert_eq!(
+            reloaded.quiet_hours,
+            Some(QuietHours {
+                start_hour: 22,
+                end_hour: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_settings_default_to_notify_all_day() {
+        let settings_file = TempSettings::new();
+        let path = settings_file.path();
+        fs::write(path, r#"{"daemon_exposure":{"token":"abc"}}"#).unwrap();
+        let settings = load_or_create_app_settings_at(path).unwrap();
+        assert!(settings.notify_signals.is_empty());
+        assert!(settings.signal_notify_enabled("scan"));
+        assert_eq!(settings.quiet_hours, None);
     }
 
     #[test]

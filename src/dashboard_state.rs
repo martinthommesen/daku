@@ -1263,9 +1263,15 @@ impl DashboardState {
     /// is its own pill), or unobserved. Shares `NON_VOTING_SIGNALS` with the
     /// daemon rollup so it never names a Signal that did not vote.
     pub fn health_explain(&self) -> Vec<String> {
-        let Some(environment_id) = self.selected_id.as_deref() else {
-            return Vec::new();
-        };
+        self.selected_id
+            .as_deref()
+            .map(|env_id| self.health_explain_for(env_id))
+            .unwrap_or_default()
+    }
+
+    /// Same lines for any Environment id. Notifications use this: the
+    /// firing Environment is not necessarily the selected one.
+    pub fn health_explain_for(&self, environment_id: &str) -> Vec<String> {
         let Some(snapshots) = self.snapshots.get(environment_id) else {
             return Vec::new();
         };
@@ -1420,6 +1426,20 @@ impl DashboardState {
             return Some((environment.health, line));
         }
         None
+    }
+
+    /// Id of the worst degraded/down Signal for one Environment, in the same
+    /// `SIGNAL_IDS` order `headline_for` uses. Drives the per-signal
+    /// notification switch: the banner posts only when this Signal is
+    /// enabled.
+    pub fn worst_signal_id(&self, env_id: &str) -> Option<&'static str> {
+        let snapshots = self.snapshots.get(env_id)?;
+        SIGNAL_IDS.iter().find_map(|signal_id| {
+            snapshots
+                .get(*signal_id)
+                .filter(|snapshot| matches!(snapshot.dto.state.as_str(), "degraded" | "down"))?;
+            Some(*signal_id)
+        })
     }
 
     /// One-line diagnostic for the selected Environment's Signal: the daemon's
@@ -2516,6 +2536,16 @@ mod tests {
         // 48 h + 1 s after the build event: outside the window.
         let stale = loaded();
         assert_eq!(stale.correlation_build(1_699_913_600 + 48 * 3600 + 1), None);
+    }
+
+    #[test]
+    fn worst_signal_id_matches_headline_order() {
+        let state = loaded();
+        // Prod's first degraded Signal in SIGNAL_IDS order is jobs.
+        assert_eq!(state.worst_signal_id("prod"), Some("jobs"));
+        // Test's first degraded Signal is MID/ECC (jobs/syslog read zero).
+        assert_eq!(state.worst_signal_id("test"), Some("mid_ecc"));
+        assert_eq!(state.worst_signal_id("nope"), None);
     }
 
     /// Monday 2026-01-05 09:00 UTC. Synthetic samples + rollups for one

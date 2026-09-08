@@ -30,7 +30,9 @@ use crate::DetachSelectedEnvironment;
 use crate::ReloadDaemon;
 use crate::SelectEnvironment;
 use crate::SelectEnvironmentSlot;
+use crate::SetQuietHours;
 use crate::ToggleNotifications;
+use crate::ToggleSignalNotify;
 use crate::dashboard_state::{
     DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase,
     fixture_events, format_health_event, freshness, is_trend_signal, mute_remaining_label,
@@ -38,7 +40,7 @@ use crate::dashboard_state::{
 };
 use crate::env_sheet::{EnvSheet, auth_label, build_config, credential_blob, credential_captions};
 use crate::notifications::{
-    notification_body, notification_title, post_health_notification, select_notification,
+    notification_body_grouped, notification_title, post_health_notification, select_notification,
 };
 use crate::persistence::{AppSettings, save_app_settings};
 
@@ -154,6 +156,24 @@ impl Daku {
         }
     }
 
+    /// Rebuilds the app menus so notification checkmarks render current
+    /// prefs. Called after every prefs toggle; a poisoned lock keeps the
+    /// previous menus rather than clearing them.
+    fn refresh_menus(&self, cx: &mut App) {
+        let updater_available = cx.global::<crate::updater::UpdaterState>().0.is_some();
+        if let Ok(settings) = self.settings.lock() {
+            crate::set_app_menus_with_prefs(
+                cx,
+                updater_available,
+                &crate::NotifyMenuPrefs {
+                    master: settings.notifications_enabled,
+                    signals: settings.notify_signals.clone(),
+                    quiet: settings.quiet_hours,
+                },
+            );
+        }
+    }
+
     /// Re-reads the shared desktop preferences into this window's state.
     /// Windows share one `Arc<Mutex<AppSettings>>`, so a mute set in one
     /// window appears in the other on its next render or freshness tick.
@@ -165,8 +185,9 @@ impl Daku {
 
     /// Decides on one batch of published health events: records everything
     /// seen, posts at most the latest novel transition. Pre-boot history,
-    /// replays, muted Environments and the global off switch stay silent.
-    /// Detached windows never post: the main window owns notifications.
+    /// replays, muted Environments, disabled Signals, quiet hours and the
+    /// global off switch stay silent. Detached windows never post: the main
+    /// window owns notifications.
     fn note_health_events(&mut self, env_id: &str, events: &[HealthEventDto]) {
         if self.detached.is_some() {
             return;
@@ -174,15 +195,26 @@ impl Daku {
         let (record, fire) = select_notification(env_id, events, &self.notify_seen, self.boot_now);
         self.notify_seen.extend(record);
         let Some(event) = fire else { return };
-        let notifications_enabled = self
-            .settings
-            .lock()
-            .map(|settings| settings.notifications_enabled)
-            .unwrap_or(true);
-        if !notifications_enabled {
+        let now = unix_now();
+        // One locked read; a poisoned lock fails safe to silent.
+        let prefs = self.settings.lock().map(|settings| {
+            (
+                settings.notifications_enabled,
+                settings.notify_signals.clone(),
+                settings.quiet_hours,
+            )
+        });
+        let Ok((master, notify_signals, quiet_hours)) = prefs else {
             return;
-        }
-        if self.state.is_muted(env_id, unix_now()) {
+        };
+        let gate = crate::notifications::NotifyGate {
+            master,
+            muted: self.state.is_muted(env_id, now),
+            headline_signal: self.state.worst_signal_id(env_id),
+            notify_signals: &notify_signals,
+            quiet_hours,
+        };
+        if !crate::notifications::gate_allows(&gate, now) {
             return;
         }
         let label = self
@@ -190,14 +222,18 @@ impl Daku {
             .environment_label(env_id)
             .unwrap_or(env_id)
             .to_owned();
-        let (health, headline) = match self.state.headline_for(env_id) {
-            Some((health, line)) => (health, Some(line)),
-            None => (event.to_health, None),
-        };
+        // Grouped body: every voting Signal, not just the worst line. Falls
+        // back to the event health on recovery (no votes left to name).
+        let health = self
+            .state
+            .headline_for(env_id)
+            .map(|(health, _)| health)
+            .unwrap_or(event.to_health);
+        let lines = self.state.health_explain_for(env_id);
         post_health_notification(
             env_id,
             &notification_title(&label),
-            &notification_body(health, headline.as_deref()),
+            &notification_body_grouped(health, &lines),
         );
     }
 
@@ -781,6 +817,31 @@ impl Render for Daku {
                     settings.notifications_enabled = !settings.notifications_enabled;
                 }
                 this.persist_settings();
+                this.refresh_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, action: &ToggleSignalNotify, _, cx| {
+                if let Ok(mut settings) = this.settings.lock() {
+                    let id = action.signal_id.to_string();
+                    let enabled = !settings.signal_notify_enabled(&id);
+                    settings.set_signal_notify(&id, enabled);
+                }
+                this.persist_settings();
+                this.refresh_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, action: &SetQuietHours, _, cx| {
+                if let Ok(mut settings) = this.settings.lock() {
+                    settings.quiet_hours = match (action.start_hour, action.end_hour) {
+                        (Some(start), Some(end)) => Some(crate::persistence::QuietHours {
+                            start_hour: start,
+                            end_hour: end,
+                        }),
+                        _ => None,
+                    };
+                }
+                this.persist_settings();
+                this.refresh_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &AddEnvironment, window, cx| {

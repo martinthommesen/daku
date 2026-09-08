@@ -14,9 +14,11 @@
 //! - Muted Environments stay silent, and the whole surface switches off via
 //!   `AppSettings::notifications_enabled`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use daku_protocol::{EnvironmentHealth, HealthEventDto, HealthEventKind};
+
+use crate::persistence::QuietHours;
 
 /// Seen key: (environment id, event time, kind).
 pub type SeenKey = (String, i64, String);
@@ -64,6 +66,65 @@ pub fn notification_body(health: EnvironmentHealth, headline: Option<&str>) -> S
         Some(line) => format!("{word}: {line}"),
         None => format!("back to {word}"),
     }
+}
+
+/// Grouped body over up to three explainer lines: the health word plus every
+/// voting Signal, so one banner carries the whole story instead of just the
+/// worst line. Empty lines read as recovery.
+pub fn notification_body_grouped(health: EnvironmentHealth, lines: &[String]) -> String {
+    let lines: Vec<&str> = lines.iter().take(3).map(String::as_str).collect();
+    match lines.as_slice() {
+        [] => notification_body(health, None),
+        [single] => notification_body(health, Some(single)),
+        _ => {
+            let word = match health {
+                EnvironmentHealth::Healthy => "healthy",
+                EnvironmentHealth::Degraded => "degraded",
+                EnvironmentHealth::Down => "down",
+            };
+            format!("{word}: {}", lines.join("; "))
+        }
+    }
+}
+
+/// Local hour (0–23) of a unix timestamp, system timezone. Falls back to 0
+/// when the value is out of range for the platform clock.
+pub fn local_hour(unix_secs: i64) -> u8 {
+    let timestamp = unix_secs as libc::time_t;
+    let mut broken: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { !libc::localtime_r(&timestamp, &mut broken).is_null() };
+    if !ok {
+        return 0;
+    }
+    broken.tm_hour.clamp(0, 23) as u8
+}
+
+/// One gating decision for a fireable transition: master switch, mute,
+/// headline-signal switch, and quiet hours must all allow it.
+pub struct NotifyGate<'a> {
+    pub master: bool,
+    pub muted: bool,
+    pub headline_signal: Option<&'a str>,
+    pub notify_signals: &'a HashMap<String, bool>,
+    pub quiet_hours: Option<QuietHours>,
+}
+
+pub fn gate_allows(gate: &NotifyGate<'_>, now: i64) -> bool {
+    if !gate.master || gate.muted {
+        return false;
+    }
+    if let Some(signal_id) = gate.headline_signal
+        && !gate.notify_signals.get(signal_id).copied().unwrap_or(true)
+    {
+        return false;
+    }
+    if gate
+        .quiet_hours
+        .is_some_and(|window| window.contains(local_hour(now)))
+    {
+        return false;
+    }
+    true
 }
 
 /// Posts a health notification, replacing the Environment's previous one.
@@ -304,5 +365,135 @@ mod tests {
             notification_body(EnvironmentHealth::Healthy, None),
             "back to healthy"
         );
+    }
+
+    #[test]
+    fn grouped_bodies_carry_up_to_three_lines() {
+        assert_eq!(
+            notification_body_grouped(EnvironmentHealth::Healthy, &[]),
+            "back to healthy"
+        );
+        assert_eq!(
+            notification_body_grouped(
+                EnvironmentHealth::Degraded,
+                &["Scheduled jobs: 2 overdue".to_owned()]
+            ),
+            "degraded: Scheduled jobs: 2 overdue"
+        );
+        assert_eq!(
+            notification_body_grouped(
+                EnvironmentHealth::Degraded,
+                &[
+                    "Scheduled jobs: 2 overdue".to_owned(),
+                    "Syslog errors: 4 errors".to_owned(),
+                    "Outbound: 3 failures".to_owned(),
+                    "Flow errors: 1 error".to_owned(),
+                ]
+            ),
+            "degraded: Scheduled jobs: 2 overdue; Syslog errors: 4 errors; Outbound: 3 failures"
+        );
+    }
+
+    static TZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `body` with `TZ` set, restored afterwards. Serialised: the
+    /// timezone is process-global. Both platform clocks re-read `TZ` on
+    /// every `localtime` call, so no `tzset` binding is needed.
+    fn with_tz(name: &str, body: impl FnOnce()) {
+        let _guard = TZ_LOCK.lock().expect("tz lock");
+        let previous = std::env::var("TZ").ok();
+        // SAFETY: serialised by TZ_LOCK; restored before returning.
+        unsafe {
+            std::env::set_var("TZ", name);
+        }
+        body();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("TZ", value),
+                None => std::env::remove_var("TZ"),
+            }
+        }
+    }
+
+    #[test]
+    fn local_hour_follows_the_system_timezone() {
+        // 1970-01-01 00:00 UTC.
+        with_tz("UTC", || assert_eq!(local_hour(0), 0));
+        with_tz("America/New_York", || assert_eq!(local_hour(0), 19));
+    }
+
+    #[test]
+    fn quiet_hours_wrap_midnight_and_reject_garbage() {
+        use crate::persistence::QuietHours;
+        let nights = QuietHours {
+            start_hour: 22,
+            end_hour: 7,
+        };
+        assert!(nights.contains(22));
+        assert!(nights.contains(3));
+        assert!(!nights.contains(7));
+        assert!(!nights.contains(12));
+        let days = QuietHours {
+            start_hour: 9,
+            end_hour: 17,
+        };
+        assert!(days.contains(9));
+        assert!(!days.contains(17));
+        assert!(!days.contains(8));
+        let garbage = QuietHours {
+            start_hour: 25,
+            end_hour: 7,
+        };
+        assert!(!garbage.contains(3), "out-of-range reads as unset");
+    }
+
+    #[test]
+    fn gate_blocks_master_mute_signal_and_quiet() {
+        use crate::persistence::QuietHours;
+        // 2023-11-14 22:13 UTC; minus 20 h is 02:13 UTC.
+        const NIGHT: i64 = 1_700_000_000;
+        const DAWN: i64 = 1_700_000_000 - 20 * 3600;
+        let allenabled: HashMap<String, bool> = HashMap::new();
+        let mut signals = HashMap::new();
+        signals.insert("jobs".to_owned(), false);
+        fn gate<'a>(
+            muted: bool,
+            headline: Option<&'a str>,
+            map: &'a HashMap<String, bool>,
+            quiet: Option<QuietHours>,
+        ) -> NotifyGate<'a> {
+            NotifyGate {
+                master: true,
+                muted,
+                headline_signal: headline,
+                notify_signals: map,
+                quiet_hours: quiet,
+            }
+        }
+        assert!(gate_allows(&gate(false, None, &allenabled, None), NIGHT));
+        assert!(!gate_allows(
+            &NotifyGate {
+                master: false,
+                ..gate(false, None, &allenabled, None)
+            },
+            NIGHT
+        ));
+        assert!(!gate_allows(&gate(true, None, &allenabled, None), NIGHT));
+        assert!(!gate_allows(
+            &gate(false, Some("jobs"), &signals, None),
+            NIGHT
+        ));
+        assert!(gate_allows(
+            &gate(false, Some("syslog"), &signals, None),
+            NIGHT
+        ));
+        let nights = Some(QuietHours {
+            start_hour: 21,
+            end_hour: 23,
+        });
+        with_tz("UTC", || {
+            assert!(!gate_allows(&gate(false, None, &allenabled, nights), NIGHT));
+            assert!(gate_allows(&gate(false, None, &allenabled, nights), DAWN));
+        });
     }
 }

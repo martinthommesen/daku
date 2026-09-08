@@ -30,6 +30,7 @@ use crate::table_growth::TableGrowthCollector;
 use crate::transaction::TransactionCollector;
 use crate::update_sets::UpdateSetsCollector;
 use crate::upgrade::UpgradeCollector;
+use crate::webhook::WebhookRelay;
 
 pub use daku_protocol::settings::DEFAULT_POLL_INTERVAL_SECS;
 
@@ -507,6 +508,7 @@ pub fn start_default_loop_with_store(
     let (dashboard_tx, dashboard_rx) = unbounded();
     let dashboard_environments = environments.clone();
     let dashboard_store = store.clone();
+    let webhook = std::sync::Arc::new(WebhookRelay::new());
     let loop_ = build_default_loop(
         environments,
         credentials,
@@ -523,6 +525,15 @@ pub fn start_default_loop_with_store(
             now,
         ) {
             eprintln!("daku dashboard publish failed: {error}");
+        }
+        // Fire-and-forget: a slow forwarder must never stall polling.
+        if WebhookRelay::configured_url().is_some() {
+            let relay = webhook.clone();
+            let store = dashboard_store.clone();
+            std::thread::Builder::new()
+                .name("daku-webhook".into())
+                .spawn(move || relay.relay_tick(&store))
+                .ok();
         }
     });
     Some(dashboard_rx)
@@ -670,6 +681,7 @@ mod tests {
         let interval = |secs: u64| {
             poll_interval_secs(&DaemonSettings {
                 poll_interval_secs: secs,
+                webhook_url: None,
             })
         };
         assert_eq!(interval(5), MIN_POLL_INTERVAL_SECS);

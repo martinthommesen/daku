@@ -33,6 +33,24 @@ actions!(
     ]
 );
 
+/// Toggles one Signal's notification switch. The switch lives in
+/// `AppSettings::notify_signals` (absent reads as on); the notify gate
+/// consults the headline Signal, so a muted Signal never fires a banner.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, gpui::Action)]
+#[action(namespace = daku, no_json)]
+pub struct ToggleSignalNotify {
+    pub signal_id: SharedString,
+}
+
+/// Sets quiet hours (`None`/`None` clears). Custom windows beyond the menu
+/// presets are hand-edited in `app.json` and validated on read.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, gpui::Action)]
+#[action(namespace = daku, no_json)]
+pub struct SetQuietHours {
+    pub start_hour: Option<u8>,
+    pub end_hour: Option<u8>,
+}
+
 /// Selects an Environment and optionally opens its drift drill-in. The one
 /// "take me there" primitive: compare-row clicks dispatch it, and the
 /// health-notification (079) and menu-bar (081) clicks will too.
@@ -143,7 +161,16 @@ pub fn run() {
             )
             .expect("failed to open daku window");
 
-            set_app_menus(cx, updater_available);
+            let prefs = settings.lock().map(|locked| NotifyMenuPrefs {
+                master: locked.notifications_enabled,
+                signals: locked.notify_signals.clone(),
+                quiet: locked.quiet_hours,
+            });
+            if let Ok(prefs) = prefs {
+                set_app_menus_with_prefs(cx, updater_available, &prefs);
+            } else {
+                set_app_menus(cx, updater_available);
+            }
         });
 }
 
@@ -209,6 +236,45 @@ pub(crate) fn open_daku_window(
 }
 
 pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
+    set_app_menus_with_prefs(
+        cx,
+        updater_available,
+        &NotifyMenuPrefs {
+            master: true,
+            signals: std::collections::HashMap::new(),
+            quiet: None,
+        },
+    );
+}
+
+/// Menu snapshot of the notification prefs, so checkmarks render current
+/// state. Callers snapshot `AppSettings` under one lock.
+pub(crate) struct NotifyMenuPrefs {
+    pub master: bool,
+    pub signals: std::collections::HashMap<String, bool>,
+    pub quiet: Option<daku_client::persistence::QuietHours>,
+}
+
+pub(crate) fn set_app_menus_with_prefs(
+    cx: &mut App,
+    updater_available: bool,
+    prefs: &NotifyMenuPrefs,
+) {
+    let signal_on = |id: &str| prefs.signals.get(id).copied().unwrap_or(true);
+    let quiet_is = |start: u8, end: u8| {
+        prefs.quiet
+            == Some(daku_client::persistence::QuietHours {
+                start_hour: start,
+                end_hour: end,
+            })
+    };
+    let check = |name: &str, action: Box<dyn gpui::Action>, checked: bool| MenuItem::Action {
+        name: name.into(),
+        action,
+        os_action: None,
+        checked,
+        disabled: false,
+    };
     cx.set_menus(vec![
         Menu {
             name: APP_NAME.into(),
@@ -226,6 +292,46 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
                 items.push(MenuItem::action("Add Environment…", AddEnvironment));
                 items.push(MenuItem::separator());
                 items.push(MenuItem::action(format!("Quit {APP_NAME}"), Quit));
+                items
+            },
+        },
+        Menu {
+            name: "Notifications".into(),
+            disabled: false,
+            items: {
+                let mut items = vec![check(
+                    "Health Notifications",
+                    Box::new(ToggleNotifications),
+                    prefs.master,
+                )];
+                items.push(MenuItem::separator());
+                for signal_id in crate::dashboard_state::SIGNAL_IDS {
+                    let label = crate::dashboard_state::signal_label(signal_id);
+                    items.push(check(
+                        &format!("Notify: {label}"),
+                        Box::new(ToggleSignalNotify {
+                            signal_id: signal_id.into(),
+                        }),
+                        signal_on(signal_id),
+                    ));
+                }
+                items.push(MenuItem::separator());
+                items.push(check(
+                    "Quiet Hours Off",
+                    Box::new(SetQuietHours {
+                        start_hour: None,
+                        end_hour: None,
+                    }),
+                    prefs.quiet.is_none(),
+                ));
+                items.push(check(
+                    "Quiet Hours 22:00–07:00",
+                    Box::new(SetQuietHours {
+                        start_hour: Some(22),
+                        end_hour: Some(7),
+                    }),
+                    quiet_is(22, 7),
+                ));
                 items
             },
         },
