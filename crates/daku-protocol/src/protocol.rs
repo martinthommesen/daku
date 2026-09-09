@@ -237,6 +237,32 @@ pub fn is_supported_instance_url(url: &str) -> bool {
     instance_url_error(url).is_none()
 }
 
+/// Path-safe environment identifier grammar: logical keys that also reach
+/// the filesystem (desktop export) and log names. Conservative on purpose:
+/// ASCII alphanumeric plus `-` and `_`, 1-64 chars. Rejects `/`, `\`, `.`,
+/// whitespace, control characters, Unicode, and empty ids so `../` can
+/// never escape the export root.
+pub fn environment_id_error(id: &str) -> Option<&'static str> {
+    if id.is_empty() {
+        return Some("environment id must not be empty");
+    }
+    if id.len() > 64 {
+        return Some("environment id must be at most 64 characters");
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Some("environment id must use only A-Z, a-z, 0-9, - and _");
+    }
+    None
+}
+
+/// `true` when [`environment_id_error`] finds nothing to complain about.
+pub fn is_supported_environment_id(id: &str) -> bool {
+    environment_id_error(id).is_none()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalSnapshotDto {
@@ -808,5 +834,29 @@ mod tests {
             instance_url_error("https://acme.service-now.com/#f"),
             Some("instance_url must not contain a query or fragment")
         );
+    }
+
+    #[test]
+    fn environment_id_grammar_is_path_safe() {
+        for id in ["prod", "app-ci", "a", "A1-_"] {
+            assert!(is_supported_environment_id(id), "{id}");
+        }
+        for id in [
+            "",
+            "../review-export",
+            "a/b",
+            "a\\b",
+            "a b",
+            "a.b",
+            ".hidden",
+            "é",
+            "a:b",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                environment_id_error(id).is_some(),
+                "{id:?} must be rejected"
+            );
+        }
     }
 }

@@ -40,18 +40,21 @@ fn main() -> anyhow::Result<()> {
     // before any provider or workspace subprocess can inherit the daemon's
     // environment.
     unsafe { std::env::remove_var(DAEMON_TOKEN_ENV) };
+    // Fail closed when no home is resolvable and no explicit override is
+    // present: silently redirecting durable state into the shared system
+    // temporary directory loses databases and confuses support.
+    if std::env::var("DAKU_HOME").is_ok_and(|v| !v.is_empty()) {
+        // Explicit override present; proceed.
+    } else if std::env::var("HOME").is_ok_and(|v| !v.is_empty()) {
+        // Normal home present; proceed.
+    } else {
+        bail!("no home directory found; set DAKU_HOME to a writable directory");
+    }
     ensure_bind_request_allowed(&arguments.bind, arguments.allow_non_loopback)?;
     let listener = TcpListener::bind(&arguments.bind)
         .with_context(|| format!("could not bind daku daemon to {}", arguments.bind))?;
     let address = listener.local_addr()?;
     ensure_bind_allowed(address, arguments.allow_non_loopback)?;
-    let ready = DaemonReady {
-        address: address.to_string(),
-        protocol_version: PROTOCOL_VERSION,
-        pid: std::process::id(),
-    };
-    println!("{}", serde_json::to_string(&ready)?);
-    std::io::stdout().flush()?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     if let Some(parent_pid) = arguments.parent_pid {
@@ -88,6 +91,16 @@ fn main() -> anyhow::Result<()> {
         shutdown.clone(),
         resolve_credential_store(&arguments),
     );
+    // Readiness is announced only after storage, settings, and the collector
+    // are initialized: an early bind line would report ready for a process
+    // that then exits on an unwritable DB or invalid settings.
+    let ready = DaemonReady {
+        address: address.to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        pid: std::process::id(),
+    };
+    println!("{}", serde_json::to_string(&ready)?);
+    std::io::stdout().flush()?;
     daku_core::serve(
         listener,
         auth,

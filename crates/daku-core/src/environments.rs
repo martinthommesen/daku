@@ -118,8 +118,8 @@ impl Backend for EnvironmentsBackend {
 }
 
 fn validate_environment(environment: &EnvironmentConfig) -> anyhow::Result<()> {
-    if environment.id.trim().is_empty() {
-        bail!("environment id must not be empty");
+    if let Some(reason) = daku_protocol::environment_id_error(&environment.id) {
+        bail!("environment id {:?}: {reason}", environment.id);
     }
     if environment.label.trim().is_empty() {
         bail!("environment label must not be empty");
@@ -154,6 +154,13 @@ fn load_or_empty(path: &Path) -> anyhow::Result<Vec<EnvironmentConfig>> {
     }
 }
 
+/// Serializes the full read-modify-write for `environments.json` so two
+/// overlapping saves cannot both read the same old JSON and lose one
+/// update. Atomic replacement alone only protects the final write. The
+/// environments file is a single store path in practice; this coarse lock
+/// is the correct per-store serialization for it.
+static ENV_FILE_OP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Validates and upserts one Environment, optionally rotating its Credential.
 /// Config first, Credential second: a config write failure changes nothing,
 /// and a Credential failure afterwards surfaces with the config already
@@ -166,6 +173,7 @@ pub fn save_environment(
     credentials: &dyn CredentialStore,
     allow_credential_write: bool,
 ) -> anyhow::Result<()> {
+    let _guard = crate::lock_or_poisoned(&ENV_FILE_OP_LOCK);
     validate_environment(environment)?;
     if let Some(blob) = credential_json {
         if !allow_credential_write {
@@ -200,6 +208,7 @@ pub fn delete_environment(
     credentials: &dyn CredentialStore,
     allow_credential_write: bool,
 ) -> anyhow::Result<()> {
+    let _guard = crate::lock_or_poisoned(&ENV_FILE_OP_LOCK);
     if !allow_credential_write {
         bail!("refusing credential delete on a non-loopback daemon");
     }

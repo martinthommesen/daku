@@ -58,6 +58,9 @@ pub fn load_environments(path: &Path) -> anyhow::Result<Vec<EnvironmentConfig>> 
     let mut environments: Vec<EnvironmentConfig> =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
     for environment in &environments {
+        if let Some(reason) = daku_protocol::environment_id_error(&environment.id) {
+            anyhow::bail!("environment id {:?}: {reason}", environment.id);
+        }
         validate_instance_url(&environment.id, &environment.instance_url)?;
         validate_platform_url(environment)?;
     }
@@ -237,6 +240,8 @@ pub struct FileCredentialStore {
     path: PathBuf,
 }
 
+static FILE_CRED_OP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl FileCredentialStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -267,6 +272,10 @@ impl CredentialStore for FileCredentialStore {
     }
 
     fn set(&self, environment_id: &str, secret: &str) -> anyhow::Result<()> {
+        // Serialize the full read-modify-write so two concurrent updates
+        // cannot both read the same old map and lose one entry. Atomic
+        // replacement alone only protects the final write.
+        let _guard = crate::lock_or_poisoned(&FILE_CRED_OP_LOCK);
         let mut map = self.read_map()?;
         map.insert(environment_id.to_owned(), secret.to_owned());
         self.write_map(&map)
@@ -274,6 +283,7 @@ impl CredentialStore for FileCredentialStore {
     }
 
     fn delete(&self, environment_id: &str) -> anyhow::Result<()> {
+        let _guard = crate::lock_or_poisoned(&FILE_CRED_OP_LOCK);
         let mut map = self.read_map()?;
         if map.remove(environment_id).is_none() {
             return Ok(());

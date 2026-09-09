@@ -4,8 +4,8 @@ use daku_protocol::SignalState;
 
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
-use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
-use crate::signal_eval::{evaluate_ge, fetch_table_rows, redact_url, row_text};
+use crate::servicenow::{ServiceNowClient, THROTTLED_DETAIL, fetch_aggregate_count};
+use crate::signal_eval::{evaluate_ge, fetch_table_rows_with_throttle, redact_url, row_text};
 
 pub const OUTBOUND_SIGNAL_ID: &str = "outbound";
 pub const OUTBOUND_HTTP_PATH: &str = "/api/now/stats/sys_outbound_http_log?sysparm_count=true&sysparm_query=http_status>=400^sys_created_on>javascript:gs.hoursAgoStart(1)";
@@ -28,13 +28,14 @@ pub fn outbound_state(outbound_http_4xx_5xx_1h: u64, thresholds: &Thresholds) ->
 }
 
 /// Offending failure rows, newest first. A failed rows request yields no
-/// rows — the count already determined the state.
+/// rows — the count already determined the state. A 429 surfaces as
+/// `throttled`.
 fn fetch_outbound_rows(
     client: &ServiceNowClient,
     environment: &EnvironmentConfig,
     credentials: &dyn CredentialStore,
-) -> (Vec<OutboundRow>, bool) {
-    fetch_table_rows(
+) -> (Vec<OutboundRow>, bool, bool) {
+    let ((rows, truncated), throttled) = fetch_table_rows_with_throttle(
         client,
         environment,
         credentials,
@@ -51,7 +52,8 @@ fn fetch_outbound_rows(
                 sys_created_on: row_text(row, "sys_created_on"),
             })
         },
-    )
+    );
+    (rows, truncated, throttled)
 }
 
 #[derive(Default)]
@@ -73,10 +75,10 @@ impl Signal for OutboundSignal {
         let outbound_http_4xx_5xx_1h =
             fetch_aggregate_count(client, environment, credentials, OUTBOUND_HTTP_PATH)?;
         // Rows only while unhealthy: a zero count costs no extra request.
-        let (failure_rows, failure_rows_truncated) = if outbound_http_4xx_5xx_1h > 0 {
+        let (failure_rows, failure_rows_truncated, throttled) = if outbound_http_4xx_5xx_1h > 0 {
             fetch_outbound_rows(client, environment, credentials)
         } else {
-            (Vec::new(), false)
+            (Vec::new(), false, false)
         };
         Ok(Observation {
             state: outbound_state(outbound_http_4xx_5xx_1h, &environment.thresholds),
@@ -84,6 +86,8 @@ impl Signal for OutboundSignal {
                 "outbound_http_4xx_5xx_1h": outbound_http_4xx_5xx_1h,
                 "failure_rows": failure_rows,
                 "failure_rows_truncated": failure_rows_truncated,
+                "throttled": throttled,
+                "throttled_detail": if throttled { Some(THROTTLED_DETAIL) } else { None },
             }),
             sample: None,
         })

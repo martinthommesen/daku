@@ -190,7 +190,9 @@ impl StateStore {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let environments: Vec<String> = connection
-            .prepare("SELECT DISTINCT environment_id FROM health_events")
+            .prepare(
+                "SELECT environment_id FROM health_events UNION SELECT environment_id FROM signal_events",
+            )
             .and_then(|mut stmt| {
                 stmt.query_map([], |row| row.get(0))?
                     .collect::<Result<_, _>>()
@@ -961,6 +963,18 @@ pub fn record_webhook_dead_letter(
             params![environment_id, observed_at, kind, error],
         )
         .map_err(to_io_error)?;
+    // Bounded retention: keep the newest 500 per environment so a flapping
+    // endpoint cannot grow the table without bound.
+    connection
+        .execute(
+            "DELETE FROM webhook_dead_letters WHERE environment_id = ?1 AND rowid NOT IN (
+                 SELECT rowid FROM webhook_dead_letters
+                 WHERE environment_id = ?1
+                 ORDER BY observed_at DESC, kind DESC LIMIT 500
+             )",
+            params![environment_id],
+        )
+        .map_err(to_io_error)?;
     Ok(())
 }
 
@@ -989,11 +1003,17 @@ pub fn ensure_tick_stats_table(connection: &Connection) -> io::Result<()> {
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS tick_stats (
                 started_at INTEGER NOT NULL,
-                duration_ms INTEGER NOT NULL
+                duration_ms INTEGER NOT NULL,
+                env_count INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS tick_stats_by_time ON tick_stats (started_at);",
         )
         .map_err(to_io_error)?;
+    // Additive migration for pre-existing tables created without env_count.
+    let _ = connection.execute(
+        "ALTER TABLE tick_stats ADD COLUMN env_count INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     Ok(())
 }
 
@@ -1002,11 +1022,20 @@ pub fn record_tick_stat(
     started_at: i64,
     duration_ms: i64,
 ) -> io::Result<()> {
+    record_tick_stat_with_envs(connection, started_at, duration_ms, 0)
+}
+
+pub fn record_tick_stat_with_envs(
+    connection: &Connection,
+    started_at: i64,
+    duration_ms: i64,
+    env_count: i64,
+) -> io::Result<()> {
     ensure_tick_stats_table(connection)?;
     connection
         .execute(
-            "INSERT INTO tick_stats (started_at, duration_ms) VALUES (?1, ?2)",
-            params![started_at, duration_ms],
+            "INSERT INTO tick_stats (started_at, duration_ms, env_count) VALUES (?1, ?2, ?3)",
+            params![started_at, duration_ms, env_count],
         )
         .map_err(to_io_error)?;
     connection

@@ -65,11 +65,17 @@ struct Hub {
 impl Hub {
     /// Broadcasts a dashboard message and remembers it for late subscribers.
     /// Slow-subscriber drops and oversize payloads are logged, never silent.
+    /// Replay never blocks: both live delivery and catch-up use `try_send`
+    /// into the bounded queue, so a reconnect cannot deadlock before its
+    /// read loop drains. Oversize messages are not cached, so one large
+    /// rollup cannot poison every future replay; the next tick republishes
+    /// bounded state.
     fn publish_dashboard(&self, message: ServerMessage) {
         let wire_bytes = serde_json::to_vec(&message).map(|v| v.len()).unwrap_or(0);
-        if wire_bytes > MAX_WIRE_MESSAGE_BYTES {
+        let oversize = wire_bytes > MAX_WIRE_MESSAGE_BYTES;
+        if oversize {
             eprintln!(
-                "daku-daemon publish above wire cap: {} bytes for {:?}; clients will resync",
+                "daku-daemon publish above wire cap: {} bytes for {:?}; dropping from cache, clients keep last bounded state",
                 wire_bytes,
                 message
                     .dashboard_cache_key()
@@ -78,7 +84,7 @@ impl Hub {
             );
         }
         let mut state = self.state.lock();
-        if let Some(key) = message.dashboard_cache_key() {
+        if !oversize && let Some(key) = message.dashboard_cache_key() {
             state.dashboard.insert(key, message.clone());
         }
         // Snapshot senders so the drop counter mutation never aliases the
@@ -121,8 +127,21 @@ impl Hub {
 
     fn subscribe(&self, sender: Sender<ServerMessage>) -> u64 {
         let mut state = self.state.lock();
+        // Non-blocking replay: a subscriber that cannot keep up gets what
+        // fits plus a drop count instead of deadlocking the handshake
+        // before its read loop starts.
+        let mut replay_drops = 0u64;
         for message in state.dashboard.values() {
-            let _ = sender.send(message.clone());
+            if sender.try_send(message.clone()).is_err() {
+                replay_drops = replay_drops.saturating_add(1);
+            }
+        }
+        if replay_drops > 0 {
+            state.dropped = state.dropped.saturating_add(replay_drops);
+            eprintln!(
+                "daku-daemon dropped {replay_drops} replay messages for a slow subscriber (total {})",
+                state.dropped,
+            );
         }
         let id = state.next_subscriber_id;
         state.next_subscriber_id = state.next_subscriber_id.saturating_add(1);
@@ -501,5 +520,21 @@ mod tests {
             environments: vec![],
         });
         assert!(hub.state.lock().subscribers.is_empty());
+    }
+
+    #[test]
+    fn hub_replay_never_blocks_on_a_full_queue() {
+        let hub = Hub::default();
+        // Fill the cache beyond the subscriber bound with distinct keys.
+        for i in 0..(SUBSCRIBER_QUEUE_BOUND + 16) {
+            hub.publish_dashboard(ServerMessage::SignalSnapshotsUpdated {
+                environment_id: format!("env-{i}"),
+                snapshots: vec![],
+            });
+        }
+        let (tx, _rx) = bounded::<ServerMessage>(1);
+        // Must return without blocking even though replay exceeds capacity.
+        hub.subscribe(tx);
+        assert!(hub.state.lock().dropped >= 1);
     }
 }

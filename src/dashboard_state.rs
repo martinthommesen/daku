@@ -291,11 +291,46 @@ pub struct CompareRow {
     pub last_clone: String,
 }
 
+/// Trend values with explicit gaps from timestamped samples. Samples with
+/// no value are skipped; a time gap over ten minutes without an observation
+/// inserts `None` so the renderer breaks the line instead of connecting
+/// across an unobserved interval. Ten minutes is five missed polls at the
+/// default 120 s cadence; once the daemon publishes its effective cadence
+/// (UX-003 follow-up) this derives from it instead of the constant.
+pub const SPARKLINE_GAP_THRESHOLD_SECS: i64 = 600;
+
+/// Trend values with explicit gaps from timestamped samples. Samples with
+/// no value are skipped; a time gap exceeding
+/// [`SPARKLINE_GAP_THRESHOLD_SECS`] inserts `None` so the renderer breaks
+/// the line instead of connecting across an unobserved interval.
+pub fn sparkline_with_gaps(points: &[daku_protocol::SamplePoint]) -> Vec<Option<f64>> {
+    let mut ordered: Vec<&daku_protocol::SamplePoint> = points.iter().collect();
+    ordered.sort_by_key(|p| p.observed_at);
+    let mut out = Vec::new();
+    let mut prev_at: Option<i64> = None;
+    for point in ordered {
+        if let Some(prev) = prev_at
+            && point.observed_at.saturating_sub(prev) > SPARKLINE_GAP_THRESHOLD_SECS
+            && !out.is_empty()
+        {
+            out.push(None);
+        }
+        if let Some(value) = point.value_real {
+            out.push(Some(value));
+        }
+        prev_at = Some(point.observed_at);
+    }
+    out
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SignalCard {
     pub signal_id: &'static str,
     pub status: String,
-    pub sparkline: Vec<f64>,
+    /// Trend values with explicit gaps: `Some(v)` for an observation,
+    /// `None` where the time gap exceeds the expected cadence so the
+    /// renderer breaks the line instead of connecting missing intervals.
+    pub sparkline: Vec<Option<f64>>,
     /// Disconnected: the status colour is stale, so the Environment detail
     /// paints it grey. Unlike `dimmed` this never covers an Operator mute.
     pub dimmed: bool,
@@ -320,7 +355,7 @@ pub enum DrillIn {
         rows: Vec<DrillInRow>,
         truncated: bool,
     },
-    Trend(Vec<f64>),
+    Trend(Vec<Option<f64>>),
     Text(String),
     Empty,
 }
@@ -1014,15 +1049,16 @@ impl DashboardState {
 
     fn drill_in_trend(&self, signal_id: &str, now: i64) -> DrillIn {
         // 24 h renders the raw samples; 7 d / 30 d render hourly roll-up
-        // averages filtered to the window. Either needs two points to draw.
-        let points: Vec<f64> = match self.trend_window {
+        // averages filtered to the window. Either needs two observations to
+        // draw. Gaps break the line instead of connecting missing intervals.
+        let points: Vec<Option<f64>> = match self.trend_window {
             TrendWindow::Day24 => self
                 .samples
                 .get(&(
                     self.selected_id.clone().unwrap_or_default(),
                     signal_id.to_owned(),
                 ))
-                .map(|points| points.iter().filter_map(|point| point.value_real).collect())
+                .map(|points| sparkline_with_gaps(points))
                 .unwrap_or_default(),
             window @ (TrendWindow::Day7 | TrendWindow::Day30) => {
                 let cutoff = window.cutoff_secs(now);
@@ -1032,16 +1068,24 @@ impl DashboardState {
                         signal_id.to_owned(),
                     ))
                     .map(|points| {
-                        points
+                        // Hourly aggregates stay connected: sparse buckets are
+                        // normal history here, not skipped poll intervals.
+                        // Only 24 h raw samples break on gaps (UX-002).
+                        let mut ordered: Vec<&RollupPoint> = points
                             .iter()
                             .filter(|point| point.hour_start >= cutoff)
-                            .filter_map(|point| point.avg_real)
+                            .collect();
+                        ordered.sort_by_key(|p| p.hour_start);
+                        ordered
+                            .iter()
+                            .filter_map(|point| point.avg_real.map(Some))
                             .collect()
                     })
                     .unwrap_or_default()
             }
         };
-        if points.len() < 2 {
+        let observed = points.iter().filter(|p| p.is_some()).count();
+        if observed < 2 {
             self.drill_in_text(signal_id)
         } else {
             DrillIn::Trend(points)
@@ -1501,12 +1545,7 @@ impl DashboardState {
                 let sparkline = if TREND_SIGNALS.contains(&signal_id) {
                     self.samples
                         .get(&(environment_id.to_owned(), signal_id.to_owned()))
-                        .map(|points| {
-                            // Gaps (skipped ticks) are dropped, never zeroed:
-                            // the segment spans the gap instead of inventing
-                            // a recovery-or-outage that never happened.
-                            points.iter().filter_map(|point| point.value_real).collect()
-                        })
+                        .map(|points| sparkline_with_gaps(points))
                         .unwrap_or_default()
                 } else {
                     Vec::new()
@@ -1853,7 +1892,9 @@ impl DashboardState {
         let environment = self.environments.iter().find(|env| env.id == env_id)?;
         let snapshots = self.snapshots.get(env_id)?;
         for signal_id in signal_ids_for(&environment.platform_id).iter().copied() {
-            let snapshot = snapshots.get(signal_id)?;
+            let Some(snapshot) = snapshots.get(signal_id) else {
+                continue;
+            };
             if !matches!(snapshot.dto.state.as_str(), "degraded" | "down") {
                 continue;
             }
@@ -2401,6 +2442,14 @@ fn detail_from_value(signal_id: &str, value: &serde_json::Value) -> String {
             "scan_unavailable" => "Instance Scan unavailable".to_owned(),
             other => other.to_owned(),
         };
+    }
+    // Throttled drill-ins: the aggregate count set the state but the row
+    // request hit 429, so surface the pressure instead of an empty list.
+    if value.get("throttled").and_then(|item| item.as_bool()) == Some(true) {
+        if let Some(detail) = value.get("throttled_detail").and_then(|item| item.as_str()) {
+            return detail.chars().take(160).collect();
+        }
+        return "throttled by ServiceNow (HTTP 429)".to_owned();
     }
     // Drift's `truncated` says the inventory page was capped, so the mismatch
     // count is a floor. Distinct from `mismatch_list_truncated`, which bounds
@@ -4561,13 +4610,19 @@ mod tests {
         let mut state = trendable();
         let now = 1_700_000_000;
         assert_eq!(state.trend_window(), TrendWindow::Day24);
-        assert_eq!(state.drill_in("jobs", now), DrillIn::Trend(vec![1.0, 2.0]));
+        assert_eq!(
+            state.drill_in("jobs", now),
+            DrillIn::Trend(vec![Some(1.0), Some(2.0)])
+        );
         state.set_trend_window(TrendWindow::Day7);
-        assert_eq!(state.drill_in("jobs", now), DrillIn::Trend(vec![5.0, 2.0]));
+        assert_eq!(
+            state.drill_in("jobs", now),
+            DrillIn::Trend(vec![Some(5.0), Some(2.0)])
+        );
         state.set_trend_window(TrendWindow::Day30);
         assert_eq!(
             state.drill_in("jobs", now),
-            DrillIn::Trend(vec![8.0, 5.0, 2.0])
+            DrillIn::Trend(vec![Some(8.0), Some(5.0), Some(2.0)])
         );
         // One in-window point is no trend: fall back to text.
         state.set_trend_window(TrendWindow::Day7);
@@ -4594,6 +4649,39 @@ mod tests {
             environments: vec![],
         });
         assert!(state.rollups.is_empty());
+    }
+
+    #[test]
+    fn sparkline_breaks_across_missing_intervals() {
+        let points = vec![
+            SamplePoint {
+                observed_at: 0,
+                value_real: Some(1.0),
+            },
+            SamplePoint {
+                observed_at: 3600,
+                value_real: Some(2.0),
+            },
+        ];
+        assert_eq!(
+            sparkline_with_gaps(&points),
+            vec![Some(1.0), None, Some(2.0)]
+        );
+    }
+
+    #[test]
+    fn sparkline_keeps_connected_samples_without_gaps() {
+        let points = vec![
+            SamplePoint {
+                observed_at: 0,
+                value_real: Some(1.0),
+            },
+            SamplePoint {
+                observed_at: 120,
+                value_real: Some(2.0),
+            },
+        ];
+        assert_eq!(sparkline_with_gaps(&points), vec![Some(1.0), Some(2.0)]);
     }
 
     #[test]
@@ -4646,7 +4734,7 @@ mod tests {
                 .find(|card| card.signal_id == signal_id)
                 .unwrap()
         };
-        assert_eq!(card("jobs").sparkline, vec![4.0]);
+        assert_eq!(card("jobs").sparkline, vec![Some(4.0)]);
         assert!(card("outbound").sparkline.is_empty());
     }
 

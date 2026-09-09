@@ -42,7 +42,8 @@ what the Operator asked for:
 
 Explicitly still out: connector/plugin seam for a second Platform, login/roles,
 pager rules/channels/quiet-hours/ack, waku agent domain, non-ServiceNow
-Platforms, hosted multi-user operation.
+Platforms (superseded by ADR-0011 and `docs/platforms.md`: HTTP and GitHub
+are shipped), hosted multi-user operation.
 
 Consequences:
 

@@ -2,6 +2,7 @@
   "actions_clean": {
     "payload": {
       "failed_24h": 0,
+      "reachability": "reachable",
       "run_rows": [],
       "run_rows_truncated": false
     },
@@ -11,6 +12,7 @@
   "actions_failed": {
     "payload": {
       "failed_24h": 1,
+      "reachability": "reachable",
       "run_rows": [
         {
           "conclusion": "failure",
@@ -118,7 +120,9 @@
           "sys_id": "email-1"
         }
       ],
-      "error_rows_truncated": false
+      "error_rows_truncated": false,
+      "throttled": false,
+      "throttled_detail": null
     },
     "signal_id": "email",
     "state": "healthy"
@@ -127,7 +131,9 @@
     "payload": {
       "email_failed_1h": 0,
       "error_rows": [],
-      "error_rows_truncated": false
+      "error_rows_truncated": false,
+      "throttled": false,
+      "throttled_detail": null
     },
     "signal_id": "email",
     "state": "healthy"
@@ -143,7 +149,9 @@
         }
       ],
       "error_rows_truncated": false,
-      "flow_error_1h": 2
+      "flow_error_1h": 2,
+      "throttled": false,
+      "throttled_detail": null
     },
     "signal_id": "flow",
     "state": "degraded"
@@ -152,7 +160,9 @@
     "payload": {
       "error_rows": [],
       "error_rows_truncated": false,
-      "flow_error_1h": 0
+      "flow_error_1h": 0,
+      "throttled": false,
+      "throttled_detail": null
     },
     "signal_id": "flow",
     "state": "healthy"
@@ -160,6 +170,7 @@
   "http_probe_down": {
     "payload": {
       "http_status": 503,
+      "reachability": "reachable",
       "rtt_ms": 0,
       "url": "https://status-down.example.com/health"
     },
@@ -169,6 +180,7 @@
   "http_probe_ok": {
     "payload": {
       "http_status": 200,
+      "reachability": "reachable",
       "rtt_ms": 0,
       "url": "https://status-ok.example.com/health"
     },
@@ -188,7 +200,9 @@
           "sys_id": "job-1"
         }
       ],
-      "overdue_rows_truncated": false
+      "overdue_rows_truncated": false,
+      "throttled": false,
+      "throttled_detail": null
     },
     "signal_id": "jobs",
     "state": "degraded"
@@ -200,7 +214,9 @@
       "error_rows_truncated": false,
       "overdue_ready": 0,
       "overdue_rows": [],
-      "overdue_rows_truncated": false
+      "overdue_rows_truncated": false,
+      "throttled": false,
+      "throttled_detail": null
     },
     "signal_id": "jobs",
     "state": "healthy"
@@ -293,7 +309,9 @@
         }
       ],
       "failure_rows_truncated": false,
-      "outbound_http_4xx_5xx_1h": 3
+      "outbound_http_4xx_5xx_1h": 3,
+      "throttled": false,
+      "throttled_detail": null
     },
     "signal_id": "outbound",
     "state": "degraded"
@@ -302,7 +320,9 @@
     "payload": {
       "failure_rows": [],
       "failure_rows_truncated": false,
-      "outbound_http_4xx_5xx_1h": 0
+      "outbound_http_4xx_5xx_1h": 0,
+      "throttled": false,
+      "throttled_detail": null
     },
     "signal_id": "outbound",
     "state": "healthy"
@@ -439,7 +459,9 @@
           "sys_id": "log-1"
         }
       ],
-      "error_rows_truncated": false
+      "error_rows_truncated": false,
+      "throttled": false,
+      "throttled_detail": null
     },
     "signal_id": "syslog",
     "state": "degraded"
@@ -448,7 +470,9 @@
     "payload": {
       "error_count_1h": 0,
       "error_rows": [],
-      "error_rows_truncated": false
+      "error_rows_truncated": false,
+      "throttled": false,
+      "throttled_detail": null
     },
     "signal_id": "syslog",
     "state": "healthy"

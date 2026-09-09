@@ -150,6 +150,7 @@ impl Signal for ActionsSignal {
                 "failed_24h": failed_24h,
                 "run_rows": runs,
                 "run_rows_truncated": runs.len() >= ROW_LIST_LIMIT,
+                "reachability": "reachable",
             }),
             sample: None,
         })

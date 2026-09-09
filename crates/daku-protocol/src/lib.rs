@@ -22,6 +22,7 @@ pub use protocol::{
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, MAX_WIRE_MESSAGE_BYTES,
     PROTOCOL_VERSION, Reachability, Request, ResponseOutcome, ResponsePayload, RollupPoint,
     RpcError, SamplePoint, ServerMessage, SignalEventDto, SignalSnapshotDto, SignalState,
-    instance_url_error, is_supported_instance_url,
+    environment_id_error, instance_url_error, is_supported_environment_id,
+    is_supported_instance_url,
 };
 pub use settings::DaemonSettings;

@@ -128,6 +128,11 @@ pub fn save_app_settings_at(path: &Path, settings: &AppSettings) -> io::Result<(
 }
 
 fn configuration_directory() -> PathBuf {
+    if let Ok(path) = std::env::var("DAKU_HOME")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
     dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(".daku")
@@ -184,17 +189,30 @@ fn write_json_atomically(path: &Path, value: &impl Serialize) -> io::Result<()> 
         fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_vec_pretty(value).map_err(to_io_error)?;
-    let temporary = path.with_extension("json.tmp");
+    // Unique tmp plus directory sync, mirroring the daemon's shared helper:
+    // a fixed `json.tmp` name races concurrent writers and a rename without
+    // a directory fsync can lose the entry on crash.
+    let temporary = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options.open(&temporary)?;
     file.write_all(&data)?;
     file.sync_all()?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     fs::rename(&temporary, path)?;
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 

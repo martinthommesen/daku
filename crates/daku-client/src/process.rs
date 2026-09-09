@@ -177,6 +177,17 @@ fn open_daemon_log(path: &Path) -> std::io::Result<std::fs::File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Bounded rotation: a long-lived daemon must not grow the log without
+    // bound. At 10 MiB, move the current file aside (one retained
+    // generation) and start fresh at 0600.
+    const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+    if let Ok(metadata) = std::fs::metadata(path)
+        && metadata.len() > MAX_LOG_BYTES
+    {
+        let rotated = path.with_extension("log.1");
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::rename(path, &rotated);
+    }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -184,7 +195,13 @@ fn open_daemon_log(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
 }
 
 /// `~/.daku/daemon.log`, append-only, 0600. The daemon writes its diagnostics

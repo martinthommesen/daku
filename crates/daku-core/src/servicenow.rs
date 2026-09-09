@@ -571,10 +571,7 @@ fn read_ureq_response(
             Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
         })
         .collect();
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .context("reading HTTP body")?;
+    let body = read_bounded_body(response.body_mut(), MAX_EXTERNAL_RESPONSE_BYTES)?;
     Ok(HttpResponse {
         status,
         headers,
@@ -582,9 +579,46 @@ fn read_ureq_response(
     })
 }
 
+/// Upper bound for any external HTTP body held in memory. Query limits
+/// bound expected payloads but not server behavior; a monitored endpoint
+/// must not be able to amplify one tick into unbounded allocation.
+pub const MAX_EXTERNAL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Reads a ureq body through a bounded reader. Returns a clear size-limit
+/// error instead of retaining an oversize or never-ending body until the
+/// transport timeout.
+pub(crate) fn read_bounded_body(body: &mut ureq::Body, limit: u64) -> anyhow::Result<String> {
+    read_bounded_string(body.as_reader(), limit)
+}
+
+pub(crate) fn read_bounded_string<R: std::io::Read>(
+    reader: R,
+    limit: u64,
+) -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let mut limited = reader.take(limit.saturating_add(1));
+    let mut text = String::new();
+    limited
+        .read_to_string(&mut text)
+        .context("reading HTTP body")?;
+    if (text.len() as u64) > limit {
+        anyhow::bail!("response body exceeds {limit} byte limit");
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_body_rejects_oversize() {
+        let ok = read_bounded_string(std::io::Cursor::new(b"hello"), 8).unwrap();
+        assert_eq!(ok, "hello");
+        let at_limit = read_bounded_string(std::io::Cursor::new(b"12345678"), 8).unwrap();
+        assert_eq!(at_limit, "12345678");
+        assert!(read_bounded_string(std::io::Cursor::new(b"123456789"), 8).is_err());
+    }
 
     #[test]
     fn percent_encode_url_encodes_servicenow_query_operators_only() {

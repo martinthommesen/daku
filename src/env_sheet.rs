@@ -692,11 +692,8 @@ pub fn validate_fields(
     instance_url: &str,
     platform: Platform,
 ) -> Result<(), String> {
-    if id.trim().is_empty() {
-        return Err("id must not be empty".to_owned());
-    }
-    if id.contains(char::is_whitespace) {
-        return Err("id must not contain whitespace".to_owned());
+    if let Some(reason) = daku_protocol::environment_id_error(id) {
+        return Err(reason.to_owned());
     }
     if label.trim().is_empty() {
         return Err("label must not be empty".to_owned());

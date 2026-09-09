@@ -43,11 +43,35 @@ pub struct DecideOut {
 }
 
 pub fn decide(env_snaps: &[&persistence::SignalSnapshot]) -> DecideOut {
-    let reachability = env_snaps
+    let reachability = if let Some(snapshot) = env_snaps
         .iter()
         .find(|snapshot| snapshot.signal_id == AVAILABILITY_SIGNAL_ID)
-        .map(|snapshot| wire_reachability(&snapshot.payload_json))
-        .unwrap_or(Reachability::Reachable);
+    {
+        wire_reachability(&snapshot.payload_json)
+    } else {
+        // No ServiceNow availability snapshot: single-signal platforms
+        // (HTTP probe, GitHub Actions) carry their own reachability.
+        // A persisted `unreachable` payload means the endpoint itself is
+        // unreachable and the environment is down. A down primary probe
+        // with no availability signal is likewise a platform outage, not
+        // a degraded multi-signal rollup.
+        let mut platform_reachability = Reachability::Reachable;
+        for snapshot in env_snaps {
+            if wire_reachability(&snapshot.payload_json) == Reachability::Unreachable {
+                platform_reachability = Reachability::Unreachable;
+                break;
+            }
+            let state = SignalState::parse(&snapshot.state).unwrap_or(SignalState::Skipped);
+            if matches!(
+                snapshot.signal_id.as_str(),
+                crate::http_probe::HTTP_PROBE_SIGNAL_ID | crate::github::ACTIONS_SIGNAL_ID
+            ) && state == SignalState::Down
+            {
+                platform_reachability = Reachability::Unreachable;
+            }
+        }
+        platform_reachability
+    };
     let votes: Vec<(String, SignalState)> = env_snaps
         .iter()
         .map(|snapshot| {

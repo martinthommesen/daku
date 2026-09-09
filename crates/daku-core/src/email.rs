@@ -10,8 +10,8 @@ use daku_protocol::SignalState;
 
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
-use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
-use crate::signal_eval::{evaluate_ge, fetch_table_rows, row_text};
+use crate::servicenow::{ServiceNowClient, THROTTLED_DETAIL, fetch_aggregate_count};
+use crate::signal_eval::{evaluate_ge, fetch_table_rows_with_throttle, row_text};
 
 pub const EMAIL_SIGNAL_ID: &str = "email";
 pub const EMAIL_FAILURE_PATH: &str = "/api/now/stats/sys_email?sysparm_count=true&sysparm_query=type=send-failed^sys_created_on>javascript:gs.hoursAgoStart(1)";
@@ -33,13 +33,14 @@ pub fn email_state(email_failed_1h: u64, thresholds: &Thresholds) -> SignalState
 /// Offending failure rows, newest first. A failed rows request yields no rows —
 /// the count already determined the state. Subjects and recipients render
 /// truncated by the client's `cell` helper; the error string stays out of the
-/// snapshot (it can carry addresses and message bodies).
+/// snapshot (it can carry addresses and message bodies). A 429 surfaces as
+/// `throttled`.
 fn fetch_email_rows(
     client: &ServiceNowClient,
     environment: &EnvironmentConfig,
     credentials: &dyn CredentialStore,
-) -> (Vec<EmailRow>, bool) {
-    fetch_table_rows(
+) -> (Vec<EmailRow>, bool, bool) {
+    let ((rows, truncated), throttled) = fetch_table_rows_with_throttle(
         client,
         environment,
         credentials,
@@ -56,7 +57,8 @@ fn fetch_email_rows(
                 sys_created_on: row_text(row, "sys_created_on"),
             })
         },
-    )
+    );
+    (rows, truncated, throttled)
 }
 
 #[derive(Default)]
@@ -78,10 +80,10 @@ impl Signal for EmailSignal {
         let email_failed_1h =
             fetch_aggregate_count(client, environment, credentials, EMAIL_FAILURE_PATH)?;
         // Rows only while unhealthy: a zero count costs no extra request.
-        let (error_rows, error_rows_truncated) = if email_failed_1h > 0 {
+        let (error_rows, error_rows_truncated, throttled) = if email_failed_1h > 0 {
             fetch_email_rows(client, environment, credentials)
         } else {
-            (Vec::new(), false)
+            (Vec::new(), false, false)
         };
         Ok(Observation {
             state: email_state(email_failed_1h, &environment.thresholds),
@@ -89,6 +91,8 @@ impl Signal for EmailSignal {
                 "email_failed_1h": email_failed_1h,
                 "error_rows": error_rows,
                 "error_rows_truncated": error_rows_truncated,
+                "throttled": throttled,
+                "throttled_detail": if throttled { Some(THROTTLED_DETAIL) } else { None },
             }),
             sample: None,
         })

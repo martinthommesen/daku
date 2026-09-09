@@ -5,8 +5,8 @@ use daku_protocol::SignalState;
 
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
-use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
-use crate::signal_eval::{evaluate_ge, fetch_table_rows, row_text};
+use crate::servicenow::{ServiceNowClient, THROTTLED_DETAIL, fetch_aggregate_count};
+use crate::signal_eval::{evaluate_ge, fetch_table_rows_with_throttle, row_text};
 
 pub const JOBS_SIGNAL_ID: &str = "jobs";
 pub const JOBS_OVERDUE_PATH: &str = "/api/now/stats/sys_trigger?sysparm_count=true&sysparm_query=state=0^next_action<javascript:gs.minutesAgoStart(15)";
@@ -35,30 +35,33 @@ struct JobRow {
 
 /// Offending rows for one non-zero count. A failed rows request yields no
 /// rows — the count already determined the state, and the drill-in header
-/// still links the filtered list.
+/// still links the filtered list. A 429 surfaces as `throttled` with the
+/// shared detail so pressure stays visible instead of reading as empty.
 fn fetch_job_rows(
     client: &ServiceNowClient,
     environment: &EnvironmentConfig,
     credentials: &dyn CredentialStore,
     path: &str,
     error_detail: bool,
-) -> (Vec<JobRow>, bool) {
-    fetch_table_rows(client, environment, credentials, path, |row| {
-        let sys_id = row_text(row, "sys_id");
-        if sys_id.is_empty() {
-            return None;
-        }
-        let name = row_text(row, "name");
-        Some(JobRow {
-            sys_id: sys_id.clone(),
-            name: if name.is_empty() { sys_id } else { name },
-            detail: if error_detail {
-                row_text(row, "state")
-            } else {
-                row_text(row, "next_action")
-            },
-        })
-    })
+) -> (Vec<JobRow>, bool, bool) {
+    let ((rows, truncated), throttled) =
+        fetch_table_rows_with_throttle(client, environment, credentials, path, |row| {
+            let sys_id = row_text(row, "sys_id");
+            if sys_id.is_empty() {
+                return None;
+            }
+            let name = row_text(row, "name");
+            Some(JobRow {
+                sys_id: sys_id.clone(),
+                name: if name.is_empty() { sys_id } else { name },
+                detail: if error_detail {
+                    row_text(row, "state")
+                } else {
+                    row_text(row, "next_action")
+                },
+            })
+        });
+    (rows, truncated, throttled)
 }
 
 #[derive(Default)]
@@ -94,7 +97,7 @@ impl Signal for JobsSignal {
             }
         };
         // Rows only while unhealthy: a zero count costs no extra request.
-        let (overdue_rows, overdue_rows_truncated) = if overdue_ready > 0 {
+        let (overdue_rows, overdue_rows_truncated, overdue_throttled) = if overdue_ready > 0 {
             fetch_job_rows(
                 client,
                 environment,
@@ -103,13 +106,14 @@ impl Signal for JobsSignal {
                 false,
             )
         } else {
-            (Vec::new(), false)
+            (Vec::new(), false, false)
         };
-        let (error_rows, error_rows_truncated) = if error > 0 {
+        let (error_rows, error_rows_truncated, error_throttled) = if error > 0 {
             fetch_job_rows(client, environment, credentials, JOBS_ERROR_ROWS_PATH, true)
         } else {
-            (Vec::new(), false)
+            (Vec::new(), false, false)
         };
+        let throttled = overdue_throttled || error_throttled;
         Ok(Observation {
             state: jobs_state(overdue_ready, error, &environment.thresholds),
             payload: serde_json::json!({
@@ -119,6 +123,8 @@ impl Signal for JobsSignal {
                 "overdue_rows_truncated": overdue_rows_truncated,
                 "error_rows": error_rows,
                 "error_rows_truncated": error_rows_truncated,
+                "throttled": throttled,
+                "throttled_detail": if throttled { Some(THROTTLED_DETAIL) } else { None },
             }),
             sample: Some((overdue_ready + error) as f64),
         })

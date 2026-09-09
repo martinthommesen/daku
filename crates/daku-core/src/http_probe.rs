@@ -87,6 +87,7 @@ impl Signal for HttpProbeSignal {
                 "http_status": response.status,
                 "rtt_ms": rtt_ms,
                 "url": redact_url(&environment.instance_url),
+                "reachability": "reachable",
             }),
             sample: None,
         })

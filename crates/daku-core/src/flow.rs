@@ -9,8 +9,8 @@ use daku_protocol::SignalState;
 
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
-use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
-use crate::signal_eval::{evaluate_ge, fetch_table_rows, row_text};
+use crate::servicenow::{ServiceNowClient, THROTTLED_DETAIL, fetch_aggregate_count};
+use crate::signal_eval::{evaluate_ge, fetch_table_rows_with_throttle, row_text};
 
 pub const FLOW_SIGNAL_ID: &str = "flow";
 pub const FLOW_ERROR_PATH: &str = "/api/now/stats/sys_flow_context?sysparm_count=true&sysparm_query=state=ERROR^sys_updated_on>javascript:gs.hoursAgoStart(1)";
@@ -30,13 +30,13 @@ pub fn flow_state(flow_error_1h: u64, thresholds: &Thresholds) -> SignalState {
 }
 
 /// Offending error rows, newest first. A failed rows request yields no rows —
-/// the count already determined the state.
+/// the count already determined the state. A 429 surfaces as `throttled`.
 fn fetch_flow_rows(
     client: &ServiceNowClient,
     environment: &EnvironmentConfig,
     credentials: &dyn CredentialStore,
-) -> (Vec<FlowRow>, bool) {
-    fetch_table_rows(
+) -> (Vec<FlowRow>, bool, bool) {
+    let ((rows, truncated), throttled) = fetch_table_rows_with_throttle(
         client,
         environment,
         credentials,
@@ -53,7 +53,8 @@ fn fetch_flow_rows(
                 sys_updated_on: row_text(row, "sys_updated_on"),
             })
         },
-    )
+    );
+    (rows, truncated, throttled)
 }
 
 #[derive(Default)]
@@ -75,10 +76,10 @@ impl Signal for FlowSignal {
         let flow_error_1h =
             fetch_aggregate_count(client, environment, credentials, FLOW_ERROR_PATH)?;
         // Rows only while unhealthy: a zero count costs no extra request.
-        let (error_rows, error_rows_truncated) = if flow_error_1h > 0 {
+        let (error_rows, error_rows_truncated, throttled) = if flow_error_1h > 0 {
             fetch_flow_rows(client, environment, credentials)
         } else {
-            (Vec::new(), false)
+            (Vec::new(), false, false)
         };
         Ok(Observation {
             state: flow_state(flow_error_1h, &environment.thresholds),
@@ -86,6 +87,8 @@ impl Signal for FlowSignal {
                 "flow_error_1h": flow_error_1h,
                 "error_rows": error_rows,
                 "error_rows_truncated": error_rows_truncated,
+                "throttled": throttled,
+                "throttled_detail": if throttled { Some(THROTTLED_DETAIL) } else { None },
             }),
             sample: None,
         })

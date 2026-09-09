@@ -699,10 +699,11 @@ pub fn start_default_loop_with_store(
         // overrun counts doctor reports. Best-effort; never fails the tick.
         // Elapsed covers collection; the pre-first-tick publish passes ZERO.
         if let Ok(connection) = dashboard_store.open() {
-            let _ = persistence::record_tick_stat(
+            let _ = persistence::record_tick_stat_with_envs(
                 &connection,
                 now,
                 i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+                dashboard_environments.len() as i64,
             );
         }
         // Fire-and-forget: a slow forwarder must never stall polling.

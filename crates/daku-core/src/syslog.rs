@@ -4,8 +4,8 @@ use daku_protocol::SignalState;
 
 use crate::collector::{Observation, PerEnvironmentCollector, ROW_LIST_LIMIT, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
-use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
-use crate::signal_eval::{evaluate_ge, fetch_table_rows, row_text};
+use crate::servicenow::{ServiceNowClient, THROTTLED_DETAIL, fetch_aggregate_count};
+use crate::signal_eval::{evaluate_ge, fetch_table_rows_with_throttle, row_text};
 
 pub const SYSLOG_SIGNAL_ID: &str = "syslog";
 pub const SYSLOG_ERROR_LEVEL: u8 = 2;
@@ -36,13 +36,13 @@ pub fn syslog_state(error_count_1h: u64, thresholds: &Thresholds) -> SignalState
 }
 
 /// Offending error rows, newest first. A failed rows request yields no rows —
-/// the count already determined the state.
+/// the count already determined the state. A 429 surfaces as `throttled`.
 fn fetch_syslog_rows(
     client: &ServiceNowClient,
     environment: &EnvironmentConfig,
     credentials: &dyn CredentialStore,
-) -> (Vec<SyslogRow>, bool) {
-    fetch_table_rows(
+) -> (Vec<SyslogRow>, bool, bool) {
+    let ((rows, truncated), throttled) = fetch_table_rows_with_throttle(
         client,
         environment,
         credentials,
@@ -61,7 +61,8 @@ fn fetch_syslog_rows(
                 sys_created_on: row_text(row, "sys_created_on"),
             })
         },
-    )
+    );
+    (rows, truncated, throttled)
 }
 
 #[derive(Default)]
@@ -87,10 +88,10 @@ impl Signal for SyslogSignal {
         let error_count_1h =
             fetch_aggregate_count(client, environment, credentials, &syslog_error_path())?;
         // Rows only while unhealthy: a zero count costs no extra request.
-        let (error_rows, error_rows_truncated) = if error_count_1h > 0 {
+        let (error_rows, error_rows_truncated, throttled) = if error_count_1h > 0 {
             fetch_syslog_rows(client, environment, credentials)
         } else {
-            (Vec::new(), false)
+            (Vec::new(), false, false)
         };
         Ok(Observation {
             state: syslog_state(error_count_1h, &environment.thresholds),
@@ -98,6 +99,8 @@ impl Signal for SyslogSignal {
                 "error_count_1h": error_count_1h,
                 "error_rows": error_rows,
                 "error_rows_truncated": error_rows_truncated,
+                "throttled": throttled,
+                "throttled_detail": if throttled { Some(THROTTLED_DETAIL) } else { None },
             }),
             sample: Some(error_count_1h as f64),
         })

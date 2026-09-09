@@ -45,10 +45,23 @@ pub fn should_relay_event(observed_at: i64, mark: i64, now: i64) -> bool {
 pub fn webhook_url_allowed(url: &str) -> bool {
     let url = url.trim();
     if let Some(rest) = url.strip_prefix("https://") {
-        return !rest.is_empty() && !rest.contains([' ', '\t', '\n']);
+        if rest.is_empty() || rest.contains([' ', '\t', '\n']) {
+            return false;
+        }
+        let authority = rest.split('/').next().unwrap_or("");
+        // Userinfo (`user:secret@host`) must never be accepted: the
+        // credential would ride the URL into logs, bundles, and the
+        // request line. Callers must use a credential-free URL.
+        if authority.contains('@') || authority.is_empty() {
+            return false;
+        }
+        return true;
     }
     if let Some(rest) = url.strip_prefix("http://") {
         let authority = rest.split('/').next().unwrap_or("");
+        if authority.contains('@') {
+            return false;
+        }
         let host = if let Some(bracketed) = authority.strip_prefix('[') {
             bracketed.split(']').next().unwrap_or("")
         } else {
@@ -121,7 +134,8 @@ pub fn refusal_line(url: &str) -> String {
 
 /// Scheme plus authority (`https://host`) with path, query, and fragment
 /// dropped: everything after the host is secret-bearing until proven
-/// otherwise.
+/// otherwise. Userinfo is stripped even for rejected input so a
+/// `user:secret@host` canary never survives into a log or bundle.
 pub fn redacted_url(url: &str) -> String {
     let trimmed = url.trim();
     let (scheme, rest) = match trimmed.split_once("://") {
@@ -132,7 +146,18 @@ pub fn redacted_url(url: &str) -> String {
     if authority.is_empty() {
         return "<unparseable>".into();
     }
-    format!("{scheme}://{authority}")
+    // Strip userinfo (`user:secret@`) and fragment/query remnants.
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+    if host.is_empty() {
+        return "<unparseable>".into();
+    }
+    format!("{scheme}://{host}")
 }
 
 pub struct WebhookRelay {
@@ -255,7 +280,10 @@ impl WebhookRelay {
             let mut events =
                 crate::persistence::load_health_events(&connection, &environment_id, 500)?;
             events.retain(|event| event.observed_at > mark);
-            events.sort_by_key(|event| event.observed_at);
+            // Stable total order: timestamp alone collapses same-second
+            // health and build events, so a crash between two posts can
+            // skip the sibling. `(observed_at, kind)` is unambiguous.
+            events.sort_by(|a, b| (a.observed_at, &a.kind).cmp(&(b.observed_at, &b.kind)));
             for event in events {
                 if !should_relay_event(event.observed_at, mark, now) {
                     last_sent.insert(environment_id.clone(), event.observed_at);
@@ -275,7 +303,11 @@ impl WebhookRelay {
                     "build": event.build,
                 })
                 .to_string();
-                if let Err(error) = post(url, &body) {
+                // Bounded retry: one immediate second attempt for transient
+                // failures before dead-lettering. Poison endpoints still
+                // advance without head-of-line blocking.
+                if post(url, &body).is_err() && post(url, &body).is_err() {
+                    let error = "webhook post failed after 1 retry";
                     // Poison head must not starve newer events: dead-letter it
                     // and advance past it.
                     let _ = crate::persistence::record_webhook_dead_letter(
@@ -283,10 +315,10 @@ impl WebhookRelay {
                         &environment_id,
                         event.observed_at,
                         &event.kind,
-                        &format!("{error:#}"),
+                        error,
                     );
                     eprintln!(
-                        "daku webhook skipped poison event for {}: {error:#}",
+                        "daku webhook skipped poison event for {}: {error}",
                         event.environment_id
                     );
                     last_sent.insert(environment_id.clone(), event.observed_at);
@@ -329,7 +361,11 @@ fn post_json(url: &str, body: &str) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("webhook post failed: {error}"))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
-        let text = response.body_mut().read_to_string().unwrap_or_default();
+        // Bound the error body before truncating for the message: a
+        // forwarder must not be able to amplify one failure into unbounded
+        // allocation.
+        let text = crate::servicenow::read_bounded_body(response.body_mut(), 64 * 1024)
+            .unwrap_or_default();
         anyhow::bail!(
             "webhook returned HTTP {status}: {}",
             text.chars().take(160).collect::<String>()
@@ -515,11 +551,12 @@ mod tests {
             anyhow::bail!("forwarder down")
         };
         // Poison head no longer blocks: both events are attempted, skipped,
-        // and dead-lettered instead of returning an error.
+        // and dead-lettered instead of returning an error. Each event gets
+        // one retry before it dead-letters.
         relay
             .relay_to(&db.store(), "http://127.0.0.1:9/hook", &failing)
             .unwrap();
-        assert_eq!(*calls.lock().expect("calls"), 2);
+        assert_eq!(*calls.lock().expect("calls"), 4);
         let connection = db.store().open().unwrap();
         assert_eq!(
             persistence::load_webhook_dead_letter_count(&connection, "prod").unwrap(),
@@ -753,5 +790,27 @@ mod tests {
         assert!(!line.contains("PATH-SECRET-1"), "{line}");
         assert!(line.ends_with("https://hooks.example.com"), "{line}");
         assert_eq!(redacted_url("not a url"), "<unparseable>");
+    }
+
+    #[test]
+    fn webhook_userinfo_is_rejected_and_redacted() {
+        for url in [
+            "https://u:secret@example.invalid/hook",
+            "https://user@example.invalid/hook",
+            "http://u:secret@127.0.0.1:9000/hook",
+        ] {
+            assert!(!webhook_url_allowed(url), "{url}");
+            let redacted = redacted_url(url);
+            assert!(!redacted.contains("secret"), "{redacted}");
+            assert!(!redacted.contains("u:"), "{redacted}");
+            assert!(!redacted.contains('@'), "{redacted}");
+            let line = refusal_line(url);
+            assert!(!line.contains("secret"), "{line}");
+            assert!(!line.contains('@'), "{line}");
+        }
+        assert_eq!(
+            redacted_url("https://u:secret@example.invalid/hook"),
+            "https://example.invalid"
+        );
     }
 }

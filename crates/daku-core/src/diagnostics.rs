@@ -111,9 +111,33 @@ fn redact_settings(home: &Path) -> serde_json::Value {
 }
 
 fn log_tail(home: &Path, lines: usize) -> String {
-    let Ok(text) = std::fs::read_to_string(home.join("daemon.log")) else {
-        return "(no daemon.log)\n".into();
+    use std::io::{Read as _, Seek as _};
+    const MAX_TAIL_BYTES: u64 = 1024 * 1024;
+    let path = home.join("daemon.log");
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(_) => return "(no daemon.log)\n".into(),
     };
+    // Bounded tail read: seek to the last megabyte instead of loading a
+    // potentially unbounded log into memory, then keep the last lines.
+    let text = (|| -> std::io::Result<String> {
+        let len = file.metadata()?.len();
+        if len > MAX_TAIL_BYTES {
+            file.seek(std::io::SeekFrom::Start(len - MAX_TAIL_BYTES))?;
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)?;
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            // Drop a potential partial first line after the seek.
+            if let Some(pos) = text.find('\n') {
+                return Ok(text[pos + 1..].to_owned());
+            }
+            return Ok(text);
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        Ok(text)
+    })();
+    let text = text.unwrap_or_default();
     let all: Vec<&str> = text.lines().collect();
     let start = all.len().saturating_sub(lines);
     all[start..]

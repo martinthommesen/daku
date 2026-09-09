@@ -1013,9 +1013,30 @@ impl Daku {
 }
 
 /// Export root for one Environment at one moment. Pure so tests pin the
-/// layout without touching the home directory.
+/// layout without touching the home directory. The id grammar is enforced
+/// at save time; this also verifies containment so a path-unsafe id can
+/// never escape the export root even if it arrives from a hand-edited file
+/// or a remote daemon.
 fn export_directory(environment_id: &str, now: i64) -> std::path::PathBuf {
-    crate::persistence::export_root().join(format!("{environment_id}-{now}"))
+    let root = crate::persistence::export_root();
+    if daku_protocol::environment_id_error(environment_id).is_some() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        environment_id.hash(&mut hasher);
+        return root.join(format!("export-{:x}-{now}", hasher.finish()));
+    }
+    let candidate = root.join(format!("{environment_id}-{now}"));
+    // Lexical containment as a second net; grammar above is authoritative.
+    if candidate.starts_with(&root) {
+        candidate
+    } else {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        environment_id.hash(&mut hasher);
+        root.join(format!("export-{:x}-{now}", hasher.finish()))
+    }
 }
 
 fn unix_now() -> i64 {
@@ -3062,15 +3083,16 @@ fn compare_row_cells(cells: impl IntoIterator<Item = String>) -> gpui::Div {
 /// and the window it spans underneath — a line with no scale cannot say
 /// whether 186 is a lot.
 fn sparkline_with_scale(
-    points: &[f64],
+    points: &[Option<f64>],
     color: gpui::Hsla,
     height: Pixels,
     unit: &'static str,
     window_label: &str,
     cx: &App,
 ) -> impl IntoElement {
-    let min = points.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = points.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let values: Vec<f64> = points.iter().filter_map(|p| *p).collect();
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     v_flex()
         .w_full()
         .mt(px(8.0))
@@ -3098,7 +3120,7 @@ fn sparkline_with_scale(
         )
 }
 
-fn sparkline(points: &[f64], color: gpui::Hsla, height: Pixels) -> impl IntoElement {
+fn sparkline(points: &[Option<f64>], color: gpui::Hsla, height: Pixels) -> impl IntoElement {
     let points = points.to_vec();
     canvas(
         move |_, _, _| {},
@@ -3108,21 +3130,35 @@ fn sparkline(points: &[f64], color: gpui::Hsla, height: Pixels) -> impl IntoElem
     .flex_1()
 }
 
-fn paint_sparkline(bounds: Bounds<Pixels>, points: &[f64], color: gpui::Hsla, window: &mut Window) {
-    if points.len() < 2 {
+fn paint_sparkline(
+    bounds: Bounds<Pixels>,
+    points: &[Option<f64>],
+    color: gpui::Hsla,
+    window: &mut Window,
+) {
+    let values: Vec<f64> = points.iter().filter_map(|p| *p).collect();
+    if values.len() < 2 {
         return;
     }
-    let min = points.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = points.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let span = (max - min).max(1.0);
     let mut path = PathBuilder::stroke(px(1.5));
     let last = (points.len() - 1) as f32;
+    let mut pen_down = false;
     for (index, value) in points.iter().enumerate() {
+        let Some(value) = value else {
+            // Gap: break the line so missing intervals render as a break,
+            // not a connection across unobserved time.
+            pen_down = false;
+            continue;
+        };
         let x = bounds.left() + bounds.size.width * (index as f32 / last);
         let y = bounds.bottom() - bounds.size.height * (((value - min) / span) as f32);
         let point: Point<Pixels> = point(x, y);
-        if index == 0 {
+        if !pen_down {
             path.move_to(point);
+            pen_down = true;
         } else {
             path.line_to(point);
         }
