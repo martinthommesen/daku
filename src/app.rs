@@ -961,6 +961,7 @@ impl Daku {
             return None;
         }
         let matches = self.palette_matches(cx);
+        let empty = matches.is_empty();
         Some(
             v_flex()
                 .mx(px(22.0))
@@ -1007,6 +1008,16 @@ impl Daku {
                                 .child(entry.hint.clone()),
                         )
                 }))
+                .when(empty, |element| {
+                    element.child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No matches. Clear the filter to see everything."),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -2535,12 +2546,11 @@ impl Daku {
             } else {
                 gpui::transparent_black()
             })
-            // Cards that need attention carry their colour, not just a dot.
-            .bg(if attention {
-                color.opacity(0.15)
-            } else {
-                cx.theme().secondary
-            })
+            // Attention reads from the border and the value colour, not
+            // from a full-card wash: one wash per screen belongs to the
+            // verdict block above, so a degraded Environment does not
+            // become a wall of amber.
+            .bg(cx.theme().secondary)
             .hover(|style| {
                 if selected || attention {
                     style
@@ -2780,7 +2790,9 @@ impl Daku {
             .mb(px(crate::theme::SPACE_LG))
             .pb(px(10.0))
             .rounded(cx.theme().radius)
-            .border_2()
+            // One weight lighter than the selected card above: the region
+            // reads as attached detail, not a second selection.
+            .border_1()
             .border_color(cx.theme().primary)
             .bg(cx.theme().secondary)
             .child(
