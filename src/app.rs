@@ -55,7 +55,7 @@ use crate::notifications::{
 use crate::persistence::{AppSettings, save_app_settings};
 use crate::{fixture_events, ui_fixture_enabled};
 
-const SIDEBAR_WIDTH: f32 = 220.0;
+const SIDEBAR_WIDTH: f32 = crate::theme::SIDEBAR_WIDTH;
 
 pub struct Daku {
     state: DashboardState,
@@ -964,9 +964,9 @@ impl Daku {
         Some(
             v_flex()
                 .mx(px(22.0))
-                .mb(px(8.0))
+                .mb(px(crate::theme::SPACE_SM))
                 .p(px(10.0))
-                .gap(px(4.0))
+                .gap(px(crate::theme::SPACE_XS))
                 .rounded(cx.theme().radius)
                 .border_1()
                 .border_color(cx.theme().border)
@@ -1405,7 +1405,7 @@ fn sheet_button(
 ) -> gpui::AnyElement {
     div()
         .id(id)
-        .px(px(12.0))
+        .px(px(crate::theme::SPACE_MD))
         .py(px(6.0))
         .rounded(cx.theme().radius)
         .border_1()
@@ -1420,7 +1420,7 @@ fn sheet_button(
 /// Environment, Credential, Thresholds and Expected drift.
 fn sheet_section(caption: &'static str, cx: &App) -> gpui::AnyElement {
     div()
-        .pt(px(8.0))
+        .pt(px(crate::theme::SPACE_SM))
         .text_sm()
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(cx.theme().foreground)
@@ -1458,7 +1458,7 @@ impl Daku {
             .suffix(move |_, cx| {
                 h_flex()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap(px(crate::theme::SPACE_XS))
                     .when(muted, |element| {
                         element.child(
                             div()
@@ -1520,7 +1520,7 @@ impl Daku {
                 SidebarHeader::new().child(
                     h_flex()
                         .items_center()
-                        .gap(px(8.0))
+                        .gap(px(crate::theme::SPACE_SM))
                         .child(div().size(px(10.0)).rounded_full().bg(roll_up))
                         .child(div().text_sm().child(header_label)),
                 ),
@@ -1567,7 +1567,10 @@ impl Daku {
     fn mute_controls(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let id = self.state.selected_id()?.to_owned();
         let now = unix_now();
-        let base = h_flex().items_center().gap(px(8.0)).text_xs();
+        let base = h_flex()
+            .items_center()
+            .gap(px(crate::theme::SPACE_SM))
+            .text_xs();
         if let Some(until) = self
             .state
             .muted_until(&id)
@@ -1726,7 +1729,7 @@ impl Daku {
                             div()
                                 .flex()
                                 .flex_col()
-                                .gap(px(4.0))
+                                .gap(px(crate::theme::SPACE_XS))
                                 .child(
                                     div()
                                         .text_xs()
@@ -1887,7 +1890,7 @@ impl Daku {
                             div()
                                 .flex()
                                 .flex_row()
-                                .gap(px(8.0))
+                                .gap(px(crate::theme::SPACE_SM))
                                 .when(sheet.busy, |element| element.opacity(0.5))
                                 .child(sheet_button(cx, "sheet-cancel", "Cancel", |this, _, cx| {
                                     this.env_sheet = None;
@@ -1931,7 +1934,7 @@ impl Daku {
         div()
             .flex()
             .flex_col()
-            .gap(px(4.0))
+            .gap(px(crate::theme::SPACE_XS))
             .child(
                 div()
                     .text_xs()
@@ -1942,7 +1945,7 @@ impl Daku {
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(8.0))
+                    .gap(px(crate::theme::SPACE_SM))
                     .children(options.iter().map(|(pick, label)| {
                         let pick = *pick;
                         let selected = match pick {
@@ -1962,7 +1965,7 @@ impl Daku {
                         div()
                             .id(SharedString::from(format!("sheet-pick-{label}")))
                             .px(px(10.0))
-                            .py(px(4.0))
+                            .py(px(crate::theme::SPACE_XS))
                             .rounded(cx.theme().radius)
                             .border_1()
                             .border_color(if selected {
@@ -2014,7 +2017,7 @@ impl Daku {
         Some(
             v_flex()
                 .mx(px(22.0))
-                .mb(px(16.0))
+                .mb(px(crate::theme::SPACE_LG))
                 .rounded(cx.theme().radius)
                 .border_1()
                 .border_color(cx.theme().border)
@@ -2084,22 +2087,26 @@ impl Daku {
         if !has_history && query.trim().is_empty() && self.note_target.is_none() {
             return None;
         }
-        let mut block = v_flex().mx(px(22.0)).mb(px(16.0)).gap(px(2.0)).child(
-            h_flex()
-                .items_center()
-                .gap(px(8.0))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Recent"),
-                )
-                .child(
-                    div()
-                        .w(px(180.0))
-                        .child(Input::new(&self.timeline_filter).small()),
-                ),
-        );
+        let mut block = v_flex()
+            .mx(px(22.0))
+            .mb(px(crate::theme::SPACE_LG))
+            .gap(px(2.0))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(crate::theme::SPACE_SM))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Recent"),
+                    )
+                    .child(
+                        div()
+                            .w(px(180.0))
+                            .child(Input::new(&self.timeline_filter).small()),
+                    ),
+            );
         for entry in entries {
             let line = div()
                 .text_sm()
@@ -2122,13 +2129,17 @@ impl Daku {
                             }))
                             // The row takes a note on click.
                             .child(
-                                h_flex().items_center().gap(px(8.0)).child(line).child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .hover(|style| style.text_decoration_1())
-                                        .child("Add note"),
-                                ),
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(crate::theme::SPACE_SM))
+                                    .child(line)
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .hover(|style| style.text_decoration_1())
+                                            .child("Add note"),
+                                    ),
                             ),
                     );
                 }
@@ -2152,7 +2163,7 @@ impl Daku {
                 .child(Input::new(&self.note_input).small())
                 .child(
                     h_flex()
-                        .gap(px(8.0))
+                        .gap(px(crate::theme::SPACE_SM))
                         .child(
                             div()
                                 .id("note-save")
@@ -2298,12 +2309,12 @@ impl Daku {
                         v_flex()
                             .px(px(22.0))
                             .pt(px(18.0))
-                            .pb(px(12.0))
-                            .gap(px(8.0))
+                            .pb(px(crate::theme::SPACE_MD))
+                            .gap(px(crate::theme::SPACE_SM))
                             .child(
                                 h_flex()
                                     .items_center()
-                                    .gap(px(8.0))
+                                    .gap(px(crate::theme::SPACE_SM))
                                     // The state is the headline: a dot the
                                     // title's own size, not a pill after it.
                                     .child(div().size(px(12.0)).rounded_full().bg(if observed {
@@ -2394,7 +2405,7 @@ impl Daku {
                             .child(
                                 h_flex()
                                     .items_center()
-                                    .gap(px(8.0))
+                                    .gap(px(crate::theme::SPACE_SM))
                                     .child(
                                         div()
                                             .text_sm()
@@ -2422,7 +2433,7 @@ impl Daku {
                             .flex()
                             .flex_row()
                             .flex_wrap()
-                            .gap(px(12.0))
+                            .gap(px(crate::theme::SPACE_MD))
                             .p(px(22.0))
                             .children(voting_cards),
                     )
@@ -2430,8 +2441,8 @@ impl Daku {
                         element.child(
                             v_flex()
                                 .mx(px(22.0))
-                                .mb(px(12.0))
-                                .gap(px(4.0))
+                                .mb(px(crate::theme::SPACE_MD))
+                                .gap(px(crate::theme::SPACE_XS))
                                 .child(
                                     div()
                                         .text_xs()
@@ -2443,7 +2454,7 @@ impl Daku {
                                         .flex()
                                         .flex_row()
                                         .flex_wrap()
-                                        .gap(px(8.0))
+                                        .gap(px(crate::theme::SPACE_SM))
                                         .children(context_cards),
                                 ),
                         )
@@ -2513,7 +2524,7 @@ impl Daku {
             .max_w(px(300.0))
             .flex()
             .flex_col()
-            .gap(px(4.0))
+            .gap(px(crate::theme::SPACE_XS))
             .p(px(14.0))
             .rounded(cx.theme().radius)
             .border_2()
@@ -2709,7 +2720,7 @@ impl Daku {
         Some(
             h_flex()
                 .items_center()
-                .gap(px(8.0))
+                .gap(px(crate::theme::SPACE_SM))
                 .children(TrendWindow::ALL.into_iter().map(|(window, label)| {
                     let selected = window == active;
                     div()
@@ -2766,7 +2777,7 @@ impl Daku {
         };
         v_flex()
             .mx(px(22.0))
-            .mb(px(16.0))
+            .mb(px(crate::theme::SPACE_LG))
             .pb(px(10.0))
             .rounded(cx.theme().radius)
             .border_2()
@@ -2775,7 +2786,7 @@ impl Daku {
             .child(
                 h_flex()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(crate::theme::SPACE_SM))
                     .px(px(14.0))
                     .py(px(10.0))
                     .child(div().size(px(8.0)).rounded_full().bg(color))
@@ -2948,7 +2959,7 @@ fn disconnected_banner(cx: &App) -> impl IntoElement {
     div()
         .w_full()
         .px(px(14.0))
-        .py(px(8.0))
+        .py(px(crate::theme::SPACE_SM))
         .bg(cx.theme().danger.opacity(0.22))
         .text_color(cx.theme().danger)
         .text_sm()
@@ -3041,8 +3052,8 @@ fn drill_in_row_cells(row: crate::dashboard_state::DrillInRow) -> gpui::Div {
     h_flex()
         .w_full()
         .px(px(14.0))
-        .py(px(8.0))
-        .gap(px(12.0))
+        .py(px(crate::theme::SPACE_SM))
+        .gap(px(crate::theme::SPACE_MD))
         .children(row.cells.into_iter().enumerate().map(|(index, cell)| {
             let body = div().flex_1().min_w_0().overflow_hidden().text_ellipsis();
             match (&row.link, index) {
@@ -3071,8 +3082,8 @@ fn compare_row_cells(cells: impl IntoIterator<Item = String>) -> gpui::Div {
     h_flex()
         .w_full()
         .px(px(14.0))
-        .py(px(8.0))
-        .gap(px(12.0))
+        .py(px(crate::theme::SPACE_SM))
+        .gap(px(crate::theme::SPACE_MD))
         .children(cells.into_iter().map(|cell| {
             div()
                 .flex_1()
@@ -3099,7 +3110,7 @@ fn sparkline_with_scale(
     let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     v_flex()
         .w_full()
-        .mt(px(8.0))
+        .mt(px(crate::theme::SPACE_SM))
         .gap(px(2.0))
         .child(
             h_flex()

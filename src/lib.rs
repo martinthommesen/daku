@@ -7,6 +7,7 @@ mod env_sheet;
 mod notifications;
 mod palette;
 mod platform;
+mod theme;
 mod updater;
 
 pub use daku_client::{identity, persistence};
