@@ -398,24 +398,40 @@ pub fn format_u64_threshold(value: u64) -> String {
     }
 }
 
-/// Formats the RTT ceiling for the sheet: `None` (off) renders empty.
+/// Formats the RTT ceiling for the sheet: `None` (default) and numbers
+/// render as-is; `Some(u64::MAX)` (off) renders `off`.
 pub fn format_rtt_threshold(value: Option<u64>) -> String {
-    value.map(|ms| ms.to_string()).unwrap_or_default()
+    match value {
+        None => String::new(),
+        Some(ms) if ms == u64::MAX => "off".to_owned(),
+        Some(ms) => ms.to_string(),
+    }
 }
 
-/// Parses an ms-ceiling field. Empty and `off` mean unset (never votes).
-fn parse_rtt_field(caption: &str, text: &str) -> Result<Option<u64>, String> {
+/// Parses an ms-ceiling field. Empty means `default`, `off` means
+/// `off_value` (never votes), otherwise a whole number of ms.
+fn parse_rtt_field(
+    caption: &str,
+    text: &str,
+    default: Option<u64>,
+    off_value: Option<u64>,
+) -> Result<Option<u64>, String> {
     let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
-        Ok(None)
-    } else {
-        Some(
-            trimmed
-                .parse::<u64>()
-                .map_err(|_| format!("{caption} must be a whole number of ms, off, or empty")),
-        )
-        .transpose()
+    if trimmed.is_empty() {
+        return Ok(default);
     }
+    if trimmed.eq_ignore_ascii_case("off") {
+        if let Some(off) = off_value {
+            return Ok(Some(off));
+        }
+        return Ok(None);
+    }
+    Some(
+        trimmed
+            .parse::<u64>()
+            .map_err(|_| format!("{caption} must be a whole number of ms, off, or empty")),
+    )
+    .transpose()
 }
 
 fn parse_count_field(
@@ -491,9 +507,16 @@ impl ThresholdTexts {
 /// (never vote).
 pub fn parse_thresholds(texts: &ThresholdTexts) -> Result<Thresholds, String> {
     let defaults = Thresholds::default();
-    let availability_rtt_degraded_ms = parse_rtt_field("RTT ceiling", &texts.rtt)?;
-    let transaction_avg_degraded_ms = parse_rtt_field("Transaction average", &texts.txn)?;
-    let http_probe_rtt_degraded_ms = parse_rtt_field("Probe RTT ceiling", &texts.probe_rtt)?;
+    let availability_rtt_degraded_ms = parse_rtt_field(
+        "RTT ceiling",
+        &texts.rtt,
+        defaults.availability_rtt_degraded_ms,
+        Some(u64::MAX),
+    )?;
+    let transaction_avg_degraded_ms =
+        parse_rtt_field("Transaction average", &texts.txn, None, None)?;
+    let http_probe_rtt_degraded_ms =
+        parse_rtt_field("Probe RTT ceiling", &texts.probe_rtt, None, None)?;
     Ok(Thresholds {
         jobs_overdue_degraded_at: parse_count_field(
             "Jobs overdue",
@@ -929,7 +952,7 @@ mod tests {
         assert_eq!(parsed.scan_p1_degraded_at, 2);
         assert_eq!(parsed.actions_failed_degraded_at, 2);
         assert_eq!(parsed.http_probe_rtt_degraded_ms, Some(300));
-        assert_eq!(parsed.availability_rtt_degraded_ms, None);
+        assert_eq!(parsed.availability_rtt_degraded_ms, Some(u64::MAX));
         let rtt = ThresholdTexts {
             rtt: "500".into(),
             ..ThresholdTexts::blank()

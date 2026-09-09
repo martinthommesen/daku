@@ -9,6 +9,10 @@
 /// shell layout does not shift under the token adoption.
 pub const SIDEBAR_WIDTH: f32 = 220.0;
 
+/// Narrow sidebar for a single platform group: one flat list needs less
+/// chrome than grouped platforms.
+pub const SIDEBAR_WIDTH_NARROW: f32 = 160.0;
+
 /// Spacing rhythm in logical pixels. Monotonic by construction. Render code
 /// adopts these incrementally; remaining literals are pre-existing outliers.
 pub const SPACE_XS: f32 = 4.0;
@@ -23,6 +27,7 @@ mod tests {
     #[test]
     fn sidebar_width_stays_pinned() {
         assert_eq!(SIDEBAR_WIDTH, 220.0);
+        assert_eq!(SIDEBAR_WIDTH_NARROW, 160.0);
     }
 
     #[test]

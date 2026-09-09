@@ -43,7 +43,7 @@ use crate::ToggleSignalNotify;
 use crate::ToggleWeeklyDigest;
 use crate::dashboard_state::{
     DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase,
-    is_trend_signal, is_voting_signal, mute_remaining_label, signal_label,
+    is_trend_signal, is_voting_signal, mute_remaining_label, short_build, signal_label,
 };
 use crate::env_sheet::{
     BuildConfig, EnvSheet, auth_label, build_config, credential_blob, credential_captions,
@@ -53,7 +53,7 @@ use crate::notifications::{
     notification_body_grouped, notification_title, post_health_notification, select_notification,
 };
 use crate::persistence::{AppSettings, save_app_settings};
-use crate::theme::{SIDEBAR_WIDTH, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XS};
+use crate::theme::{SIDEBAR_WIDTH, SIDEBAR_WIDTH_NARROW, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XS};
 use crate::{fixture_events, ui_fixture_enabled};
 
 pub struct Daku {
@@ -68,6 +68,10 @@ pub struct Daku {
     /// Command palette (⌘K) visibility and filter text.
     palette_open: bool,
     palette_input: Entity<InputState>,
+    /// Healthy-tile group disclosure: collapsed shows one expand control
+    /// with the healthy count; expanded shows the tiles. Ignored when zero
+    /// problems exist — the healthy group then defaults expanded.
+    healthy_expanded: bool,
     /// Desktop boot time: health events observed before this record as seen
     /// without firing, so launch/reconnect replays never storm.
     boot_now: i64,
@@ -84,6 +88,21 @@ pub struct Daku {
     /// `Root` owns the window's root dispatch node, so the shell only receives
     /// menu- and keystroke-dispatched actions while this handle is focused.
     focus_handle: FocusHandle,
+}
+
+/// Pre-built detail content: cards and regions built where `Context<Self>`
+/// is available, handed to the `&App` detail render.
+struct DetailContent {
+    problem_cards: Vec<gpui::AnyElement>,
+    info_cards: Vec<gpui::AnyElement>,
+    healthy_cards: Vec<gpui::AnyElement>,
+    healthy_open: bool,
+    healthy_total: usize,
+    show_healthy_toggle: bool,
+    poll_sparkline: Vec<Option<f64>>,
+    drill_in: Option<gpui::AnyElement>,
+    header_actions: Option<gpui::AnyElement>,
+    compare: Option<gpui::AnyElement>,
 }
 
 /// Single mute length offered in the Environment header. One choice keeps
@@ -140,6 +159,7 @@ impl Daku {
                 exported_path: None,
                 palette_open: false,
                 palette_input,
+                healthy_expanded: false,
                 boot_now: unix_now(),
                 notify_seen: HashSet::new(),
                 last_ambient: None,
@@ -390,6 +410,7 @@ impl Daku {
         if open_drift {
             self.state.open_card("drift");
         }
+        self.healthy_expanded = false;
         cx.notify();
     }
 
@@ -1172,21 +1193,64 @@ impl Render for Daku {
             } else {
                 (Vec::new(), Vec::new())
             };
-        let voting_cards: Vec<gpui::AnyElement> = voting
+        // Severity groups: problems first, then info-only context, then
+        // healthy collapsed. Waiting, skipped, and unknown are unobserved,
+        // never verified healthy, so they join info.
+        // Poll timeline: the availability response-time sparkline beside the
+        // event rows. Gaps mark missing polls, including unreachable ones.
+        // Skipped on the removed-Environment tombstone, which renders no
+        // detail to carry it.
+        let poll_sparkline: Vec<Option<f64>> = if removed {
+            Vec::new()
+        } else {
+            voting
+                .iter()
+                .find(|card| card.signal_id == "availability")
+                .map(|card| card.sparkline.clone())
+                .unwrap_or_default()
+        };
+        let (problems, rest): (Vec<SignalCard>, Vec<SignalCard>) = voting
+            .into_iter()
+            .partition(|card| matches!(card.status.as_str(), "degraded" | "down"));
+        let (info_voting, healthy): (Vec<SignalCard>, Vec<SignalCard>) =
+            rest.into_iter().partition(|card| {
+                card.status == crate::dashboard_state::WAITING
+                    || card.status == "skipped"
+                    || card.status == "unknown"
+            });
+        let investigate = self.state.first_problem_signal_id().map(SharedString::from);
+        let has_problems = !problems.is_empty();
+        let healthy_open = !has_problems || self.healthy_expanded;
+        let healthy_total = healthy.len();
+        let show_healthy_toggle = has_problems && healthy_total > 0;
+        let problem_cards: Vec<gpui::AnyElement> = problems
             .into_iter()
             .map(|card| self.signal_card(card, cx))
             .collect();
-        let context_cards: Vec<gpui::AnyElement> = context
+        let healthy_cards: Vec<gpui::AnyElement> = if healthy_open {
+            healthy
+                .into_iter()
+                .map(|card| self.signal_card(card, cx))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut info_cards: Vec<gpui::AnyElement> = context
             .into_iter()
             .map(|card| self.context_chip(card, cx))
             .collect();
+        info_cards.extend(
+            info_voting
+                .into_iter()
+                .map(|card| self.signal_card(card, cx)),
+        );
         let drill_in = self
             .state
             .selected_card()
             .map(|signal_id| self.drill_in_region(signal_id, cx));
         // Mute buttons and compare rows carry click listeners like the
         // cards do, so they are built here and handed to the detail render.
-        let mute_controls = self.mute_controls(cx);
+        let header_actions = self.header_actions(investigate, cx);
         let compare = self.compare_strip(cx);
         let sheet = self.env_sheet_view(cx);
         let detail = if removed {
@@ -1198,11 +1262,18 @@ impl Render for Daku {
                 .into_any_element()
         } else {
             self.render_detail(
-                voting_cards,
-                context_cards,
-                drill_in,
-                mute_controls,
-                compare,
+                DetailContent {
+                    problem_cards,
+                    info_cards,
+                    healthy_cards,
+                    healthy_open,
+                    healthy_total,
+                    show_healthy_toggle,
+                    poll_sparkline,
+                    drill_in,
+                    header_actions,
+                    compare,
+                },
                 cx,
             )
         };
@@ -1395,6 +1466,30 @@ fn sheet_button(
         .into_any_element()
 }
 
+/// One header action pill: Investigate, mute, and unmute share this shape
+/// with their own border, text colour, and handler.
+fn header_pill(
+    cx: &mut Context<Daku>,
+    id: &'static str,
+    border: gpui::Hsla,
+    color: gpui::Hsla,
+    label: &str,
+    on_click: impl Fn(&mut Daku, &ClickEvent, &mut Context<Daku>) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .px(px(10.0))
+        .py(px(2.0))
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(border)
+        .text_color(color)
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| on_click(this, event, cx)))
+        .child(label.to_owned())
+        .into_any_element()
+}
+
 /// One sheet section heading. Groups the ~25 sheet inputs under
 /// Environment, Credential, Thresholds and Expected drift.
 fn sheet_section(caption: &'static str, cx: &App) -> gpui::AnyElement {
@@ -1457,8 +1552,9 @@ impl Daku {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let selected_id = self.state.selected_id().map(str::to_owned);
         let groups = self.state.sidebar_platforms(unix_now());
+        let narrow = groups.len() <= 1;
         // Single platform keeps the flat list; more platforms group up.
-        let header_label: SharedString = if groups.len() > 1 {
+        let header_label: SharedString = if !narrow {
             "Platforms".into()
         } else {
             groups
@@ -1492,7 +1588,11 @@ impl Daku {
 
         let mut sidebar = Sidebar::new("daku-sidebar")
             .collapsible(SidebarCollapsible::None)
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(if narrow {
+                SIDEBAR_WIDTH_NARROW
+            } else {
+                SIDEBAR_WIDTH
+            }))
             .bg(gpui::transparent_black())
             .border_r_0()
             .header(
@@ -1504,7 +1604,7 @@ impl Daku {
                         .child(div().text_sm().child(header_label)),
                 ),
             );
-        if groups.len() > 1 {
+        if !narrow {
             // Slot numbers follow the flat sidebar order (⌘1–9 switch in
             // that order), so one running counter spans every group.
             let mut slot: usize = 0;
@@ -1540,13 +1640,40 @@ impl Daku {
             .into_any_element()
     }
 
-    /// Mute / unmute controls for the selected Environment header: the
-    /// mute deadline plus Unmute when muted, else one Mute button.
-    /// One choice keeps the header to a single action.
-    fn mute_controls(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// Header actions for the selected Environment: Investigate opens the
+    /// first degraded-or-down drill-in when one exists, then the mute
+    /// toggle plus Edit. One row beside the diagnosis.
+    fn header_actions(
+        &self,
+        investigate: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let id = self.state.selected_id()?.to_owned();
         let now = unix_now();
+        let (primary, foreground, border, muted) = {
+            let theme = cx.theme();
+            (
+                theme.primary,
+                theme.foreground,
+                theme.border,
+                theme.muted_foreground,
+            )
+        };
         let base = h_flex().items_center().gap(px(SPACE_SM)).text_xs();
+        let base = match investigate {
+            Some(target) => base.child(header_pill(
+                &mut *cx,
+                "investigate",
+                primary,
+                foreground,
+                "Investigate",
+                move |this, _, cx| {
+                    this.state.open_card(&target);
+                    cx.notify();
+                },
+            )),
+            None => base,
+        };
         if let Some(until) = self
             .state
             .muted_until(&id)
@@ -1558,41 +1685,31 @@ impl Daku {
                         .text_color(cx.theme().warning)
                         .child(mute_remaining_label(until, now)),
                 )
-                .child(
-                    div()
-                        .id("mute-unmute")
-                        .px(px(10.0))
-                        .py(px(2.0))
-                        .rounded(cx.theme().radius)
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .text_color(cx.theme().foreground)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.unmute_selected(cx);
-                        }))
-                        .child("Unmute"),
-                )
+                .child(header_pill(
+                    &mut *cx,
+                    "mute-unmute",
+                    border,
+                    foreground,
+                    "Unmute",
+                    |this, _, cx| {
+                        this.unmute_selected(cx);
+                    },
+                ))
                 .child(edit_button(cx))
                 .into_any_element(),
             )
         } else {
             Some(
-                base.child(
-                    div()
-                        .id("mute-24h")
-                        .px(px(10.0))
-                        .py(px(2.0))
-                        .rounded(cx.theme().radius)
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .text_color(cx.theme().muted_foreground)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.mute_selected(MUTE_DEFAULT_SECS, cx);
-                        }))
-                        .child("Mute for 24h"),
-                )
+                base.child(header_pill(
+                    &mut *cx,
+                    "mute-24h",
+                    border,
+                    muted,
+                    "Mute for 24h",
+                    |this, _, cx| {
+                        this.mute_selected(MUTE_DEFAULT_SECS, cx);
+                    },
+                ))
                 .child(edit_button(cx))
                 .into_any_element(),
             )
@@ -2038,9 +2155,12 @@ impl Daku {
                         env_id: SharedString::from(row.id.clone()),
                         open_drift: true,
                     };
+                    let full_build = row.build.clone();
+                    let short = full_build.as_deref().map(short_build);
+                    let build = short.clone().unwrap_or_else(|| "\u{2014}".to_owned());
                     compare_row_cells([
                         row.label.clone(),
-                        row.build.clone().unwrap_or_else(|| "\u{2014}".to_owned()),
+                        build,
                         row.drift.clone(),
                         row.last_clone.clone(),
                     ])
@@ -2052,6 +2172,13 @@ impl Daku {
                     })
                     .id(SharedString::from(format!("compare-{}", row.id)))
                     .cursor_pointer()
+                    .when_some(
+                        match (&full_build, &short) {
+                            (Some(full), Some(short)) if short != full => Some(full.clone()),
+                            _ => None,
+                        },
+                        |element, full| with_tooltip(element, &full),
+                    )
                     .on_click(move |_, window, cx| {
                         window.dispatch_action(Box::new(action.clone()), cx);
                     })
@@ -2077,42 +2204,64 @@ impl Daku {
         )
     }
 
-    /// Recent health/build transitions under the Signal cards. Omitted
-    /// entirely without events — a fresh Environment shows no empty box.
-    /// Plain list: no search and no note editor. Stored annotations still
-    /// render as part of the row text.
-    fn recent_block(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// Recent polls under the Signal cards: the availability sparkline plus
+    /// health/build transitions. Omitted entirely without either — a fresh
+    /// Environment shows no empty box. Plain list: no search and no note
+    /// editor. Stored annotations still render as part of the row text.
+    fn recent_block(
+        &self,
+        poll_sparkline: &[Option<f64>],
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let now = unix_now();
         let entries = self.state.timeline(now, 20, "");
-        if entries.is_empty() {
+        let has_spark = poll_sparkline.iter().any(Option::is_some);
+        if entries.is_empty() && !has_spark {
             return None;
         }
         let mut block = v_flex().mx(px(22.0)).mb(px(SPACE_LG)).gap(px(2.0)).child(
             div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child("Recent"),
+                .child("Recent polls"),
         );
-        for entry in entries {
-            block = block.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(entry.text.clone()),
-            );
+        if has_spark {
+            block = block.child(sparkline_with_scale(
+                poll_sparkline,
+                cx.theme().muted_foreground,
+                px(64.0),
+                unit_suffix("availability"),
+                TREND_WINDOW_LABEL,
+                cx,
+            ));
+        }
+        for (index, entry) in entries.into_iter().enumerate() {
+            let row = div()
+                .id(SharedString::from(format!("recent-{index}")))
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(entry.text.clone());
+            block = block.child(match entry.tooltip {
+                Some(tip) => with_tooltip(row, &tip).into_any_element(),
+                None => row.into_any_element(),
+            });
         }
         Some(block.into_any_element())
     }
 
-    fn render_detail(
-        &self,
-        voting_cards: Vec<gpui::AnyElement>,
-        context_cards: Vec<gpui::AnyElement>,
-        drill_in: Option<gpui::AnyElement>,
-        mute_controls: Option<gpui::AnyElement>,
-        compare: Option<gpui::AnyElement>,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_detail(&self, content: DetailContent, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let DetailContent {
+            problem_cards,
+            info_cards,
+            healthy_cards,
+            healthy_open,
+            healthy_total,
+            show_healthy_toggle,
+            poll_sparkline,
+            drill_in,
+            header_actions,
+            compare,
+        } = content;
         let selected = self.state.selected().cloned();
         div()
             .id("detail")
@@ -2138,12 +2287,12 @@ impl Daku {
                 } else {
                     cx.theme().muted_foreground
                 };
-                // One verdict block answers "why is this degraded": the
-                // voting lines first, the clone/upgrade correlation with
-                // them, metadata after. Healthy Environments show no block.
-                let explain = self.state.health_explain();
-                let correlation = self.state.correlation_build(unix_now());
-                let has_verdict = !explain.is_empty() || correlation.is_some();
+                // Diagnosis headline answers "what is wrong and why" in one
+                // block: state plus affected count, then the possible cause
+                // with a lead example. Tiles below own the per-signal detail,
+                // so no line here repeats a tile summary. Healthy and
+                // unreachable Environments show no headline block.
+                let headline = self.state.diagnosis_headline(unix_now());
                 let build_age = self.state.build_age().map(|(_, since)| {
                     format!(
                         "on this build {} ago",
@@ -2196,32 +2345,59 @@ impl Daku {
                                             .child(fresh.label),
                                     ),
                             )
-                            .when(has_verdict, |element| {
+                            .when_some(headline, |element, headline| {
+                                let state_word = match environment.health {
+                                    EnvironmentHealth::Down => "Down",
+                                    _ => "Degraded",
+                                };
+                                let count_line = format!(
+                                    "{state_word} — {} signal{} affected",
+                                    headline.degraded_count,
+                                    if headline.degraded_count == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    }
+                                );
+                                let lead = signal_label(headline.lead_signal_id);
+                                let short_cause = headline.build.as_deref().map(short_build);
+                                let cause_line = match &short_cause {
+                                    Some(short) => {
+                                        format!("Possible {short} fallout · e.g. {lead}")
+                                    }
+                                    None => format!("e.g. {lead}"),
+                                };
+                                let cause_tip = match (&headline.build, &short_cause) {
+                                    (Some(full), Some(short)) if short != full => {
+                                        Some(full.clone())
+                                    }
+                                    _ => None,
+                                };
                                 element.child(
                                     v_flex()
                                         .gap(px(2.0))
                                         .p(px(10.0))
                                         .rounded(cx.theme().radius)
                                         .border_1()
-                                        .border_color(cx.theme().warning.opacity(0.45))
-                                        .bg(cx.theme().warning.opacity(0.08))
-                                        .children(explain.iter().map(|line| {
+                                        .border_color(cx.theme().warning)
+                                        .bg(cx.theme().warning.opacity(0.12))
+                                        .child(
                                             div()
-                                                .text_sm()
+                                                .text_lg()
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(cx.theme().foreground)
-                                                .child(line.clone())
-                                        }))
-                                        .when_some(correlation, |element, build| {
-                                            element.child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(format!(
-                                                        "Started after build {build} — likely clone/upgrade fallout"
-                                                    )),
-                                            )
-                                        }),
+                                                .child(count_line),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("headline-cause")
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .when_some(cause_tip, |element, full| {
+                                                    with_tooltip(element, &full)
+                                                })
+                                                .child(cause_line),
+                                        ),
                                 )
                             })
                             .child(
@@ -2248,18 +2424,64 @@ impl Daku {
                                         )
                                     }),
                             )
-                            .children(mute_controls),
+                            .children(header_actions)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(SPACE_SM))
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .children(
+                                        [
+                                            (
+                                                health_color(EnvironmentHealth::Healthy, cx),
+                                                false,
+                                                "healthy",
+                                            ),
+                                            (
+                                                health_color(EnvironmentHealth::Degraded, cx),
+                                                false,
+                                                "degraded",
+                                            ),
+                                            (
+                                                health_color(EnvironmentHealth::Down, cx),
+                                                false,
+                                                "down",
+                                            ),
+                                            (
+                                                cx.theme().muted_foreground,
+                                                true,
+                                                "no reading",
+                                            ),
+                                            (
+                                                cx.theme().muted_foreground,
+                                                false,
+                                                "muted",
+                                            ),
+                                        ]
+                                        .into_iter()
+                                        .map(|(color, hollow, label)| {
+                                            h_flex()
+                                                .items_center()
+                                                .gap(px(4.0))
+                                                .child(status_dot(color, hollow))
+                                                .child(label)
+                                        }),
+                                    ),
+                            ),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .gap(px(SPACE_MD))
-                            .p(px(22.0))
-                            .children(voting_cards),
-                    )
-                    .when(!context_cards.is_empty(), |element| {
+                    .when(!problem_cards.is_empty(), |element| {
+                        element.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .gap(px(SPACE_MD))
+                                .p(px(22.0))
+                                .children(problem_cards),
+                        )
+                    })
+                    .when(!info_cards.is_empty(), |element| {
                         element.child(
                             v_flex()
                                 .mx(px(22.0))
@@ -2269,7 +2491,7 @@ impl Daku {
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child("Other signals — never vote toward health"),
+                                        .child("Info only"),
                                 )
                                 .child(
                                     div()
@@ -2277,11 +2499,51 @@ impl Daku {
                                         .flex_row()
                                         .flex_wrap()
                                         .gap(px(SPACE_SM))
-                                        .children(context_cards),
+                                        .children(info_cards),
                                 ),
                         )
                     })
-                    .children(self.recent_block(cx))
+                    .when(healthy_total > 0, |element| {
+                        let label: SharedString = if healthy_open {
+                            "Hide healthy signals".into()
+                        } else {
+                            format!("Show {healthy_total} healthy signals").into()
+                        };
+                        element.child(
+                            v_flex()
+                                .mx(px(22.0))
+                                .mb(px(SPACE_MD))
+                                .gap(px(SPACE_XS))
+                                .when(show_healthy_toggle, |element| {
+                                    element.child(
+                                        div()
+                                            .id("healthy-toggle")
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_decoration_1())
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    this.healthy_expanded = !this.healthy_expanded;
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .child(label),
+                                    )
+                                })
+                                .when(healthy_open, |element| {
+                                    element.child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .flex_wrap()
+                                            .gap(px(SPACE_SM))
+                                            .children(healthy_cards),
+                                    )
+                                }),
+                        )
+                    })
+                    .children(self.recent_block(&poll_sparkline, cx))
                     .children(self.palette_overlay(cx))
                     .children(drill_in)
                     .children(compare)
@@ -2736,6 +2998,13 @@ fn status_dot(color: gpui::Hsla, hollow: bool) -> gpui::Div {
     } else {
         dot.bg(color)
     }
+}
+
+/// Full text behind a truncated row, on hover. The row needs a stable id
+/// (tooltip state keys off it), like `clipped_line`.
+fn with_tooltip(element: gpui::Stateful<gpui::Div>, tip: &str) -> gpui::Stateful<gpui::Div> {
+    let tip = SharedString::from(tip.to_owned());
+    element.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
 }
 
 /// One line that clips instead of wrapping; the full text is on hover. The id

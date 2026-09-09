@@ -10,8 +10,8 @@ pub mod settings;
 mod protocol;
 
 pub use environment::{
-    AuthMethod, CredentialShapeError, EnvironmentConfig, NON_VOTING_SIGNALS, Platform, Thresholds,
-    split_github_repo, validate_credential,
+    AVAILABILITY_RTT_DEFAULT_MS, AuthMethod, CredentialShapeError, EnvironmentConfig,
+    NON_VOTING_SIGNALS, Platform, Thresholds, split_github_repo, validate_credential,
 };
 pub use payload::{
     TypedPayload, drift_mismatch, drift_role, parse, parse_build, parse_reachability,

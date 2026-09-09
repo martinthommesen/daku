@@ -54,7 +54,7 @@ Shared semantics:
 the build string and round-trip ms. Anything else → `unreachable`/`down`
 (429 records `HTTP 429`). Transport errors probe as `down` with the error.
 
-Thresholds: `availability_rtt_degraded_ms` (default off). A reachable
+Thresholds: `availability_rtt_degraded_ms` (default 5000 ms, `off` disables). A reachable
 Environment slower than the ceiling degrades with `rtt X ms > Y ms` as the
 detail. Samples keep RTT only when reachable (a timeout is not latency).
 

@@ -514,8 +514,11 @@ mod tests {
         assert_eq!(thresholds.http_probe_rtt_degraded_ms, None);
         assert!(thresholds.summary().contains("updates≥off"));
         assert_eq!(thresholds.ecc_output_ready_degraded_at, 100);
-        assert_eq!(thresholds.availability_rtt_degraded_ms, None);
-        assert!(thresholds.summary().contains("rtt>off"));
+        assert_eq!(
+            thresholds.availability_rtt_degraded_ms,
+            Some(daku_protocol::AVAILABILITY_RTT_DEFAULT_MS)
+        );
+        assert!(thresholds.summary().contains("rtt>5000ms"));
         assert!(thresholds.summary().contains("email≥off"));
     }
 

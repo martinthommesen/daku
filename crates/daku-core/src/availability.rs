@@ -178,16 +178,16 @@ impl AvailabilitySignal {
 }
 
 /// A reachable Environment slower than its configured ceiling degrades, with
-/// the ceiling in the error string so the card says why. `None` disables the
-/// check — the historical behaviour, since availability never had a response-
-/// time threshold before.
+/// the ceiling in the error string so the card says why. A missing ceiling
+/// follows the default; `Some(u64::MAX)` (the sheet's `off`) disables the
+/// check.
 pub fn apply_rtt_threshold(
     observation: AvailabilityObservation,
     thresholds: &Thresholds,
 ) -> AvailabilityObservation {
-    let Some(max_ms) = thresholds.availability_rtt_degraded_ms else {
-        return observation;
-    };
+    let max_ms = thresholds
+        .availability_rtt_degraded_ms
+        .unwrap_or(daku_protocol::AVAILABILITY_RTT_DEFAULT_MS);
     if observation.reachability != Reachability::Reachable || observation.rtt_ms <= max_ms {
         return observation;
     }
@@ -295,11 +295,51 @@ mod tests {
     const UNAUTH_JSON: &str = include_str!("../tests/fixtures/availability/401.json");
 
     #[test]
-    fn rtt_threshold_is_disabled_by_default() {
-        let observation = classify_availability_response(200, "application/json", OK_JSON, 42);
-        let unchanged = apply_rtt_threshold(observation.clone(), &Thresholds::default());
-        assert_eq!(unchanged, observation);
-        assert_eq!(unchanged.state, SignalState::Healthy);
+    fn rtt_threshold_defaults_to_5000_ms() {
+        let thresholds = Thresholds::default();
+        assert_eq!(
+            thresholds.availability_rtt_degraded_ms,
+            Some(daku_protocol::AVAILABILITY_RTT_DEFAULT_MS)
+        );
+        // Boundary: exactly at the ceiling stays healthy, one ms over degrades.
+        let at_ceiling = classify_availability_response(200, "application/json", OK_JSON, 5000);
+        assert_eq!(
+            apply_rtt_threshold(at_ceiling, &thresholds).state,
+            SignalState::Healthy
+        );
+        let over = classify_availability_response(200, "application/json", OK_JSON, 5001);
+        let degraded = apply_rtt_threshold(over, &thresholds);
+        assert_eq!(degraded.state, SignalState::Degraded);
+        assert_eq!(degraded.error.as_deref(), Some("rtt 5001 ms > 5000 ms"));
+        // The reported case: ten seconds is never healthy by default.
+        let slow = classify_availability_response(200, "application/json", OK_JSON, 10087);
+        assert_eq!(
+            apply_rtt_threshold(slow.clone(), &thresholds).state,
+            SignalState::Degraded
+        );
+        // A missing ceiling follows the default, so legacy stored nulls flip.
+        let legacy = Thresholds {
+            availability_rtt_degraded_ms: None,
+            ..Thresholds::default()
+        };
+        assert_eq!(
+            apply_rtt_threshold(slow.clone(), &legacy).state,
+            SignalState::Degraded
+        );
+        // Explicit off never degrades; unreachable never votes on latency.
+        let off = Thresholds {
+            availability_rtt_degraded_ms: Some(u64::MAX),
+            ..Thresholds::default()
+        };
+        assert_eq!(
+            apply_rtt_threshold(slow.clone(), &off).state,
+            SignalState::Healthy
+        );
+        let down = classify_availability_response(429, "application/json", "{}", 5000);
+        assert_eq!(
+            apply_rtt_threshold(down, &thresholds).state,
+            SignalState::Down
+        );
     }
 
     #[test]

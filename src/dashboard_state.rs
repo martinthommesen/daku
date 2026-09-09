@@ -289,6 +289,17 @@ pub struct PlatformGroup {
     pub rows: Vec<SidebarRow>,
 }
 
+/// Diagnosis headline parts for a degraded Environment: how many voting
+/// signals are degraded or down, the suspect build when the clone/upgrade
+/// correlation fires, and the first degraded-or-down voting signal in signal
+/// order as the lead example (signal order, not causal priority).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosisHeadline {
+    pub degraded_count: usize,
+    pub build: Option<String>,
+    pub lead_signal_id: &'static str,
+}
+
 /// One merged Recent-timeline row. `note_key` is `(observed_at, kind)` for
 /// health events — the annotation target — and `None` for per-Signal rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,6 +308,9 @@ pub struct TimelineEntry {
     pub text: String,
     pub note_key: Option<(i64, String)>,
     pub note: Option<String>,
+    /// Full text behind a truncated row, shown in the tooltip. `None` rows
+    /// render plain.
+    pub tooltip: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -438,6 +452,7 @@ impl DashboardState {
                 text,
                 note_key: Some((event.observed_at, event.kind.as_str().to_owned())),
                 note: event.note.filter(|note| !note.trim().is_empty()),
+                tooltip: event.build.clone(),
             });
         }
         if let Some(events) = self.signal_events.get(id) {
@@ -454,6 +469,7 @@ impl DashboardState {
                     ),
                     note_key: None,
                     note: None,
+                    tooltip: None,
                 }
             }));
         }
@@ -1702,7 +1718,7 @@ impl DashboardState {
                 .and_then(|map| map.get("availability"))
                 .and_then(|snapshot| parse_build(&snapshot.payload));
             if let Some(build) = build {
-                return format!("{summary} \u{b7} {build}");
+                return format!("{summary} \u{b7} {}", short_build(&build));
             }
         }
         summary
@@ -1718,7 +1734,7 @@ impl DashboardState {
             .and_then(|map| map.get(signal_id))
             .and_then(|snapshot| skipped_reason(&snapshot.payload));
         match reason.as_deref() {
-            Some("no_clone_source") => "mark one Environment \"clone_source\": true",
+            Some("no_clone_source") => "Set one Environment as the clone source",
             Some("need_two_environments") => "add a second Environment",
             _ => "",
         }
@@ -1736,9 +1752,10 @@ impl DashboardState {
             .unwrap_or_default()
     }
 
-    /// Same lines for any Environment id. Notifications use this: the
-    /// firing Environment is not necessarily the selected one.
-    pub fn health_explain_for(&self, environment_id: &str) -> Vec<String> {
+    /// Degraded-or-down voting signal ids for one Environment, in signal
+    /// order. Shared by the explainer and the diagnosis headline so the
+    /// count, the lead example, and the lines can never disagree.
+    fn degraded_voting_ids(&self, environment_id: &str) -> Vec<&'static str> {
         let platform_id = self
             .environments
             .iter()
@@ -1752,11 +1769,24 @@ impl DashboardState {
             .iter()
             .copied()
             .filter(|signal_id| is_voting_signal(signal_id))
+            .filter(|signal_id| {
+                snapshots.get(*signal_id).is_some_and(|snapshot| {
+                    matches!(snapshot.dto.state.as_str(), "degraded" | "down")
+                })
+            })
+            .collect()
+    }
+
+    /// Same lines for any Environment id. Notifications use this: the
+    /// firing Environment is not necessarily the selected one.
+    pub fn health_explain_for(&self, environment_id: &str) -> Vec<String> {
+        let Some(snapshots) = self.snapshots.get(environment_id) else {
+            return Vec::new();
+        };
+        self.degraded_voting_ids(environment_id)
+            .into_iter()
             .filter_map(|signal_id| {
                 let snapshot = snapshots.get(signal_id)?;
-                if !matches!(snapshot.dto.state.as_str(), "degraded" | "down") {
-                    return None;
-                }
                 let summary = summarize_value(signal_id, &snapshot.payload);
                 let detail = detail_from_value(signal_id, &snapshot.payload);
                 let body = if !summary.is_empty() { summary } else { detail };
@@ -1803,6 +1833,40 @@ impl DashboardState {
         } else {
             None
         }
+    }
+
+    /// Diagnosis headline for the selected Environment: the degraded voting
+    /// count, the suspect build when the clone/upgrade correlation fires, and
+    /// the first degraded-or-down voting signal in signal order as the lead
+    /// example. `None` unless currently degraded or down — healthy
+    /// Environments render their own header without a cause claim. Pure read
+    /// of published state; the shell owns the wording.
+    pub fn diagnosis_headline(&self, now: i64) -> Option<DiagnosisHeadline> {
+        let environment_id = self.selected_id.as_deref()?;
+        let environment = self
+            .environments
+            .iter()
+            .find(|env| env.id == environment_id)?;
+        if !matches!(
+            environment.health,
+            EnvironmentHealth::Degraded | EnvironmentHealth::Down
+        ) {
+            return None;
+        }
+        let lead_signal_id = self.first_problem_signal_id()?;
+        Some(DiagnosisHeadline {
+            degraded_count: self.degraded_voting_ids(environment_id).len(),
+            build: self.correlation_build(now),
+            lead_signal_id,
+        })
+    }
+
+    /// First degraded-or-down voting signal in signal order, if any.
+    /// Drives Investigate so the action can never disagree with the
+    /// headline lead example.
+    pub fn first_problem_signal_id(&self) -> Option<&'static str> {
+        let environment_id = self.selected_id.as_deref()?;
+        self.degraded_voting_ids(environment_id).into_iter().next()
     }
 
     /// How unusual the latest sample is for a trend Signal: latest raw value
@@ -2022,10 +2086,19 @@ impl DashboardState {
                         .map(str::to_owned)
                 };
                 match (version("source_version"), version("other_version")) {
-                    (Some(source), Some(other)) => format!("{id}: {source} → {other}"),
-                    (Some(_), None) => format!("{id}: missing here"),
-                    (None, Some(_)) => format!("{id}: only here"),
-                    (None, None) => id.to_owned(),
+                    (Some(source), Some(other)) => format!(
+                        "{}: {} → {}",
+                        truncate_with_ellipsis(id, 32),
+                        truncate_with_ellipsis(&source, 24),
+                        truncate_with_ellipsis(&other, 24)
+                    ),
+                    (Some(_), None) => {
+                        format!("{}: missing here", truncate_with_ellipsis(id, 32))
+                    }
+                    (None, Some(_)) => {
+                        format!("{}: only here", truncate_with_ellipsis(id, 32))
+                    }
+                    (None, None) => truncate_with_ellipsis(id, 32),
                 }
             })
             .collect();
@@ -2071,6 +2144,27 @@ impl DashboardState {
     }
 }
 
+/// Truncates to `max_chars` characters with an ellipsis marker. Short
+/// inputs pass through untouched so callers never pad. Stops counting past
+/// `max_chars`, so long inputs cost one short walk, not two full ones.
+pub fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().nth(max_chars).is_none() {
+        return text.to_owned();
+    }
+    let kept = max_chars.saturating_sub(1);
+    format!("{}…", text.chars().take(kept).collect::<String>())
+}
+
+/// Build short-label width, shared by the label and every truncation guard
+/// so the cutoff lives in one place.
+pub const BUILD_SHORT_LEN: usize = 28;
+
+/// Short label for build strings and long identifiers: the head plus an
+/// ellipsis. The full text belongs in the tooltip beside it.
+pub fn short_build(build: &str) -> String {
+    truncate_with_ellipsis(build, BUILD_SHORT_LEN)
+}
+
 /// Compact age without a prefix: "40 s", "45 min", "3 h", "12 d".
 /// Recent timelines and build age share it; `freshness` keeps its own
 /// "polled … ago" phrasing untouched.
@@ -2099,7 +2193,7 @@ pub fn format_health_event(event: &HealthEventDto, now: i64) -> String {
         }
         HealthEventKind::Build => {
             let build = event.build.as_deref().unwrap_or("?");
-            format!("build {build}, {ago} ago")
+            format!("build {}, {ago} ago", short_build(build))
         }
     }
 }
@@ -2245,7 +2339,7 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
             value.get("rtt_ms").and_then(|item| item.as_u64()),
             value.get("build").and_then(|item| item.as_str()),
         ) {
-            (Some(ms), _) => format!("{ms} ms"),
+            (Some(ms), _) => format!("{ms} ms response time"),
             (None, Some(build)) => build.to_owned(),
             _ => String::new(),
         },
@@ -2277,7 +2371,7 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 .and_then(|item| item.as_u64())
                 .unwrap_or(0);
             if total == 0 {
-                return "no MID servers".into();
+                return "No MID servers".into();
             }
             format!(
                 "{}/{} MID up · queue {}",
@@ -2317,13 +2411,12 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 format!("{failed} failed · last 7d")
             } else if let Some(to) = value.get("last_to").and_then(|item| item.as_str()) {
                 match value.get("last_age_days").and_then(|item| item.as_i64()) {
-                    Some(0) => format!("{to} · today"),
                     Some(1) => format!("{to} · 1 day ago"),
                     Some(days) => format!("{to} · {days} days ago"),
                     None => to.to_owned(),
                 }
             } else {
-                "no upgrades found".into()
+                "No upgrades found".into()
             }
         }
         "sessions" => {
@@ -2357,7 +2450,7 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
             format!("{tables} tables · {} rows", compact_count(total))
         }
         "slow_txn" => format!(
-            "{} ms avg · last hour",
+            "{} ms avg transaction · last hour",
             value
                 .get("transaction_avg_ms")
                 .and_then(|item| item.as_f64())
@@ -2370,7 +2463,7 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 .and_then(|item| item.as_u64())
                 .unwrap_or(0);
             if open == 0 {
-                "no open update sets".into()
+                "No open update sets".into()
             } else if open == 1 {
                 "1 open update set".into()
             } else {
@@ -2386,12 +2479,14 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 .get("p2_open")
                 .and_then(|item| item.as_u64())
                 .unwrap_or(0);
-            if p1 > 0 {
-                format!("{p1} P1 · {p2} P2")
+            if p1 > 0 && p2 > 0 {
+                format!("{p1} P1 · {p2} P2 findings")
+            } else if p1 > 0 {
+                format!("{p1} P1 findings")
             } else if p2 > 0 {
-                format!("{p2} P2 · no P1")
+                format!("{p2} P2 findings")
             } else {
-                "no open findings".into()
+                "No open findings".into()
             }
         }
         "http_probe" => {
@@ -2418,7 +2513,7 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
         }
         "drift" => {
             if value.get("role").and_then(|item| item.as_str()) == Some("source") {
-                "source of truth".into()
+                "Source of truth".into()
             } else if let Some(count) = value.get("mismatches").and_then(|item| item.as_u64()) {
                 let expected = value
                     .get("expected_mismatches")
@@ -2438,13 +2533,12 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 // `supported: false` is the source's own 403: it cannot list
                 // clones, so no target will ever get an answer from it.
                 if value.get("supported") == Some(&serde_json::Value::Bool(false)) {
-                    "clone source \u{b7} cannot list clones".into()
+                    "Clone source \u{b7} cannot list clones".into()
                 } else {
-                    "clone source".into()
+                    "Clone source".into()
                 }
             } else if let Some(days) = value.get("age_days").and_then(|item| item.as_i64()) {
                 match days {
-                    0 => "today".into(),
                     1 => "1 day ago".into(),
                     days => format!("{days} days ago"),
                 }
@@ -2454,12 +2548,12 @@ fn summarize_value(signal_id: &str, value: &serde_json::Value) -> String {
                 // carries a null `completed` too. The 10 mirrors
                 // daku-core's CLONE_PAGE_LIMIT (the client does not depend on
                 // that crate).
-                "not in the last 10 clones".into()
+                "Not in the last 10 clones".into()
             } else if value
                 .get("completed")
                 .is_some_and(serde_json::Value::is_null)
             {
-                "no clone found".into()
+                "No clone found".into()
             } else {
                 String::new()
             }
@@ -2474,11 +2568,11 @@ fn detail_from_value(signal_id: &str, value: &serde_json::Value) -> String {
         return match reason {
             "asleep" => "Environment asleep".to_owned(),
             "unreachable" => "Environment unreachable".to_owned(),
-            "need_two_environments" => "needs two Environments".to_owned(),
-            "no_clone_source" => "no clone source configured".to_owned(),
-            "clone_source_cannot_list_clones" => "clone source cannot list clones".to_owned(),
-            "clone_source_unreachable" => "clone source unreachable".to_owned(),
-            "clone_source_asleep" => "clone source asleep".to_owned(),
+            "need_two_environments" => "Needs two Environments".to_owned(),
+            "no_clone_source" => "No clone source configured".to_owned(),
+            "clone_source_cannot_list_clones" => "Clone source cannot list clones".to_owned(),
+            "clone_source_unreachable" => "Clone source unreachable".to_owned(),
+            "clone_source_asleep" => "Clone source asleep".to_owned(),
             "scan_unavailable" => "Instance Scan unavailable".to_owned(),
             other => other.to_owned(),
         };
@@ -2756,34 +2850,38 @@ mod tests {
     /// `pinned_payloads_render` fails until it is listed here — that is the
     /// point of the pin.
     const RENDERED: [(&str, &str, &str); 47] = [
-        ("availability_asleep", "142 ms", ""),
+        ("availability_asleep", "142 ms response time", ""),
         // The build string is shown with the plugin inventory (drift), not
         // under the latency number.
-        ("availability_reachable", "142 ms", ""),
-        ("availability_reachable_other_build", "142 ms", ""),
+        ("availability_reachable", "142 ms response time", ""),
+        (
+            "availability_reachable_other_build",
+            "142 ms response time",
+            "",
+        ),
         (
             "availability_unreachable",
-            "142 ms",
+            "142 ms response time",
             "throttled by ServiceNow (HTTP 429); retry budget exhausted",
         ),
         // A failed probe carries no counts, so there is no summary to render:
         // the card falls back to its status word and the detail says why.
         ("down_probe_failed", "", "HTTP 429"),
         ("drift_compare", "3 plugins differ", ""),
-        ("drift_source", "source of truth", ""),
+        ("drift_source", "Source of truth", ""),
         ("jobs_counts", "2 overdue \u{b7} 0 in error", ""),
         ("jobs_zero", "0 overdue \u{b7} 0 in error", ""),
         (
             "last_clone_source_cannot_list",
-            "clone source \u{b7} cannot list clones",
+            "Clone source \u{b7} cannot list clones",
             "",
         ),
-        ("last_clone_source_supported", "clone source", ""),
+        ("last_clone_source_supported", "Clone source", ""),
         ("last_clone_target_completed", "12 days ago", ""),
-        ("last_clone_target_never", "no clone found", ""),
+        ("last_clone_target_never", "No clone found", ""),
         (
             "last_clone_target_older_than_page",
-            "not in the last 10 clones",
+            "Not in the last 10 clones",
             "",
         ),
         ("mid_ecc_healthy", "3/3 MID up \u{b7} queue 2", ""),
@@ -2795,39 +2893,39 @@ mod tests {
         ("email_count", "2 email failures \u{b7} last hour", ""),
         ("email_zero", "0 email failures \u{b7} last hour", ""),
         ("upgrade_failed", "1 failed \u{b7} last 7d", ""),
-        ("upgrade_clean", "Zurich P1 \u{b7} today", ""),
+        ("upgrade_clean", "Zurich P1 \u{b7} 0 days ago", ""),
         ("sessions_count", "3 active sessions", ""),
         ("sessions_zero", "0 active sessions", ""),
         ("table_growth", "5 tables \u{b7} 211.3K rows", ""),
         ("table_growth_quiet", "5 tables \u{b7} 12K rows", ""),
-        ("txn_slow", "842 ms avg \u{b7} last hour", ""),
-        ("txn_ok", "118 ms avg \u{b7} last hour", ""),
+        ("txn_slow", "842 ms avg transaction \u{b7} last hour", ""),
+        ("txn_ok", "118 ms avg transaction \u{b7} last hour", ""),
         ("update_sets_open", "2 open update sets", ""),
-        ("update_sets_clean", "no open update sets", ""),
-        ("scan_open", "1 P1 \u{b7} 1 P2", ""),
-        ("scan_clean", "no open findings", ""),
+        ("update_sets_clean", "No open update sets", ""),
+        ("scan_open", "1 P1 \u{b7} 1 P2 findings", ""),
+        ("scan_clean", "No open findings", ""),
         ("http_probe_ok", "0 ms \u{b7} HTTP 200", ""),
         ("http_probe_down", "0 ms \u{b7} HTTP 503", ""),
         ("actions_failed", "1 failed run \u{b7} 24h", ""),
         ("actions_clean", "0 failed runs \u{b7} 24h", ""),
         ("skipped_asleep", "", "Environment asleep"),
-        ("skipped_clone_source_asleep", "", "clone source asleep"),
+        ("skipped_clone_source_asleep", "", "Clone source asleep"),
         (
             "skipped_clone_source_cannot_list_clones",
             "",
-            "clone source cannot list clones",
+            "Clone source cannot list clones",
         ),
         (
             "skipped_clone_source_unreachable",
             "",
-            "clone source unreachable",
+            "Clone source unreachable",
         ),
         (
             "skipped_need_two_environments",
             "",
-            "needs two Environments",
+            "Needs two Environments",
         ),
-        ("skipped_no_clone_source", "", "no clone source configured"),
+        ("skipped_no_clone_source", "", "No clone source configured"),
         ("skipped_unreachable", "", "Environment unreachable"),
         ("syslog_count", "4 errors \u{b7} last hour", ""),
         ("syslog_zero", "0 errors \u{b7} last hour", ""),
@@ -3023,7 +3121,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.starts_with("Because: Instance Scan: 1 P1 · 1 P2")),
+                .any(|line| line.starts_with("Because: Instance Scan: 1 P1 · 1 P2 findings")),
             "{text}"
         );
         assert!(
@@ -3046,10 +3144,91 @@ mod tests {
                 "Outbound: 3 HTTP failures · last hour".to_owned(),
                 "Flow errors: 2 flow errors · last hour".to_owned(),
                 "Upgrades: 1 failed · last 7d".to_owned(),
-                "Slow transactions: 842 ms avg · last hour".to_owned(),
+                "Slow transactions: 842 ms avg transaction · last hour".to_owned(),
                 "Update sets: 2 open update sets".to_owned(),
-                "Instance Scan: 1 P1 · 1 P2".to_owned(),
+                "Instance Scan: 1 P1 · 1 P2 findings".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_keeps_short_text_and_marks_cuts() {
+        assert_eq!(truncate_with_ellipsis("abc", 5), "abc");
+        assert_eq!(truncate_with_ellipsis("abcde", 5), "abcde");
+        assert_eq!(truncate_with_ellipsis("abcdef", 5), "abcd…");
+        assert_eq!(
+            short_build("glide-zurich-12-18-2025__patch0-hotfix1")
+                .chars()
+                .count(),
+            28
+        );
+        assert!(short_build("glide-zurich-12-18-2025__patch0-hotfix1").ends_with('…'));
+        assert_eq!(short_build("short"), "short");
+    }
+
+    #[test]
+    fn diagnosis_headline_names_count_build_and_lead() {
+        let state = loaded();
+        let headline = state
+            .diagnosis_headline(TEST_NOW)
+            .expect("fixture prod is degraded");
+        assert_eq!(headline.degraded_count, state.health_explain().len());
+        assert_eq!(headline.degraded_count, 8);
+        assert_eq!(headline.build, state.correlation_build(TEST_NOW));
+        assert!(headline.build.is_some());
+        assert_eq!(headline.lead_signal_id, "jobs");
+        assert_eq!(signal_label(headline.lead_signal_id), "Scheduled jobs");
+    }
+
+    #[test]
+    fn diagnosis_headline_absent_without_degraded_selection() {
+        let mut state = loaded();
+        state.select("test");
+        // The test env votes but is not degraded, so no cause claim renders.
+        assert_eq!(state.diagnosis_headline(TEST_NOW), None);
+        let fresh = DashboardState::new();
+        assert_eq!(fresh.diagnosis_headline(TEST_NOW), None);
+    }
+
+    #[test]
+    fn diagnosis_headline_covers_down_with_degraded_snapshots() {
+        let mut state = loaded();
+        state.apply(&ServerMessage::EnvironmentsUpdated {
+            environments: vec![
+                env(
+                    "prod",
+                    "Production",
+                    EnvironmentHealth::Down,
+                    Reachability::Unreachable,
+                ),
+                env(
+                    "test",
+                    "Test",
+                    EnvironmentHealth::Healthy,
+                    Reachability::Asleep,
+                ),
+            ],
+        });
+        state.select("prod");
+        let headline = state
+            .diagnosis_headline(TEST_NOW)
+            .expect("down with degraded votes headlines");
+        assert_eq!(headline.degraded_count, 8);
+        // Correlation needs Degraded health, so a Down headline names no
+        // build — the reachability pill beside it names the condition.
+        assert_eq!(headline.build, None);
+        assert_eq!(headline.lead_signal_id, "jobs");
+    }
+
+    #[test]
+    fn investigate_target_matches_headline_lead() {
+        let state = loaded();
+        let headline = state
+            .diagnosis_headline(TEST_NOW)
+            .expect("fixture prod is degraded");
+        assert_eq!(
+            state.first_problem_signal_id(),
+            Some(headline.lead_signal_id)
         );
     }
 
@@ -3580,7 +3759,7 @@ mod tests {
         state.select("prod");
         assert_eq!(
             state.drill_in("drift", TEST_NOW),
-            DrillIn::Text("source of truth · glide-zurich-12-18-2025__patch0-hotfix1".into())
+            DrillIn::Text("Source of truth · glide-zurich-12-18-2025__pa…".into())
         );
     }
 
@@ -4146,22 +4325,22 @@ mod tests {
     fn last_clone_summary_shows_age() {
         assert_eq!(
             summarize_payload("last_clone", r#"{"role":"source","supported":true}"#),
-            "clone source"
+            "Clone source"
         );
         assert_eq!(
             summarize_payload("last_clone", r#"{"completed":"x","age_days":0}"#),
-            "today"
+            "0 days ago"
         );
         assert_eq!(
             summarize_payload("last_clone", r#"{"supported":true,"completed":null}"#),
-            "no clone found"
+            "No clone found"
         );
         assert_eq!(
             summarize_payload(
                 "last_clone",
                 r#"{"supported":true,"completed":null,"unknown":"older_than_page"}"#
             ),
-            "not in the last 10 clones"
+            "Not in the last 10 clones"
         );
     }
 
@@ -4186,7 +4365,7 @@ mod tests {
                 "availability",
                 r#"{"reachability":"unreachable","rtt_ms":142,"build":null,"error":"HTTP 429"}"#
             ),
-            "142 ms"
+            "142 ms response time"
         );
     }
 
@@ -4223,15 +4402,15 @@ mod tests {
         );
         assert_eq!(
             detail_from_payload("drift", r#"{"skipped":"need_two_environments"}"#),
-            "needs two Environments"
+            "Needs two Environments"
         );
         assert_eq!(
             detail_from_payload("last_clone", r#"{"skipped":"clone_source_unreachable"}"#),
-            "clone source unreachable"
+            "Clone source unreachable"
         );
         assert_eq!(
             detail_from_payload("last_clone", r#"{"skipped":"clone_source_asleep"}"#),
-            "clone source asleep"
+            "Clone source asleep"
         );
     }
 
@@ -4251,7 +4430,7 @@ mod tests {
                 "drift",
                 r#"{"skipped":"clone_source_asleep","truncated":true}"#
             ),
-            "clone source asleep"
+            "Clone source asleep"
         );
     }
 
@@ -4407,7 +4586,7 @@ mod tests {
         assert_eq!(test.drift, "3 plugins differ");
         assert_eq!(test.last_clone, "12 days ago");
         let prod = rows.iter().find(|row| row.id == "prod").unwrap();
-        assert_eq!(prod.drift, "source of truth");
+        assert_eq!(prod.drift, "Source of truth");
         assert_eq!(prod.last_clone, "");
     }
     #[test]
@@ -4896,7 +5075,7 @@ mod tests {
             .find(|card| card.signal_id == "mid_ecc")
             .unwrap();
         assert_eq!(card.status, "unknown");
-        assert_eq!(state.card_summary("mid_ecc"), "no MID servers");
+        assert_eq!(state.card_summary("mid_ecc"), "No MID servers");
     }
 
     #[test]
@@ -4918,7 +5097,7 @@ mod tests {
             )],
         });
         state.select("prod");
-        assert!(state.card_hint("last_clone").contains("clone_source"));
+        assert!(state.card_hint("last_clone").contains("clone source"));
         assert_eq!(state.card_hint("jobs"), "");
     }
 
@@ -5027,7 +5206,7 @@ mod tests {
     #[test]
     fn dashboard_state_card_summary_per_signal() {
         let mut state = loaded();
-        assert_eq!(state.card_summary("availability"), "142 ms");
+        assert_eq!(state.card_summary("availability"), "142 ms response time");
         assert_eq!(state.card_summary("syslog"), "4 errors · last hour");
         assert_eq!(state.card_summary("mid_ecc"), "3/3 MID up · queue 2");
         assert_eq!(
@@ -5037,12 +5216,12 @@ mod tests {
         // Drift carries the build from the availability snapshot as context.
         assert_eq!(
             state.card_summary("drift"),
-            "source of truth · glide-zurich-12-18-2025__patch0-hotfix1"
+            "Source of truth · glide-zurich-12-18-2025__pa…"
         );
         state.select("test");
         assert_eq!(
             state.card_summary("drift"),
-            "3 plugins differ · glide-yokohama-07-02-2025__patch1"
+            "3 plugins differ · glide-yokohama-07-02-2025__…"
         );
         assert_eq!(state.card_summary("last_clone"), "12 days ago");
         state.apply(&ServerMessage::SignalSnapshotsUpdated {
@@ -5081,8 +5260,8 @@ mod tests {
     fn payload_is_parsed_once_per_apply() {
         let state = loaded();
         let before = state.snapshots.clone();
-        assert_eq!(state.card_summary("availability"), "142 ms");
-        assert_eq!(state.card_summary("availability"), "142 ms");
+        assert_eq!(state.card_summary("availability"), "142 ms response time");
+        assert_eq!(state.card_summary("availability"), "142 ms response time");
         assert_eq!(
             state.drill_in("drift", TEST_NOW),
             state.drill_in("drift", TEST_NOW)

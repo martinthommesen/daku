@@ -101,11 +101,18 @@ pub struct EnvironmentConfig {
     pub expected_drift: Vec<String>,
 }
 
+/// Default availability response-time ceiling: a reachable Environment
+/// slower than this degrades. A ten-second response is never healthy;
+/// typical healthy probes answer well under two seconds.
+pub const AVAILABILITY_RTT_DEFAULT_MS: u64 = 5000;
+
 /// Degrade thresholds per Environment. Defaults preserve the historical
 /// hard-coded behaviour exactly: one overdue job, one syslog error, one
 /// outbound failure, one flow error, any unhealthy MID or ECC error, ECC output-ready ≥ 100,
-/// any plugin/build mismatch degrades. Availability RTT never degraded before
-/// (`None` = disabled); jobs error count never voted before (`u64::MAX`).
+/// any plugin/build mismatch degrades. Availability RTT degrades past
+/// `AVAILABILITY_RTT_DEFAULT_MS` (a missing ceiling follows the default at
+/// evaluation; `Some(u64::MAX)` disables the check); jobs error count never
+/// voted before (`u64::MAX`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Thresholds {
@@ -158,7 +165,7 @@ impl Default for Thresholds {
             ecc_error_degraded_at: 1,
             ecc_output_ready_degraded_at: 100,
             drift_mismatches_degraded_at: 1,
-            availability_rtt_degraded_ms: None,
+            availability_rtt_degraded_ms: Some(AVAILABILITY_RTT_DEFAULT_MS),
         }
     }
 }
@@ -227,10 +234,11 @@ impl Thresholds {
                 value.to_string()
             }
         };
-        let rtt = self
-            .availability_rtt_degraded_ms
-            .map(|ms| format!("{ms}ms"))
-            .unwrap_or_else(|| "off".to_owned());
+        let rtt = match self.availability_rtt_degraded_ms {
+            None => format!("{AVAILABILITY_RTT_DEFAULT_MS}ms (default)"),
+            Some(value) if value == u64::MAX => "off".to_owned(),
+            Some(ms) => format!("{ms}ms"),
+        };
         let txn = self
             .transaction_avg_degraded_ms
             .map(|ms| format!("{ms}ms"))
