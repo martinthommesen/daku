@@ -159,7 +159,6 @@ pub fn run() {
                 KeyBinding::new("secondary-w", CloseWindow, None),
                 KeyBinding::new("secondary-r", ReloadDaemon, None),
                 KeyBinding::new("secondary-shift-c", CopySummary, None),
-                KeyBinding::new("secondary-shift-e", ExportSnapshot, None),
                 KeyBinding::new("secondary-k", TogglePalette, None),
                 KeyBinding::new("escape", ClosePalette, None),
                 KeyBinding::new("secondary-1", SelectEnvironmentSlot { slot: 0 }, None),
@@ -190,7 +189,6 @@ pub fn run() {
 
             let prefs = settings.lock().map(|locked| NotifyMenuPrefs {
                 master: locked.notifications_enabled,
-                signals: locked.notify_signals.clone(),
                 quiet: locked.quiet_hours,
                 digest_weekly: locked.digest_weekly,
             });
@@ -269,7 +267,6 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
         updater_available,
         &NotifyMenuPrefs {
             master: true,
-            signals: std::collections::HashMap::new(),
             quiet: None,
             digest_weekly: false,
         },
@@ -277,10 +274,10 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
 }
 
 /// Menu snapshot of the notification prefs, so checkmarks render current
-/// state. Callers snapshot `AppSettings` under one lock.
+/// state. Callers snapshot `AppSettings` under one lock. Per-Signal switches
+/// stay in storage for read-compat but are no longer a menu surface.
 pub(crate) struct NotifyMenuPrefs {
     pub master: bool,
-    pub signals: std::collections::HashMap<String, bool>,
     pub quiet: Option<daku_client::persistence::QuietHours>,
     pub digest_weekly: bool,
 }
@@ -290,7 +287,6 @@ pub(crate) fn set_app_menus_with_prefs(
     updater_available: bool,
     prefs: &NotifyMenuPrefs,
 ) {
-    let signal_on = |id: &str| prefs.signals.get(id).copied().unwrap_or(true);
     let quiet_is = |start: u8, end: u8| {
         prefs.quiet
             == Some(daku_client::persistence::QuietHours {
@@ -315,14 +311,6 @@ pub(crate) fn set_app_menus_with_prefs(
                     items.push(MenuItem::action("Check for Updates…", CheckForUpdates));
                 }
                 items.push(MenuItem::action("Copy Environment Summary", CopySummary));
-                items.push(MenuItem::action(
-                    "Copy Agent Context (JSON)",
-                    CopyAgentContext,
-                ));
-                items.push(MenuItem::action(
-                    "Export Environment Snapshot",
-                    ExportSnapshot,
-                ));
                 items.push(MenuItem::action("Command Palette…", TogglePalette));
                 items.push(MenuItem::action(
                     "Toggle Health Notifications",
@@ -343,20 +331,6 @@ pub(crate) fn set_app_menus_with_prefs(
                     Box::new(ToggleNotifications),
                     prefs.master,
                 )];
-                items.push(MenuItem::separator());
-                for signal_id in crate::dashboard_state::SIGNAL_IDS
-                    .iter()
-                    .chain(crate::dashboard_state::PLATFORM_SIGNAL_IDS.iter())
-                {
-                    let label = crate::dashboard_state::signal_label(signal_id);
-                    items.push(check(
-                        &format!("Notify: {label}"),
-                        Box::new(ToggleSignalNotify {
-                            signal_id: (*signal_id).into(),
-                        }),
-                        signal_on(signal_id),
-                    ));
-                }
                 items.push(MenuItem::separator());
                 items.push(check(
                     "Quiet Hours Off",
@@ -388,7 +362,6 @@ pub(crate) fn set_app_menus_with_prefs(
             disabled: false,
             items: vec![
                 MenuItem::action("Close Window", CloseWindow),
-                MenuItem::action("Detach Selected Environment", DetachSelectedEnvironment),
                 MenuItem::separator(),
                 MenuItem::action("Reload Daemon", ReloadDaemon),
             ],

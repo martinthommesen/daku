@@ -6,9 +6,8 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaletteEntry {
     /// `switch:<env>` for Environments, a verb otherwise (`reload`,
-    /// `copy`, `export`, `add-env`, `toggle-notifications`,
-    /// `toggle-digest`, `mute-1h`, `mute-4h`, `mute-24h`, `unmute`,
-    /// `open-snow`, `detach`).
+    /// `copy`, `add-env`, `toggle-notifications`,
+    /// `toggle-digest`, `mute-24h`, `unmute`, `open-snow`).
     pub id: String,
     pub title: String,
     pub hint: String,
@@ -51,12 +50,7 @@ pub fn entries_for(envs: &[EnvRef<'_>], selected_id: Option<&str>) -> Vec<Palett
             title: open_title.into(),
             hint: "deep link".into(),
         });
-        for (id, title) in [
-            ("mute-1h", "Mute for 1 hour"),
-            ("mute-4h", "Mute for 4 hours"),
-            ("mute-24h", "Mute for 24 hours"),
-            ("unmute", "Unmute"),
-        ] {
+        for (id, title) in [("mute-24h", "Mute for 24 hours"), ("unmute", "Unmute")] {
             entries.push(PaletteEntry {
                 id: id.into(),
                 title: title.into(),
@@ -67,8 +61,6 @@ pub fn entries_for(envs: &[EnvRef<'_>], selected_id: Option<&str>) -> Vec<Palett
     for (id, title, hint) in [
         ("reload", "Reload Daemon", "config"),
         ("copy", "Copy Environment Summary", "clipboard"),
-        ("copy-context", "Copy Agent Context (JSON)", "clipboard"),
-        ("export", "Export Environment Snapshot", "files"),
         ("add-env", "Add Environment…", "setup"),
         (
             "toggle-notifications",
@@ -76,7 +68,6 @@ pub fn entries_for(envs: &[EnvRef<'_>], selected_id: Option<&str>) -> Vec<Palett
             "notifications",
         ),
         ("toggle-digest", "Toggle Weekly Digest", "notifications"),
-        ("detach", "Detach Into Its Own Window", "window"),
     ] {
         entries.push(PaletteEntry {
             id: id.into(),
@@ -137,7 +128,7 @@ mod tests {
         assert_eq!(entries[0].id, "switch:prod");
         assert!(entries[0].title.contains("degraded"));
         assert_eq!(entries[1].id, "switch:test");
-        assert!(entries.iter().any(|entry| entry.id == "mute-1h"));
+        assert!(entries.iter().any(|entry| entry.id == "mute-24h"));
         assert!(entries.iter().any(|entry| entry.id == "reload"));
         // No selection, no selection-scoped rows.
         let bare = entries_for(&refs, None);
@@ -193,7 +184,7 @@ mod tests {
         let entries = entries_for(&refs, Some("prod"));
         assert_eq!(filter_entries(&entries, "").len(), entries.len());
         assert_eq!(filter_entries(&entries, "PROD").len(), 1);
-        assert_eq!(filter_entries(&entries, "mute").len(), 4);
+        assert_eq!(filter_entries(&entries, "mute").len(), 2);
         assert_eq!(filter_entries(&entries, "zzz").len(), 0);
         // "switch" matches the two environment rows by id prefix.
         assert_eq!(filter_entries(&entries, "switch:").len(), 2);

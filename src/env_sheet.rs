@@ -51,6 +51,10 @@ pub struct EnvSheet {
     pub threshold_rtt: Entity<InputState>,
     /// Planned drift ids, comma- or newline-separated.
     pub expected_drift_field: Entity<InputState>,
+    /// Advanced disclosure: collapsed by default so onboarding asks basics
+    /// only. Thresholds, expected drift, clone-source, and id override live
+    /// behind it; empty still means default.
+    pub show_advanced: bool,
     pub busy: bool,
     /// (is_error, text) line under the fields.
     pub notice: Option<(bool, String)>,
@@ -181,6 +185,7 @@ impl EnvSheet {
                 false,
             ),
             expected_drift_field: Self::field(window, cx, "", false),
+            show_advanced: false,
             busy: false,
             notice: None,
             delete_armed: false,
@@ -306,6 +311,7 @@ impl EnvSheet {
                 &format_expected_drift_text(&env.expected_drift),
                 false,
             ),
+            show_advanced: false,
             busy: false,
             notice: None,
             delete_armed: false,
@@ -718,6 +724,43 @@ pub fn validate_id_unique(id: &str, existing_ids: &[String]) -> Result<(), Strin
     Ok(())
 }
 
+/// Derives a stable id from a label so onboarding can skip the id field.
+/// Lowercases, keeps alphanumeric runs joined by single dashes, falls back
+/// to `env` when nothing usable remains.
+pub fn derive_id_from_label(label: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in label.trim().to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if dash && !out.is_empty() {
+                out.push('-');
+            }
+            out.push(ch);
+            dash = false;
+        } else if ch == '-' || ch == '_' || ch.is_whitespace() {
+            dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_owned();
+    if trimmed.is_empty() {
+        "env".to_owned()
+    } else {
+        trimmed
+    }
+}
+
+/// Resolves the id to save: the typed id wins, otherwise the label derives
+/// one. Edits never reach here with an empty typed id because ids are
+/// immutable and the field is hidden.
+pub fn resolve_sheet_id(typed_id: &str, label: &str) -> String {
+    let trimmed = typed_id.trim();
+    if trimmed.is_empty() {
+        derive_id_from_label(label)
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 /// Display names for the auth-method toggle.
 pub fn auth_label(auth_method: AuthMethod) -> &'static str {
     match auth_method {
@@ -738,6 +781,15 @@ pub fn credential_captions(auth_method: AuthMethod) -> (&'static str, &'static s
 mod tests {
     use super::*;
     use daku_protocol::validate_credential;
+
+    #[test]
+    fn derive_id_from_label_keeps_it_simple() {
+        assert_eq!(derive_id_from_label("Production"), "production");
+        assert_eq!(derive_id_from_label("Acme Prod 2"), "acme-prod-2");
+        assert_eq!(derive_id_from_label("  "), "env");
+        assert_eq!(resolve_sheet_id("", "Dev Env"), "dev-env");
+        assert_eq!(resolve_sheet_id("custom", "Dev Env"), "custom");
+    }
 
     #[test]
     fn empty_credential_pair_leaves_stored() {
