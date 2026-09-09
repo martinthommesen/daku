@@ -6,6 +6,7 @@ use daku_protocol::SignalState;
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
+use crate::signal_eval::{evaluate_ge, fetch_table_rows, row_text};
 
 pub const JOBS_SIGNAL_ID: &str = "jobs";
 pub const JOBS_OVERDUE_PATH: &str = "/api/now/stats/sys_trigger?sysparm_count=true&sysparm_query=state=0^next_action<javascript:gs.minutesAgoStart(15)";
@@ -16,8 +17,8 @@ pub const JOBS_OVERDUE_ROWS_PATH: &str = "/api/now/table/sys_trigger?sysparm_fie
 pub const JOBS_ERROR_ROWS_PATH: &str = "/api/now/table/sys_trigger?sysparm_fields=sys_id,name,state,next_action&sysparm_query=state=3^ORDERBYDESCsys_updated_on&sysparm_limit=10";
 
 pub fn jobs_state(overdue_ready: u64, error: u64, thresholds: &Thresholds) -> SignalState {
-    if overdue_ready >= thresholds.jobs_overdue_degraded_at
-        || error >= thresholds.jobs_error_degraded_at
+    if evaluate_ge(overdue_ready, thresholds.jobs_overdue_degraded_at) == SignalState::Degraded
+        || evaluate_ge(error, thresholds.jobs_error_degraded_at) == SignalState::Degraded
     {
         SignalState::Degraded
     } else {
@@ -32,13 +33,6 @@ struct JobRow {
     detail: String,
 }
 
-fn text(row: &serde_json::Value, key: &str) -> String {
-    row.get(key)
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_owned()
-}
-
 /// Offending rows for one non-zero count. A failed rows request yields no
 /// rows — the count already determined the state, and the drill-in header
 /// still links the filtered list.
@@ -49,40 +43,22 @@ fn fetch_job_rows(
     path: &str,
     error_detail: bool,
 ) -> (Vec<JobRow>, bool) {
-    let Ok(response) = client.request(environment, credentials, "GET", path, None) else {
-        return (Vec::new(), false);
-    };
-    if response.status != 200 {
-        return (Vec::new(), false);
-    }
-    let rows: Vec<JobRow> = serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
-        .ok()
-        .and_then(|value| {
-            value
-                .get("result")
-                .and_then(|result| result.as_array())
-                .cloned()
+    fetch_table_rows(client, environment, credentials, path, |row| {
+        let sys_id = row_text(row, "sys_id");
+        if sys_id.is_empty() {
+            return None;
+        }
+        let name = row_text(row, "name");
+        Some(JobRow {
+            sys_id: sys_id.clone(),
+            name: if name.is_empty() { sys_id } else { name },
+            detail: if error_detail {
+                row_text(row, "state")
+            } else {
+                row_text(row, "next_action")
+            },
         })
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|row| {
-            let sys_id = text(row, "sys_id");
-            if sys_id.is_empty() {
-                return None;
-            }
-            let name = text(row, "name");
-            Some(JobRow {
-                sys_id: sys_id.clone(),
-                name: if name.is_empty() { sys_id } else { name },
-                detail: if error_detail {
-                    text(row, "state")
-                } else {
-                    text(row, "next_action")
-                },
-            })
-        })
-        .collect();
-    crate::collector::take_bounded(rows)
+    })
 }
 
 #[derive(Default)]

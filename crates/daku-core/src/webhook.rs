@@ -19,12 +19,27 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::persistence::StateStore;
 
 /// Backfill bound: events older than this are marked seen, never POSTed.
 const BACKFILL_SECS: i64 = 24 * 3600;
+
+/// Whether one health/build event should be relayed: newer than the
+/// per-Environment high-water mark and inside the backfill window.
+/// Pure decision — the test surface for the relay's "which events" rule.
+///
+/// Note the deliberate bypass, shared with `notifications::should_notify`:
+/// the daemon fan-out posts health **and** build and ignores Mute,
+/// quiet hours, per-Signal switches, and the desktop master switch — the
+/// daemon has no desktop prefs (ADR-0009: Mute stays desktop-side, the
+/// daemon keeps collecting). The desktop notification path respects all
+/// gates; this path only dedupes (mark) and bounds (backfill).
+pub fn should_relay_event(observed_at: i64, mark: i64, now: i64) -> bool {
+    observed_at > mark && now.saturating_sub(observed_at) <= BACKFILL_SECS
+}
 
 /// True for URLs the relay may POST to.
 pub fn webhook_url_allowed(url: &str) -> bool {
@@ -42,6 +57,54 @@ pub fn webhook_url_allowed(url: &str) -> bool {
         return matches!(host, "127.0.0.1" | "localhost" | "::1");
     }
     false
+}
+
+/// Advisory warning for allowed https URLs pointing at intranet, link-local,
+/// or cloud-metadata-like hosts. The relay still sends (intranet forwarders
+/// are legitimate); the warning surfaces the foot-gun in daemon logs so a
+/// mistaken or socially engineered URL does not exfiltrate health metadata
+/// silently. Returns the warning text when review is warranted.
+pub fn webhook_url_needs_review(url: &str) -> Option<String> {
+    let rest = url.trim().strip_prefix("https://")?;
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    } else {
+        authority
+            .rsplit('@')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    let private = host == "localhost"
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("169.254.")
+        || host == "169.254.169.254"
+        || host.starts_with("metadata.")
+        || host == "metadata.google.internal"
+        || host.starts_with("fc")
+        || host.starts_with("fd")
+        || host.starts_with("fe80")
+        || (host
+            .strip_prefix("172.")
+            .and_then(|rest| rest.split('.').next()?.parse::<u8>().ok())
+            .is_some_and(|second| (16..=31).contains(&second)));
+    if private {
+        Some(format!(
+            "daku webhook posts health metadata to an intranet or metadata-like https target ({}); confirm the URL is intentional",
+            redacted_url(url),
+        ))
+    } else {
+        None
+    }
 }
 
 /// What a refused webhook URL prints: scheme plus host only. Forwarder URLs
@@ -75,6 +138,8 @@ pub fn redacted_url(url: &str) -> String {
 pub struct WebhookRelay {
     last_sent: Mutex<HashMap<String, i64>>,
     last_refused: Mutex<Option<String>>,
+    last_warned: Mutex<Option<String>>,
+    in_flight: AtomicBool,
 }
 
 impl Default for WebhookRelay {
@@ -82,6 +147,8 @@ impl Default for WebhookRelay {
         Self {
             last_sent: Mutex::new(HashMap::new()),
             last_refused: Mutex::new(None),
+            last_warned: Mutex::new(None),
+            in_flight: AtomicBool::new(false),
         }
     }
 }
@@ -130,7 +197,25 @@ impl WebhookRelay {
             }
             return;
         }
-        if let Err(error) = self.relay_to(store, &url, post) {
+        // Serialize overlapping tick runs; a slow endpoint coalesces instead
+        // of piling a thread per tick.
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if let Some(warning) = webhook_url_needs_review(&url) {
+            let mut warned = self.last_warned.lock().expect("webhook warning");
+            if warned.as_deref() != Some(warning.as_str()) {
+                eprintln!("{warning}");
+                *warned = Some(warning);
+            }
+        }
+        let result = self.relay_to(store, &url, post);
+        self.in_flight.store(false, Ordering::Release);
+        if let Err(error) = result {
             eprintln!("daku webhook post failed: {error:#}");
         }
     }
@@ -142,6 +227,7 @@ impl WebhookRelay {
         post: &dyn Fn(&str, &str) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let connection = store.open()?;
+        crate::persistence::ensure_webhook_tables(&connection)?;
         let now = crate::collector::unix_now();
         let mut last_sent = self.last_sent.lock().expect("webhook marks");
         // Environments are whatever the snapshots mention; the relay follows
@@ -153,14 +239,31 @@ impl WebhookRelay {
         environments.sort();
         environments.dedup();
         for environment_id in environments {
-            let mark = last_sent.get(&environment_id).copied().unwrap_or(0);
+            // Persisted cursor wins over memory so restarts resume; a brand
+            // new Environment seeds at now to avoid an initial burst.
+            let persisted = crate::persistence::load_webhook_cursor(&connection, &environment_id)?;
+            let mark = match (last_sent.get(&environment_id).copied(), persisted) {
+                (Some(memory), Some(stored)) => memory.max(stored),
+                (Some(memory), None) => memory,
+                (None, Some(stored)) => stored,
+                (None, None) => {
+                    crate::persistence::store_webhook_cursor(&connection, &environment_id, now)?;
+                    last_sent.insert(environment_id.clone(), now);
+                    continue;
+                }
+            };
             let mut events =
                 crate::persistence::load_health_events(&connection, &environment_id, 500)?;
             events.retain(|event| event.observed_at > mark);
             events.sort_by_key(|event| event.observed_at);
             for event in events {
-                if now.saturating_sub(event.observed_at) > BACKFILL_SECS {
+                if !should_relay_event(event.observed_at, mark, now) {
                     last_sent.insert(environment_id.clone(), event.observed_at);
+                    crate::persistence::store_webhook_cursor(
+                        &connection,
+                        &environment_id,
+                        event.observed_at,
+                    )?;
                     continue;
                 }
                 let body = serde_json::json!({
@@ -172,8 +275,34 @@ impl WebhookRelay {
                     "build": event.build,
                 })
                 .to_string();
-                post(url, &body)?;
+                if let Err(error) = post(url, &body) {
+                    // Poison head must not starve newer events: dead-letter it
+                    // and advance past it.
+                    let _ = crate::persistence::record_webhook_dead_letter(
+                        &connection,
+                        &environment_id,
+                        event.observed_at,
+                        &event.kind,
+                        &format!("{error:#}"),
+                    );
+                    eprintln!(
+                        "daku webhook skipped poison event for {}: {error:#}",
+                        event.environment_id
+                    );
+                    last_sent.insert(environment_id.clone(), event.observed_at);
+                    crate::persistence::store_webhook_cursor(
+                        &connection,
+                        &environment_id,
+                        event.observed_at,
+                    )?;
+                    continue;
+                }
                 last_sent.insert(environment_id.clone(), event.observed_at);
+                crate::persistence::store_webhook_cursor(
+                    &connection,
+                    &environment_id,
+                    event.observed_at,
+                )?;
             }
         }
         Ok(())
@@ -218,6 +347,30 @@ mod tests {
     use daku_protocol::settings::DaemonSettings;
     use daku_protocol::{Reachability, SignalState};
     use std::sync::{Arc, Mutex as StdMutex};
+
+    #[test]
+    fn should_relay_event_dedupes_and_bounds_backfill() {
+        assert!(should_relay_event(101, 100, 200));
+        assert!(!should_relay_event(100, 100, 200));
+        assert!(!should_relay_event(99, 100, 200));
+        assert!(!should_relay_event(0, -1, BACKFILL_SECS + 1));
+        assert!(should_relay_event(1, 0, 1 + BACKFILL_SECS));
+    }
+
+    #[test]
+    fn webhook_url_intranet_targets_warn_without_blocking() {
+        for url in [
+            "https://192.168.1.10/hook",
+            "https://10.0.0.5/hook",
+            "https://169.254.169.254/hook",
+            "https://metadata.google.internal/hook",
+        ] {
+            assert!(webhook_url_allowed(url), "{url}");
+            assert!(webhook_url_needs_review(url).is_some(), "{url}");
+        }
+        assert!(webhook_url_needs_review("https://hooks.example.com/hook").is_none());
+        assert!(webhook_url_needs_review("http://127.0.0.1:9000/hook").is_none());
+    }
 
     #[test]
     fn webhook_url_policy_is_loopback_http_or_any_https() {
@@ -294,6 +447,11 @@ mod tests {
     fn relay_posts_new_events_once_and_advances_marks() {
         let now = crate::collector::unix_now();
         let db = seed(now);
+        // Simulate an upgraded host with backlog: cursor starts at zero.
+        {
+            let connection = db.store().open().unwrap();
+            persistence::store_webhook_cursor(&connection, "prod", 0).unwrap();
+        }
         let relay = WebhookRelay::new();
         let posted: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink = posted.clone();
@@ -321,6 +479,10 @@ mod tests {
     fn relay_skips_stale_events_but_marks_them_seen() {
         let now = crate::collector::unix_now();
         let db = seed_at(now, &[(now - BACKFILL_SECS - 1, "health", "degraded")]);
+        {
+            let connection = db.store().open().unwrap();
+            persistence::store_webhook_cursor(&connection, "prod", 0).unwrap();
+        }
         let relay = WebhookRelay::new();
         let posted: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink = posted.clone();
@@ -338,9 +500,13 @@ mod tests {
     }
 
     #[test]
-    fn relay_stops_at_the_first_failure_and_retries_next_tick() {
+    fn relay_skips_poison_head_and_dead_letters_it() {
         let now = crate::collector::unix_now();
         let db = seed(now);
+        {
+            let connection = db.store().open().unwrap();
+            persistence::store_webhook_cursor(&connection, "prod", 0).unwrap();
+        }
         let relay = WebhookRelay::new();
         let calls = Arc::new(StdMutex::new(0usize));
         let probe = calls.clone();
@@ -348,12 +514,18 @@ mod tests {
             *probe.lock().expect("calls") += 1;
             anyhow::bail!("forwarder down")
         };
-        assert!(
-            relay
-                .relay_to(&db.store(), "http://127.0.0.1:9/hook", &failing)
-                .is_err()
+        // Poison head no longer blocks: both events are attempted, skipped,
+        // and dead-lettered instead of returning an error.
+        relay
+            .relay_to(&db.store(), "http://127.0.0.1:9/hook", &failing)
+            .unwrap();
+        assert_eq!(*calls.lock().expect("calls"), 2);
+        let connection = db.store().open().unwrap();
+        assert_eq!(
+            persistence::load_webhook_dead_letter_count(&connection, "prod").unwrap(),
+            2
         );
-        assert_eq!(*calls.lock().expect("calls"), 1);
+        // A later tick with a healthy forwarder posts nothing new.
         let posted: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink = posted.clone();
         relay
@@ -366,7 +538,41 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(posted.lock().expect("posted").len(), 2);
+        assert!(posted.lock().expect("posted").is_empty());
+    }
+
+    #[test]
+    fn relay_seeds_fresh_cursor_at_now_without_burst() {
+        let now = crate::collector::unix_now();
+        let db = seed(now);
+        let relay = WebhookRelay::new();
+        let posted: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = posted.clone();
+        relay
+            .relay_to(
+                &db.store(),
+                "http://127.0.0.1:9/hook",
+                &|_url: &str, body: &str| {
+                    sink.lock().expect("posted").push(body.to_owned());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(posted.lock().expect("posted").is_empty());
+        // Restart resumes from the persisted cursor, not from zero.
+        let relay2 = WebhookRelay::new();
+        let sink2 = posted.clone();
+        relay2
+            .relay_to(
+                &db.store(),
+                "http://127.0.0.1:9/hook",
+                &|_url: &str, body: &str| {
+                    sink2.lock().expect("posted").push(body.to_owned());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(posted.lock().expect("posted").is_empty());
     }
 
     #[test]
@@ -375,6 +581,10 @@ mod tests {
         use std::net::TcpListener;
         let now = crate::collector::unix_now();
         let db = seed(now);
+        {
+            let connection = db.store().open().unwrap();
+            persistence::store_webhook_cursor(&connection, "prod", 0).unwrap();
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let received = Arc::new(StdMutex::new(Vec::new()));
@@ -475,6 +685,11 @@ mod tests {
         );
         assert!(posted.lock().expect("posted").is_empty());
         // Allowed URL with an injected sender: the tick wiring posts.
+        // Pre-seed the cursor to zero so the seeded backlog relays.
+        {
+            let connection = db.store().open().unwrap();
+            persistence::store_webhook_cursor(&connection, "prod", 0).unwrap();
+        }
         relay.relay_tick_with(
             &db.store(),
             Some("http://127.0.0.1:9/hook".into()),

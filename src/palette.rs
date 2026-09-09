@@ -20,6 +20,7 @@ pub struct EnvRef<'a> {
     pub id: &'a str,
     pub label: &'a str,
     pub health: &'a str,
+    pub platform: &'a str,
 }
 
 /// The full list: one row per Environment first (switch), then shell
@@ -35,9 +36,19 @@ pub fn entries_for(envs: &[EnvRef<'_>], selected_id: Option<&str>) -> Vec<Palett
         });
     }
     if selected_id.is_some() {
+        // The deep link leaves the product on probes, so the title names
+        // the destination.
+        let selected_platform = selected_id
+            .and_then(|id| envs.iter().find(|env| env.id == id))
+            .map(|env| env.platform);
+        let open_title = match selected_platform {
+            Some("github") => "Open repository",
+            Some("http") => "Open probe target",
+            _ => "Open in ServiceNow",
+        };
         entries.push(PaletteEntry {
             id: "open-snow".into(),
-            title: "Open in ServiceNow".into(),
+            title: open_title.into(),
             hint: "deep link".into(),
         });
         for (id, title) in [
@@ -97,23 +108,30 @@ pub fn filter_entries<'a>(entries: &'a [PaletteEntry], query: &str) -> Vec<&'a P
 mod tests {
     use super::*;
 
-    fn sample() -> (Vec<String>, Vec<String>, Vec<String>) {
+    fn sample() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
         // Owned backing stores so `EnvRef` borrows stay valid.
         (
             vec!["prod".to_owned(), "test".to_owned()],
             vec!["Production".to_owned(), "Test".to_owned()],
             vec!["degraded".to_owned(), "healthy".to_owned()],
+            vec!["servicenow".to_owned(), "http".to_owned()],
         )
     }
 
     #[test]
     fn entries_list_environments_first_then_commands() {
-        let (ids, labels, healths) = sample();
+        let (ids, labels, healths, platforms) = sample();
         let refs: Vec<EnvRef<'_>> = ids
             .iter()
             .zip(labels.iter())
             .zip(healths.iter())
-            .map(|((id, label), health)| EnvRef { id, label, health })
+            .zip(platforms.iter())
+            .map(|(((id, label), health), platform)| EnvRef {
+                id,
+                label,
+                health,
+                platform,
+            })
             .collect();
         let entries = entries_for(&refs, Some("prod"));
         assert_eq!(entries[0].id, "switch:prod");
@@ -129,13 +147,48 @@ mod tests {
     }
 
     #[test]
-    fn filter_matches_title_hint_and_id_case_insensitively() {
-        let (ids, labels, healths) = sample();
+    fn open_entry_names_the_probe_destination_per_platform() {
+        let (ids, labels, healths, platforms) = sample();
         let refs: Vec<EnvRef<'_>> = ids
             .iter()
             .zip(labels.iter())
             .zip(healths.iter())
-            .map(|((id, label), health)| EnvRef { id, label, health })
+            .zip(platforms.iter())
+            .map(|(((id, label), health), platform)| EnvRef {
+                id,
+                label,
+                health,
+                platform,
+            })
+            .collect();
+        // prod is servicenow, test is http.
+        let snow = entries_for(&refs, Some("prod"));
+        assert!(
+            snow.iter()
+                .any(|entry| entry.id == "open-snow" && entry.title == "Open in ServiceNow")
+        );
+        let probe = entries_for(&refs, Some("test"));
+        assert!(
+            probe
+                .iter()
+                .any(|entry| entry.id == "open-snow" && entry.title == "Open probe target")
+        );
+    }
+
+    #[test]
+    fn filter_matches_title_hint_and_id_case_insensitively() {
+        let (ids, labels, healths, platforms) = sample();
+        let refs: Vec<EnvRef<'_>> = ids
+            .iter()
+            .zip(labels.iter())
+            .zip(healths.iter())
+            .zip(platforms.iter())
+            .map(|(((id, label), health), platform)| EnvRef {
+                id,
+                label,
+                health,
+                platform,
+            })
             .collect();
         let entries = entries_for(&refs, Some("prod"));
         assert_eq!(filter_entries(&entries, "").len(), entries.len());

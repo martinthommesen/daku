@@ -48,7 +48,7 @@ pub fn classify_availability_response(
         );
     }
     let error = match status {
-        429 => Some("HTTP 429".to_owned()),
+        429 => Some(crate::servicenow::THROTTLED_DETAIL.to_owned()),
         _ => None,
     };
     observation(
@@ -360,7 +360,10 @@ mod tests {
     fn classify_availability_429_records_transient_error() {
         let observation = classify_availability_response(429, "application/json", "{}", 5);
         assert_eq!(observation.reachability, Reachability::Unreachable);
-        assert_eq!(observation.error.as_deref(), Some("HTTP 429"));
+        assert_eq!(
+            observation.error.as_deref(),
+            Some(crate::servicenow::THROTTLED_DETAIL)
+        );
     }
 
     #[test]

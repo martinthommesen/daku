@@ -43,7 +43,7 @@ use crate::ToggleSignalNotify;
 use crate::ToggleWeeklyDigest;
 use crate::dashboard_state::{
     DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase, freshness,
-    is_trend_signal, mute_remaining_label, signal_label,
+    is_trend_signal, is_voting_signal, mute_remaining_label, signal_label,
 };
 use crate::env_sheet::{
     BuildConfig, EnvSheet, auth_label, build_config, credential_blob, credential_captions,
@@ -77,6 +77,9 @@ pub struct Daku {
     /// Command palette (⌘K) visibility and filter text.
     palette_open: bool,
     palette_input: Entity<InputState>,
+    /// Header verdict disclosure: collapsed shows the first two voting lines
+    /// plus a "+N more" toggle; expanded shows all of them.
+    verdict_expanded: bool,
     /// Desktop boot time: health events observed before this record as seen
     /// without firing, so launch/reconnect replays never storm.
     boot_now: i64,
@@ -127,9 +130,21 @@ impl Daku {
             if let Some(pinned) = pinned.as_deref() {
                 state.select(pinned);
             }
-            let timeline_filter = cx.new(|cx| InputState::new(window, cx).default_value(""));
-            let note_input = cx.new(|cx| InputState::new(window, cx).default_value(""));
-            let palette_input = cx.new(|cx| InputState::new(window, cx).default_value(""));
+            let timeline_filter = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Filter recent…")
+                    .default_value("")
+            });
+            let note_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Add context for the next operator…")
+                    .default_value("")
+            });
+            let palette_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Type a command or environment…")
+                    .default_value("")
+            });
             tick_freshness(cx);
             // Detached windows never pump clicks or post: the main window
             // owns notifications, so a second window cannot double-fire.
@@ -149,6 +164,7 @@ impl Daku {
                 note_target: None,
                 palette_open: false,
                 palette_input,
+                verdict_expanded: false,
                 boot_now: unix_now(),
                 notify_seen: HashSet::new(),
                 last_ambient: None,
@@ -267,7 +283,17 @@ impl Daku {
             notify_signals: &notify_signals,
             quiet_hours,
         };
-        if !crate::notifications::gate_allows(&gate, now) {
+        // Shared attention decision: batch rule (health-kind, post-boot,
+        // unseen — guaranteed by `select_notification` above) plus gates.
+        let decision = crate::notifications::AttentionInput {
+            kind: event.kind,
+            observed_at: event.observed_at,
+            boot_now: self.boot_now,
+            seen: false,
+            gate,
+            now,
+        };
+        if !crate::notifications::should_notify(&decision) {
             return;
         }
         let label = self
@@ -390,6 +416,8 @@ impl Daku {
         if open_drift {
             self.state.open_card("drift");
         }
+        // A fresh verdict starts collapsed.
+        self.verdict_expanded = false;
         cx.notify();
     }
 
@@ -511,45 +539,63 @@ impl Daku {
     }
 
     /// Pre-flight: plain fields plus Credential shape when a fresh blob was
-    /// entered, plus threshold and expected-drift parsing. Shows the first
-    /// problem in the sheet.
+    /// entered, plus threshold and expected-drift parsing. Reports every
+    /// problem at once so a 25-field sheet never fails one field at a time.
     fn validate_sheet(
         &mut self,
         cx: &App,
     ) -> Option<(daku_protocol::EnvironmentConfig, Option<String>)> {
         let (mut config, blob) = self.read_sheet(cx)?;
+        let mut problems: Vec<String> = Vec::new();
         if let Err(error) = crate::env_sheet::validate_fields(
             &config.id,
             &config.label,
             &config.instance_url,
             config.platform,
         ) {
-            self.set_sheet_notice(true, error);
-            return None;
+            problems.push(error);
         }
+        // Ids are immutable on edit, so only a new Environment can collide.
         let sheet = self.env_sheet.as_ref()?;
+        if sheet.editing_id.is_none() {
+            let ids: Vec<String> = self
+                .state
+                .environments()
+                .iter()
+                .map(|env| env.id.clone())
+                .collect();
+            if let Err(error) = crate::env_sheet::validate_id_unique(&config.id, &ids) {
+                problems.push(error);
+            }
+        }
         let thresholds = match sheet.thresholds_result(cx) {
-            Ok(thresholds) => thresholds,
+            Ok(thresholds) => Some(thresholds),
             Err(error) => {
-                self.set_sheet_notice(true, error);
-                return None;
+                problems.push(error);
+                None
             }
         };
         let expected_drift = match sheet.expected_drift_result(cx) {
-            Ok(expected_drift) => expected_drift,
+            Ok(expected_drift) => Some(expected_drift),
             Err(error) => {
-                self.set_sheet_notice(true, error);
-                return None;
+                problems.push(error);
+                None
             }
         };
-        crate::env_sheet::apply_sheet_tuning(&mut config, thresholds, expected_drift);
+        if let (Some(thresholds), Some(expected_drift)) = (thresholds, expected_drift) {
+            crate::env_sheet::apply_sheet_tuning(&mut config, thresholds, expected_drift);
+        }
         if let Some(blob) = &blob
             && let Err(error) = daku_protocol::validate_credential(config.auth_method, blob)
         {
-            self.set_sheet_notice(true, error.to_string());
-            return None;
+            problems.push(error.to_string());
         }
-        Some((config, blob))
+        if problems.is_empty() {
+            Some((config, blob))
+        } else {
+            self.set_sheet_notice(true, problems.join(" · "));
+            None
+        }
     }
 
     /// Runs one management RPC off the UI thread; `done` applies the outcome
@@ -837,6 +883,7 @@ impl Daku {
                 id: &env.id,
                 label: &env.label,
                 health: env.health.as_str(),
+                platform: &env.platform_id,
             })
             .collect();
         let entries = crate::palette::entries_for(&envs, selected.as_deref());
@@ -925,17 +972,14 @@ impl Daku {
                 .border_color(cx.theme().border)
                 .bg(cx.theme().secondary)
                 .child(Input::new(&self.palette_input).small())
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key.as_str() == "enter" {
                         let first = this.palette_matches(cx).into_iter().next();
-                        // No window down here: entries needing one (add-env,
-                        // detach) stay on the click path; Enter runs the
-                        // window-free subset and closes.
+                        // Enter runs the same dispatch as a click, including
+                        // window-scoped entries (add-env, detach).
                         if let Some(entry) = first {
                             let id = entry.id.clone();
-                            this.palette_open = false;
-                            this.run_palette_command(&id, cx);
-                            cx.notify();
+                            this.run_palette_entry(&id, window, cx);
                         }
                     }
                 }))
@@ -1111,16 +1155,25 @@ impl Render for Daku {
         let sidebar = self.detached.is_none().then(|| self.render_sidebar(cx));
         // Cards and the Drill-in carry click listeners, so they are built here
         // (where `Context<Self>` is available) and handed to the `&App` detail
-        // render.
-        let cards: Vec<gpui::AnyElement> = if self.state.selected().is_some() {
-            self.state
-                .cards(unix_now())
-                .into_iter()
-                .map(|card| self.signal_card(card, cx))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // render. Voting Signals render as full cards; the rest (last_clone,
+        // sessions, table_growth) render as a compact strip.
+        let (voting, context): (Vec<SignalCard>, Vec<SignalCard>) =
+            if self.state.selected().is_some() {
+                self.state
+                    .cards(unix_now())
+                    .into_iter()
+                    .partition(|card| is_voting_signal(card.signal_id))
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        let voting_cards: Vec<gpui::AnyElement> = voting
+            .into_iter()
+            .map(|card| self.signal_card(card, cx))
+            .collect();
+        let context_cards: Vec<gpui::AnyElement> = context
+            .into_iter()
+            .map(|card| self.context_chip(card, cx))
+            .collect();
         let drill_in = self
             .state
             .selected_card()
@@ -1135,10 +1188,17 @@ impl Render for Daku {
                 .flex_1()
                 .p(px(22.0))
                 .text_color(cx.theme().muted_foreground)
-                .child("This Environment was removed.")
+                .child("This Environment was removed. Close this window with ⌘W.")
                 .into_any_element()
         } else {
-            self.render_detail(cards, drill_in, mute_controls, compare, cx)
+            self.render_detail(
+                voting_cards,
+                context_cards,
+                drill_in,
+                mute_controls,
+                compare,
+                cx,
+            )
         };
         let title: SharedString = match &self.detached {
             Some(pinned) => self
@@ -1205,6 +1265,12 @@ impl Render for Daku {
             .on_action(cx.listener(|this, _: &ClosePalette, _, cx| {
                 if this.palette_open {
                     this.palette_open = false;
+                    cx.notify();
+                } else if this.note_target.is_some() {
+                    // Escape backs out of the note editor without saving;
+                    // the sheet keeps its own explicit Cancel so typed
+                    // secrets are never lost to a stray keypress.
+                    this.note_target = None;
                     cx.notify();
                 }
             }))
@@ -1280,17 +1346,24 @@ impl Render for Daku {
     }
 }
 
-/// Small "Edit" opener for the Environment sheet (`106`). A free function
-/// so both mute-controls branches share it.
+/// Explicit "Edit environment" button for the Environment sheet (`106`). A
+/// free function so both mute-controls branches share it. Bordered like a
+/// button on purpose: the bare grey word read as a fourth mute duration.
 fn edit_button(cx: &mut Context<Daku>) -> gpui::AnyElement {
     div()
         .id("env-edit")
-        .text_color(cx.theme().muted_foreground)
+        .px(px(10.0))
+        .py(px(2.0))
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .text_xs()
+        .text_color(cx.theme().foreground)
         .cursor_pointer()
         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
             this.open_edit_sheet(window, cx);
         }))
-        .child("Edit")
+        .child("Edit environment")
         .into_any_element()
 }
 
@@ -1322,24 +1395,59 @@ fn sheet_button(
         .into_any_element()
 }
 
+/// One sheet section heading. Groups the ~25 sheet inputs under
+/// Environment, Credential, Thresholds and Expected drift.
+fn sheet_section(caption: &'static str, cx: &App) -> gpui::AnyElement {
+    div()
+        .pt(px(8.0))
+        .text_sm()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(cx.theme().foreground)
+        .child(caption)
+        .into_any_element()
+}
+
 impl Daku {
     fn sidebar_menu_item(
         &self,
         row: crate::dashboard_state::SidebarRow,
+        slot: Option<usize>,
         selected_id: &Option<String>,
         cx: &mut Context<Self>,
     ) -> SidebarMenuItem {
         let selected = selected_id.as_deref() == Some(row.id.as_str());
         let id = row.id.clone();
-        let quiet = row.dimmed || row.muted;
-        let color = if quiet {
+        let label: SharedString = match slot {
+            Some(number) => format!("{number} · {}", row.label).into(),
+            None => row.label.clone().into(),
+        };
+        let muted = row.muted;
+        let dimmed = row.dimmed;
+        let dot = if dimmed || muted {
             cx.theme().muted_foreground
         } else {
             health_color(row.health, cx)
         };
-        SidebarMenuItem::new(row.label.clone())
+        // Hollow dot = stale or blind (never polled, disconnected): the tool
+        // has nothing to say. Solid grey dot plus the word "Muted" = the
+        // Operator chose silence. The two must never look alike.
+        let hollow = dimmed && !muted;
+        SidebarMenuItem::new(label)
             .active(selected)
-            .suffix(move |_, _| div().size(px(8.0)).rounded_full().bg(color))
+            .suffix(move |_, cx| {
+                h_flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .when(muted, |element| {
+                        element.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Muted"),
+                        )
+                    })
+                    .child(status_dot(dot, hollow))
+            })
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.state.select(&id);
                 cx.notify();
@@ -1369,7 +1477,7 @@ impl Daku {
         let footer = if let Some(flashed) = self.copied_flash.as_deref() {
             flashed.to_owned()
         } else if let Some(path) = self.exported_path.as_deref() {
-            format!("Exported to {path}")
+            format!("Exported to {}", short_export_path(path))
         } else {
             format!(
                 "{} \u{b7} v{}",
@@ -1397,22 +1505,26 @@ impl Daku {
                 ),
             );
         if groups.len() > 1 {
+            // Slot numbers follow the flat sidebar order (⌘1–9 switch in
+            // that order), so one running counter spans every group.
+            let mut slot: usize = 0;
             for group in groups {
-                let items: Vec<SidebarMenuItem> = group
-                    .rows
-                    .into_iter()
-                    .map(|row| self.sidebar_menu_item(row, &selected_id, cx))
-                    .collect();
+                let mut items: Vec<SidebarMenuItem> = Vec::new();
+                for row in group.rows {
+                    slot += 1;
+                    let number = if slot <= 9 { Some(slot) } else { None };
+                    items.push(self.sidebar_menu_item(row, number, &selected_id, cx));
+                }
                 sidebar = sidebar.child(
                     SidebarGroup::new(group.label).child(SidebarMenu::new().children(items)),
                 );
             }
         } else {
-            let items: Vec<SidebarMenuItem> = groups
-                .into_iter()
-                .flat_map(|group| group.rows)
-                .map(|row| self.sidebar_menu_item(row, &selected_id, cx))
-                .collect();
+            let mut items: Vec<SidebarMenuItem> = Vec::new();
+            for (index, row) in groups.into_iter().flat_map(|group| group.rows).enumerate() {
+                let number = if index < 9 { Some(index + 1) } else { None };
+                items.push(self.sidebar_menu_item(row, number, &selected_id, cx));
+            }
             sidebar = sidebar
                 .child(SidebarGroup::new("Environments").child(SidebarMenu::new().children(items)));
         }
@@ -1430,6 +1542,7 @@ impl Daku {
 
     /// Mute / unmute controls for the selected Environment header: the
     /// mute deadline plus Unmute when muted, else 1 h / 4 h / 24 h options.
+    /// The durations mute notifications.
     fn mute_controls(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let id = self.state.selected_id()?.to_owned();
         let now = unix_now();
@@ -1448,7 +1561,12 @@ impl Daku {
                 .child(
                     div()
                         .id("mute-unmute")
-                        .text_color(cx.theme().muted_foreground)
+                        .px(px(10.0))
+                        .py(px(2.0))
+                        .rounded(cx.theme().radius)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .text_color(cx.theme().foreground)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.unmute_selected(cx);
@@ -1460,19 +1578,23 @@ impl Daku {
             )
         } else {
             Some(
-                base.child(div().text_color(cx.theme().muted_foreground).child("Mute"))
-                    .children(MUTE_OPTIONS.into_iter().map(|(secs, label)| {
-                        div()
-                            .id(SharedString::from(format!("mute-{label}")))
-                            .text_color(cx.theme().muted_foreground)
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.mute_selected(secs, cx);
-                            }))
-                            .child(label)
-                    }))
-                    .child(edit_button(cx))
-                    .into_any_element(),
+                base.child(
+                    div()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Mute notifications:"),
+                )
+                .children(MUTE_OPTIONS.into_iter().map(|(secs, label)| {
+                    div()
+                        .id(SharedString::from(format!("mute-{label}")))
+                        .text_color(cx.theme().muted_foreground)
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.mute_selected(secs, cx);
+                        }))
+                        .child(label)
+                }))
+                .child(edit_button(cx))
+                .into_any_element(),
             )
         }
     }
@@ -1528,6 +1650,7 @@ impl Daku {
                         .when(sheet.editing_id.is_none(), |element| {
                             element.child(EnvSheet::field_row("ID", &sheet.id_field, cx))
                         })
+                        .child(sheet_section("Environment", cx))
                         .child(EnvSheet::field_row("Label", &sheet.label_field, cx))
                         .child(EnvSheet::field_row(url_caption(sheet.platform), &sheet.url_field, cx))
                         .child(self.sheet_toggle_row(
@@ -1551,6 +1674,15 @@ impl Daku {
                             cx,
                         ))
                         .child(self.sheet_toggle_row(
+                            "Clone source",
+                            &[
+                                (SheetToggle::CloneSource(false), "No"),
+                                (SheetToggle::CloneSource(true), "Yes"),
+                            ],
+                            cx,
+                        ))
+                        .child(sheet_section("Credential", cx))
+                        .child(self.sheet_toggle_row(
                             "Auth",
                             &[
                                 (
@@ -1568,14 +1700,6 @@ impl Daku {
                             ],
                             cx,
                         ))
-                        .child(self.sheet_toggle_row(
-                            "Clone source",
-                            &[
-                                (SheetToggle::CloneSource(false), "No"),
-                                (SheetToggle::CloneSource(true), "Yes"),
-                            ],
-                            cx,
-                        ))
                         .child(EnvSheet::field_row(caption_a, &sheet.secret_a, cx))
                         .child(
                             div()
@@ -1590,6 +1714,25 @@ impl Daku {
                                 )
                                 .child(Input::new(&sheet.secret_b).mask_toggle()),
                         )
+                        .when(sheet.editing_id.is_some(), |element| {
+                            element.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        "Leave both Credential fields blank to keep the stored one.",
+                                    ),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    "Test checks reachability and build. It does not check table access.",
+                                ),
+                        )
+                        .child(sheet_section("Thresholds", cx))
                         .child(
                             div()
                                 .text_xs()
@@ -1693,21 +1836,12 @@ impl Daku {
                                 .text_color(cx.theme().danger)
                                 .child(error),
                         })
+                        .child(sheet_section("Expected drift", cx))
                         .child(EnvSheet::field_row(
                             "Expected drift ids (comma-separated)",
                             &sheet.expected_drift_field,
                             cx,
                         ))
-                        .when(sheet.editing_id.is_some(), |element| {
-                            element.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        "Leave both Credential fields blank to keep the stored one.",
-                                    ),
-                            )
-                        })
                         .when(overwrite_hint, |element| {
                             element.child(
                                 div()
@@ -1733,6 +1867,7 @@ impl Daku {
                                 .flex()
                                 .flex_row()
                                 .gap(px(8.0))
+                                .when(sheet.busy, |element| element.opacity(0.5))
                                 .child(sheet_button(cx, "sheet-cancel", "Cancel", |this, _, cx| {
                                     this.env_sheet = None;
                                     cx.notify();
@@ -1898,12 +2033,19 @@ impl Daku {
                     element.child(
                         div()
                             .px(px(14.0))
-                            .pb(px(10.0))
                             .text_xs()
                             .text_color(cx.theme().warning)
                             .child("build / drift mismatch"),
                     )
                 })
+                .child(
+                    div()
+                        .px(px(14.0))
+                        .pb(px(10.0))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Select a row to open its drift"),
+                )
                 .into_any_element(),
         )
     }
@@ -1957,7 +2099,16 @@ impl Daku {
                                 this.note_target = Some(target.clone());
                                 cx.notify();
                             }))
-                            .child(line),
+                            // The row takes a note on click.
+                            .child(
+                                h_flex().items_center().gap(px(8.0)).child(line).child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .hover(|style| style.text_decoration_1())
+                                        .child("Add note"),
+                                ),
+                            ),
                     );
                 }
                 None => {
@@ -1966,7 +2117,10 @@ impl Daku {
             }
         }
         if let Some((env_id, observed_at, kind)) = self.note_target.clone() {
-            let label = format!("Note for {kind} event {}:", observed_at);
+            let label = format!(
+                "Note for the {kind} event, {} ago:",
+                age_phrase(now.saturating_sub(observed_at))
+            );
             block = block
                 .child(
                     div()
@@ -2024,10 +2178,14 @@ impl Daku {
     ) {
         let note = self.note_input.read(cx).value().to_string();
         // The editor clears optimistically: rebuilding it needs the window,
-        // which does not outlive this call. An RPC failure logs to stderr
-        // and the next publish restores the un-annotated row.
+        // which does not outlive this call. An RPC failure surfaces in the
+        // footer and the next publish restores the un-annotated row.
         self.note_target = None;
-        self.note_input = cx.new(|cx| InputState::new(window, cx).default_value(""));
+        self.note_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Add context for the next operator…")
+                .default_value("")
+        });
         cx.notify();
         let Some(client) = self
             .supervisor
@@ -2052,9 +2210,10 @@ impl Daku {
                     })
                 })
                 .await;
-            let _ = this.update(cx, |_, cx| {
+            let _ = this.update(cx, |this, cx| {
                 if let Err(error) = result {
                     eprintln!("daku note save failed: {error:#}");
+                    this.flash(&format!("Note save failed: {error:#}"), cx, 6);
                 }
                 cx.notify();
             });
@@ -2064,7 +2223,8 @@ impl Daku {
 
     fn render_detail(
         &self,
-        cards: Vec<gpui::AnyElement>,
+        voting_cards: Vec<gpui::AnyElement>,
+        context_cards: Vec<gpui::AnyElement>,
         drill_in: Option<gpui::AnyElement>,
         mute_controls: Option<gpui::AnyElement>,
         compare: Option<gpui::AnyElement>,
@@ -2091,13 +2251,30 @@ impl Daku {
                 } else {
                     cx.theme().muted_foreground
                 };
+                // One verdict block answers "why is this degraded": the
+                // voting lines first, the clone/upgrade correlation with
+                // them, metadata after. Healthy Environments show no block.
+                let explain = self.state.health_explain();
+                let correlation = self.state.correlation_build(unix_now());
+                let has_verdict = !explain.is_empty() || correlation.is_some();
+                let shown = if self.verdict_expanded {
+                    explain.len()
+                } else {
+                    explain.len().min(2)
+                };
+                let build_age = self.state.build_age().map(|(_, since)| {
+                    format!(
+                        "on this build {} ago",
+                        age_phrase(unix_now().saturating_sub(since))
+                    )
+                });
                 element
                     .child(
                         v_flex()
                             .px(px(22.0))
                             .pt(px(18.0))
                             .pb(px(12.0))
-                            .gap(px(6.0))
+                            .gap(px(8.0))
                             .child(
                                 h_flex()
                                     .items_center()
@@ -2135,50 +2312,85 @@ impl Daku {
                                             .text_sm()
                                             .text_color(fresh_color)
                                             .child(fresh.label),
-                                    )
-                                    .children(mute_controls),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        environment
-                                            .instance_url
-                                            .trim_start_matches("https://")
-                                            .to_owned(),
                                     ),
                             )
-                            .when_some(self.state.build_age(), |element, (_, since)| {
+                            .when(has_verdict, |element| {
                                 element.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!(
-                                            "on this build {} ago",
-                                            age_phrase(unix_now().saturating_sub(since))
-                                        )),
+                                    v_flex()
+                                        .gap(px(2.0))
+                                        .p(px(10.0))
+                                        .rounded(cx.theme().radius)
+                                        .border_1()
+                                        .border_color(cx.theme().warning.opacity(0.45))
+                                        .bg(cx.theme().warning.opacity(0.08))
+                                        .children(explain.iter().take(shown).map(|line| {
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(cx.theme().foreground)
+                                                .child(line.clone())
+                                        }))
+                                        .when_some(correlation, |element, build| {
+                                            element.child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(format!(
+                                                        "Started after build {build} — likely clone/upgrade fallout"
+                                                    )),
+                                            )
+                                        })
+                                        .when(explain.len() > 2, |element| {
+                                            let remaining = explain.len() - shown;
+                                            let label: SharedString = if self.verdict_expanded {
+                                                "Show less".into()
+                                            } else {
+                                                format!("+{remaining} more").into()
+                                            };
+                                            element.child(
+                                                div()
+                                                    .id("verdict-toggle")
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .cursor_pointer()
+                                                    .hover(|style| style.text_decoration_1())
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            this.verdict_expanded =
+                                                                !this.verdict_expanded;
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                    .child(label),
+                                            )
+                                        }),
                                 )
                             })
-                            .children(self.state.health_explain().into_iter().map(|line| {
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().warning)
-                                    .child(line)
-                            }))
-                            .when_some(
-                                self.state.correlation_build(unix_now()),
-                                |element, build| {
-                                    element.child(
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
                                         div()
                                             .text_sm()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child(format!(
-                                                "Started after build {build} — likely clone/upgrade fallout"
-                                            )),
+                                            .child(
+                                                environment
+                                                    .instance_url
+                                                    .trim_start_matches("https://")
+                                                    .to_owned(),
+                                            ),
                                     )
-                                },
-                            ),
+                                    .when_some(build_age, |element, age| {
+                                        element.child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(age),
+                                        )
+                                    }),
+                            )
+                            .children(mute_controls),
                     )
                     .child(
                         div()
@@ -2187,8 +2399,30 @@ impl Daku {
                             .flex_wrap()
                             .gap(px(12.0))
                             .p(px(22.0))
-                            .children(cards),
+                            .children(voting_cards),
                     )
+                    .when(!context_cards.is_empty(), |element| {
+                        element.child(
+                            v_flex()
+                                .mx(px(22.0))
+                                .mb(px(12.0))
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Other signals — never vote toward health"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .flex_wrap()
+                                        .gap(px(8.0))
+                                        .children(context_cards),
+                                ),
+                        )
+                    })
                     .children(self.recent_block(cx))
                     .children(self.palette_overlay(cx))
                     .children(drill_in)
@@ -2198,7 +2432,7 @@ impl Daku {
                 let message = if self.state.connected() && !self.state.has_environments() {
                     "No Environments configured — add one from the app menu (daku → Add Environment…), or copy environments.example.json to ~/.daku/environments.json and press ⌘R. Daemon diagnostics: ~/.daku/daemon.log"
                 } else {
-                    "No Environment selected."
+                    "No Environment selected — pick one in the sidebar."
                 };
                 element.child(
                     div()
@@ -2224,10 +2458,15 @@ impl Daku {
         };
         let waiting = card.status == crate::dashboard_state::WAITING;
         let skipped = card.status == "skipped";
+        let unknown = card.status == "unknown";
         // Disconnected cards are stale; muted cards are quiet on purpose.
-        // Both paint grey and never carry attention colour.
+        // Both paint grey and never carry attention colour. Hollow dots mark
+        // "no reading" (waiting, skipped, unknown, disconnected) so they
+        // never read as chosen silence, which stays solid grey.
         let quiet = card.dimmed || card.muted;
         let attention = !quiet && matches!(card.status.as_str(), "degraded" | "down");
+        let hollow = !card.muted && (card.dimmed || waiting || skipped || unknown);
+        let hover_border = cx.theme().border;
         let color = if quiet {
             cx.theme().muted_foreground
         } else {
@@ -2256,15 +2495,22 @@ impl Daku {
             .border_color(if selected {
                 cx.theme().primary
             } else if attention {
-                color.opacity(0.4)
+                color.opacity(0.75)
             } else {
                 gpui::transparent_black()
             })
             // Cards that need attention carry their colour, not just a dot.
             .bg(if attention {
-                color.opacity(0.10)
+                color.opacity(0.15)
             } else {
                 cx.theme().secondary
+            })
+            .hover(|style| {
+                if selected || attention {
+                    style
+                } else {
+                    style.border_color(hover_border)
+                }
             })
             .text_color(cx.theme().secondary_foreground)
             .when(skipped, |element| element.opacity(0.7))
@@ -2279,7 +2525,7 @@ impl Daku {
                     .gap(px(6.0))
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(div().size(px(8.0)).rounded_full().bg(color))
+                    .child(status_dot(color, hollow))
                     // The title is the deep link; it underlines on hover.
                     .child(match url {
                         Some(url) => open_link(
@@ -2347,9 +2593,72 @@ impl Daku {
                     color,
                     px(28.0),
                     unit_suffix(signal_id),
+                    TREND_WINDOW_LABEL,
                     cx,
                 ))
             })
+            .into_any_element()
+    }
+
+    /// Compact chip for a non-voting Signal (last_clone, sessions,
+    /// table_growth): one line of dot, label and value. Clicking opens the
+    /// Drill-in like a full card does.
+    fn context_chip(&self, card: SignalCard, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let signal_id = card.signal_id;
+        let selected = self.state.selected_card() == Some(signal_id);
+        let summary = self.state.card_summary(signal_id);
+        let detail = self.state.card_detail(signal_id);
+        let value = if card.status == crate::dashboard_state::WAITING {
+            "waiting".to_owned()
+        } else if !summary.is_empty() {
+            summary
+        } else if !detail.is_empty() {
+            detail
+        } else {
+            card.status.clone()
+        };
+        let quiet = card.dimmed || card.muted;
+        let hollow = !card.muted && (card.dimmed || card.status == "skipped");
+        let color = if quiet {
+            cx.theme().muted_foreground
+        } else {
+            status_color(&card.status, cx)
+        };
+        h_flex()
+            .id(SharedString::from(format!("context-{signal_id}")))
+            .items_center()
+            .gap(px(6.0))
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded_full()
+            .border_1()
+            .border_color(if selected {
+                cx.theme().primary
+            } else {
+                cx.theme().border
+            })
+            .bg(cx.theme().secondary)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.state.select_card(signal_id);
+                cx.notify();
+            }))
+            .child(status_dot(color, hollow))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(signal_label(signal_id)),
+            )
+            .child(
+                div()
+                    .max_w(px(260.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_sm()
+                    .text_color(cx.theme().foreground)
+                    .child(value),
+            )
             .into_any_element()
     }
 
@@ -2413,6 +2722,11 @@ impl Daku {
     fn drill_in_region(&self, signal_id: &'static str, cx: &mut Context<Self>) -> gpui::AnyElement {
         let content = self.state.drill_in(signal_id, unix_now());
         let url = self.state.signal_url(signal_id);
+        let platform_id = self
+            .state
+            .selected()
+            .map(|env| env.platform_id.as_str())
+            .unwrap_or("servicenow");
         let status = self
             .state
             .cards(unix_now())
@@ -2451,7 +2765,7 @@ impl Daku {
                             open_link(
                                 format!("drill-open-{signal_id}").into(),
                                 url,
-                                "Open in ServiceNow \u{2197}",
+                                drill_open_label(platform_id),
                             )
                             .text_xs(),
                         )
@@ -2497,7 +2811,7 @@ impl Daku {
                                 .px(px(14.0))
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("\u{2026} more on the instance"),
+                                .child("… more rows on the instance — open with the link above"),
                         )
                     }),
                 DrillIn::Trend(points) => element
@@ -2518,6 +2832,7 @@ impl Daku {
                         color,
                         px(80.0),
                         unit_suffix(signal_id),
+                        self.state.trend_window().caption(),
                         cx,
                     ))),
                 DrillIn::Text(text) => element.child(
@@ -2551,6 +2866,17 @@ fn open_link(id: SharedString, url: String, label: &'static str) -> gpui::Statef
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(move |_, _, cx| cx.open_url(&url))
         .child(label)
+}
+
+/// Status dot: solid for a live reading or chosen silence, hollow for
+/// "no reading" (waiting, skipped, unknown, disconnected).
+fn status_dot(color: gpui::Hsla, hollow: bool) -> gpui::Div {
+    let dot = div().size(px(8.0)).rounded_full();
+    if hollow {
+        dot.border_1().border_color(color)
+    } else {
+        dot.bg(color)
+    }
 }
 
 /// One line that clips instead of wrapping; the full text is on hover. The id
@@ -2598,10 +2924,32 @@ fn disconnected_banner(cx: &App) -> impl IntoElement {
         .w_full()
         .px(px(14.0))
         .py(px(8.0))
-        .bg(cx.theme().danger.opacity(0.15))
+        .bg(cx.theme().danger.opacity(0.22))
         .text_color(cx.theme().danger)
-        .text_size(px(12.0))
-        .child("Disconnected")
+        .text_sm()
+        .font_weight(FontWeight::SEMIBOLD)
+        .child("Disconnected — showing last known data")
+}
+
+/// Drill-in deep-link label per platform. The destination is the probe
+/// target or the repository on non-ServiceNow platforms, never ServiceNow.
+fn drill_open_label(platform_id: &str) -> &'static str {
+    match platform_id {
+        "github" => "Open repository \u{2197}",
+        "http" => "Open probe target \u{2197}",
+        _ => "Open in ServiceNow \u{2197}",
+    }
+}
+
+/// Short footer form of an export directory: the last two path components.
+/// The full path clips in the 220 px sidebar with no copy action.
+fn short_export_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() >= 2 {
+        format!("…/{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        path.to_owned()
+    }
 }
 
 /// Card/sidebar status dot. Known words share `health_color`'s mapping so
@@ -2621,6 +2969,7 @@ fn health_tag(health: EnvironmentHealth) -> Tag {
         EnvironmentHealth::Healthy => Tag::success(),
         EnvironmentHealth::Degraded => Tag::warning(),
         EnvironmentHealth::Down => Tag::danger(),
+        EnvironmentHealth::Waiting => Tag::secondary(),
     }
     .outline()
     .small()
@@ -2629,6 +2978,7 @@ fn health_tag(health: EnvironmentHealth) -> Tag {
         EnvironmentHealth::Healthy => "healthy",
         EnvironmentHealth::Degraded => "degraded",
         EnvironmentHealth::Down => "down",
+        EnvironmentHealth::Waiting => "waiting",
     })
 }
 
@@ -2652,6 +3002,7 @@ fn health_color(health: EnvironmentHealth, cx: &App) -> gpui::Hsla {
         EnvironmentHealth::Healthy => cx.theme().success,
         EnvironmentHealth::Degraded => cx.theme().warning,
         EnvironmentHealth::Down => cx.theme().danger,
+        EnvironmentHealth::Waiting => cx.theme().muted_foreground,
     }
 }
 
@@ -2715,6 +3066,7 @@ fn sparkline_with_scale(
     color: gpui::Hsla,
     height: Pixels,
     unit: &'static str,
+    window_label: &str,
     cx: &App,
 ) -> impl IntoElement {
     let min = points.iter().copied().fold(f64::INFINITY, f64::min);
@@ -2742,7 +3094,7 @@ fn sparkline_with_scale(
             div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(TREND_WINDOW_LABEL),
+                .child(window_label.to_owned()),
         )
 }
 
@@ -2782,6 +3134,7 @@ fn paint_sparkline(bounds: Bounds<Pixels>, points: &[f64], color: gpui::Hsla, wi
 
 #[cfg(test)]
 mod tests {
+    use super::short_export_path;
     use super::split_summary;
 
     #[test]
@@ -2818,5 +3171,15 @@ mod tests {
             "No clone source configured"
         );
         assert_eq!(super::capitalize(""), "");
+    }
+
+    #[test]
+    fn short_export_path_keeps_the_last_two_components() {
+        assert_eq!(
+            short_export_path("/Users/op/.daku/exports/prod-1700000000"),
+            "…/exports/prod-1700000000"
+        );
+        assert_eq!(short_export_path("prod-1"), "prod-1");
+        assert_eq!(short_export_path(""), "");
     }
 }

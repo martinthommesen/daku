@@ -61,6 +61,7 @@ pub fn notification_body(health: EnvironmentHealth, headline: Option<&str>) -> S
         EnvironmentHealth::Healthy => "healthy",
         EnvironmentHealth::Degraded => "degraded",
         EnvironmentHealth::Down => "down",
+        EnvironmentHealth::Waiting => "waiting",
     };
     match headline {
         Some(line) => format!("{word}: {line}"),
@@ -81,6 +82,7 @@ pub fn notification_body_grouped(health: EnvironmentHealth, lines: &[String]) ->
                 EnvironmentHealth::Healthy => "healthy",
                 EnvironmentHealth::Degraded => "degraded",
                 EnvironmentHealth::Down => "down",
+                EnvironmentHealth::Waiting => "waiting",
             };
             format!("{word}: {}", lines.join("; "))
         }
@@ -166,6 +168,32 @@ pub fn gate_allows(gate: &NotifyGate<'_>, now: i64) -> bool {
         return false;
     }
     true
+}
+
+/// One shared attention decision for a fireable health transition.
+/// Combines the batch rule (`select_notification`: health-kind, at/after
+/// boot, unseen) with the gate rule (`gate_allows`: master, mute,
+/// per-Signal switch, quiet hours). Pure and platform-neutral — the test
+/// surface for "who gets shouted at, when". Delivery stays split:
+/// desktop posts via `delivery`, the daemon webhook fan-out documents its
+/// bypass explicitly in `webhook::should_relay_event`.
+pub struct AttentionInput<'a> {
+    pub kind: HealthEventKind,
+    pub observed_at: i64,
+    pub boot_now: i64,
+    pub seen: bool,
+    pub gate: NotifyGate<'a>,
+    pub now: i64,
+}
+
+pub fn should_notify(input: &AttentionInput<'_>) -> bool {
+    if input.kind != HealthEventKind::Health {
+        return false;
+    }
+    if input.observed_at < input.boot_now || input.seen {
+        return false;
+    }
+    gate_allows(&input.gate, input.now)
 }
 
 /// Posts a health notification, replacing the Environment's previous one.
@@ -566,5 +594,67 @@ mod tests {
             assert!(!gate_allows(&gate(false, None, &allenabled, nights), NIGHT));
             assert!(gate_allows(&gate(false, None, &allenabled, nights), DAWN));
         });
+    }
+
+    #[test]
+    fn should_notify_combines_batch_and_gate() {
+        let enabled: HashMap<String, bool> = HashMap::new();
+        fn input<'a>(
+            kind: HealthEventKind,
+            observed_at: i64,
+            seen: bool,
+            map: &'a HashMap<String, bool>,
+            muted: bool,
+        ) -> AttentionInput<'a> {
+            AttentionInput {
+                kind,
+                observed_at,
+                boot_now: 200,
+                seen,
+                gate: NotifyGate {
+                    master: true,
+                    muted,
+                    headline_signal: None,
+                    notify_signals: map,
+                    quiet_hours: None,
+                },
+                now: 300,
+            }
+        }
+        assert!(should_notify(&input(
+            HealthEventKind::Health,
+            300,
+            false,
+            &enabled,
+            false
+        )));
+        assert!(!should_notify(&input(
+            HealthEventKind::Build,
+            300,
+            false,
+            &enabled,
+            false
+        )));
+        assert!(!should_notify(&input(
+            HealthEventKind::Health,
+            100,
+            false,
+            &enabled,
+            false
+        )));
+        assert!(!should_notify(&input(
+            HealthEventKind::Health,
+            300,
+            true,
+            &enabled,
+            false
+        )));
+        assert!(!should_notify(&input(
+            HealthEventKind::Health,
+            300,
+            false,
+            &enabled,
+            true
+        )));
     }
 }

@@ -158,18 +158,10 @@ fn validate_instance_url(id: &str, url: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Per-platform URL shape on top of the generic https rule: a GitHub
-/// Environment must point at one `owner/repo`.
+/// Per-platform URL shape on top of the generic https rule.
+/// Delegates to the Platform registry — the rule lives there.
 fn validate_platform_url(environment: &EnvironmentConfig) -> anyhow::Result<()> {
-    if environment.platform == Platform::Github
-        && split_github_repo(&environment.instance_url).is_none()
-    {
-        return Err(anyhow!(
-            "environment {}: github instance_url must look like https://github.com/<owner>/<repo>",
-            environment.id
-        ));
-    }
-    Ok(())
+    crate::platform_registry::validate_platform_url(environment)
 }
 
 /// `owner/repo` from a GitHub URL, tolerating a trailing slash or `.git`.
@@ -264,35 +256,8 @@ impl FileCredentialStore {
     }
 
     fn write_map(&self, map: &HashMap<String, String>) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
         let data = serde_json::to_vec_pretty(map).context("encoding credentials file")?;
-        let temporary = self.path.with_extension("json.tmp");
-        {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
-            }
-            let mut file = options
-                .open(&temporary)
-                .with_context(|| format!("writing {}", temporary.display()))?;
-            use std::io::Write as _;
-            file.write_all(&data)
-                .with_context(|| format!("writing {}", temporary.display()))?;
-        }
-        fs::rename(&temporary, &self.path)
-            .with_context(|| format!("replacing {}", self.path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("securing {}", self.path.display()))?;
-        }
-        Ok(())
+        crate::atomic_write::atomic_write(&self.path, &data)
     }
 }
 
@@ -565,6 +530,17 @@ mod tests {
         );
         let error = format!("{:#}", load_environments(file.path()).unwrap_err());
         assert!(error.contains("parsing"), "{error}");
+    }
+
+    #[test]
+    fn environments_reject_unknown_top_level_keys() {
+        for bad in ["instanceurl", "lable", "platfom"] {
+            let file = write_temp(&format!(
+                r#"[{{"id":"dev","label":"Dev","instance_url":"https://acme.example.service-now.com","auth_method":"basic","sort_order":0,"{bad}":"x"}}]"#,
+            ));
+            let error = format!("{:#}", load_environments(file.path()).unwrap_err());
+            assert!(error.contains(bad), "{error}");
+        }
     }
 
     #[test]

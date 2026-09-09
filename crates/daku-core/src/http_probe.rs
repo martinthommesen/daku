@@ -14,14 +14,9 @@ use daku_protocol::SignalState;
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{HttpRequest, ServiceNowClient, basic_authorization};
+use crate::signal_eval::redact_url;
 
 pub const HTTP_PROBE_SIGNAL_ID: &str = "http_probe";
-
-/// Keeps scheme + host + path; drops query and fragment.
-fn redact_url(url: &str) -> String {
-    let without_fragment = url.split('#').next().unwrap_or("");
-    without_fragment.split('?').next().unwrap_or("").to_owned()
-}
 
 fn basic_header(blob: &str) -> Option<(String, String)> {
     let value: serde_json::Value = serde_json::from_str(blob).ok()?;

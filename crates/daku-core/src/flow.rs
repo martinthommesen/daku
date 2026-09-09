@@ -10,6 +10,7 @@ use daku_protocol::SignalState;
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
+use crate::signal_eval::{evaluate_ge, fetch_table_rows, row_text};
 
 pub const FLOW_SIGNAL_ID: &str = "flow";
 pub const FLOW_ERROR_PATH: &str = "/api/now/stats/sys_flow_context?sysparm_count=true&sysparm_query=state=ERROR^sys_updated_on>javascript:gs.hoursAgoStart(1)";
@@ -24,20 +25,8 @@ struct FlowRow {
     sys_updated_on: String,
 }
 
-fn row_text(row: &serde_json::Value, key: &str) -> String {
-    match row.get(key) {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(value) if value.is_number() => value.to_string(),
-        _ => String::new(),
-    }
-}
-
 pub fn flow_state(flow_error_1h: u64, thresholds: &Thresholds) -> SignalState {
-    if flow_error_1h >= thresholds.flow_error_degraded_at {
-        SignalState::Degraded
-    } else {
-        SignalState::Healthy
-    }
+    evaluate_ge(flow_error_1h, thresholds.flow_error_degraded_at)
 }
 
 /// Offending error rows, newest first. A failed rows request yields no rows —
@@ -47,24 +36,12 @@ fn fetch_flow_rows(
     environment: &EnvironmentConfig,
     credentials: &dyn CredentialStore,
 ) -> (Vec<FlowRow>, bool) {
-    let Ok(response) = client.request(environment, credentials, "GET", FLOW_ERROR_ROWS_PATH, None)
-    else {
-        return (Vec::new(), false);
-    };
-    if response.status != 200 {
-        return (Vec::new(), false);
-    }
-    let rows: Vec<FlowRow> = serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
-        .ok()
-        .and_then(|value| {
-            value
-                .get("result")
-                .and_then(|result| result.as_array())
-                .cloned()
-        })
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|row| {
+    fetch_table_rows(
+        client,
+        environment,
+        credentials,
+        FLOW_ERROR_ROWS_PATH,
+        |row| {
             let sys_id = row_text(row, "sys_id");
             if sys_id.is_empty() {
                 return None;
@@ -75,9 +52,8 @@ fn fetch_flow_rows(
                 state: row_text(row, "state"),
                 sys_updated_on: row_text(row, "sys_updated_on"),
             })
-        })
-        .collect();
-    crate::collector::take_bounded(rows)
+        },
+    )
 }
 
 #[derive(Default)]

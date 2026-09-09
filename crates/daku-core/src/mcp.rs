@@ -292,11 +292,11 @@ fn call_tool(
 
 /// Redacted drill-in rows for one Signal payload: which items are offending,
 /// without the payload itself. The allowlist names exactly one display field
-/// per list — config-ish names (job names, MID host names, plugin ids), never
-/// message bodies (syslog `message`, email `subject`), URLs (outbound,
-/// transaction), or credentials. Lists without a safe display field report
-/// counts only (`names` empty). Bounded to `ROW_NAMES_CAP` names; `truncated`
-/// ORs the payload's own flag with the cap.
+/// per list — config-ish names (job names, MID host names, plugin ids, user
+/// display names), never message bodies (syslog `message`, email `subject`),
+/// URLs (outbound, transaction), or credentials. Lists without a safe display
+/// field report counts only (`names` empty). Bounded to `ROW_NAMES_CAP` names;
+/// `truncated` ORs the payload's own flag with the cap.
 pub const ROW_NAMES_CAP: usize = 10;
 
 /// (signal id, list key, display-field key or `None` for counts only).
@@ -309,6 +309,7 @@ const REDACTED_ROW_TABLE: &[(&str, &str, Option<&str>)] = &[
     ("flow", "error_rows", Some("name")),
     ("email", "error_rows", None),
     ("upgrade", "upgrades", Some("from_version")),
+    ("sessions", "session_rows", Some("user")),
     ("update_sets", "open_rows", Some("name")),
     ("scan", "finding_rows", Some("priority")),
     ("drift", "mismatch_list", Some("id")),
@@ -568,10 +569,30 @@ mod tests {
         assert_eq!(rows[0]["count"], 1);
         assert_eq!(rows[0]["truncated"], true);
         assert!(!serde_json::to_string(&rows).unwrap().contains("SECRET-3"));
+        // Session user display names ride; ids stay out of the names.
+        let rows = redacted_rows(
+            "sessions",
+            r#"{"active_sessions":2,"truncated":false,"session_rows":[{"sys_id":"s1","user":"Fred Johnson","user_id":"u1","sys_created_on":"2026-01-27 00:12:00"},{"sys_id":"s2","user":"Ada Lovelace","user_id":"u2","sys_created_on":"2026-01-27 00:10:00"}],"session_rows_truncated":false}"#,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["list"], "session_rows");
+        assert_eq!(rows[0]["count"], 2);
+        assert_eq!(
+            rows[0]["names"],
+            serde_json::json!(["Fred Johnson", "Ada Lovelace"])
+        );
+        assert_eq!(rows[0]["truncated"], false);
         // Unknown signals, unparsable payloads, and empty lists yield nothing.
         assert!(redacted_rows("availability", r#"{"rtt_ms":4}"#).is_empty());
         assert!(redacted_rows("jobs", "not json").is_empty());
         assert!(redacted_rows("jobs", r#"{"overdue_rows":[],"error_rows":[]}"#).is_empty());
+        assert!(
+            redacted_rows(
+                "sessions",
+                r#"{"active_sessions":0,"truncated":false,"session_rows":[],"session_rows_truncated":false}"#
+            )
+            .is_empty()
+        );
     }
 
     #[test]

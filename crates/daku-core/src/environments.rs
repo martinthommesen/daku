@@ -15,9 +15,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
 use anyhow::{Context, anyhow, bail};
 
 use daku_protocol::{Command, EnvironmentConfig, ResponsePayload, validate_credential};
@@ -130,37 +127,18 @@ fn validate_environment(environment: &EnvironmentConfig) -> anyhow::Result<()> {
     if let Some(reason) = daku_protocol::instance_url_error(&environment.instance_url) {
         bail!("environment {}: {reason}", environment.id);
     }
+    crate::platform_registry::validate_platform_url(environment)?;
     Ok(())
 }
 
-/// Atomic `environments.json` write: pretty JSON via tmp + rename, `0600` on
-/// unix. Entries sort by `sort_order`, like the loader expects.
+/// Atomic `environments.json` write: pretty JSON via the shared helper with
+/// unique tmp, fsync, and owner-only modes. Entries sort by `sort_order`,
+/// like the loader expects.
 pub fn save_environments(path: &Path, environments: &[EnvironmentConfig]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
     let mut sorted = environments.to_vec();
     sorted.sort_by_key(|environment| environment.sort_order);
     let data = serde_json::to_vec_pretty(&sorted).context("encoding environments.json")?;
-    let temporary = path.with_extension("json.tmp");
-    {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        io::Write::write_all(
-            &mut options
-                .open(&temporary)
-                .with_context(|| format!("writing {}", temporary.display()))?,
-            &data,
-        )
-        .with_context(|| format!("writing {}", temporary.display()))?;
-    }
-    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("securing {}", path.display()))?;
-    Ok(())
+    crate::atomic_write::atomic_write(path, &data)
 }
 
 fn load_or_empty(path: &Path) -> anyhow::Result<Vec<EnvironmentConfig>> {
@@ -261,6 +239,8 @@ pub fn test_environment(
         }
         None => credentials,
     };
+    // Per-Platform probe dispatch; see `platform_registry::transport_for`
+    // for the transport rule. Keep in step with `signals_for`.
     match environment.platform {
         daku_protocol::Platform::Servicenow => {
             Ok(AvailabilitySignal.observe(client, store, environment))
@@ -316,10 +296,13 @@ mod tests {
         assert_eq!(read(file.path()).len(), 1);
         assert_eq!(credentials.get("dev").unwrap().as_deref(), Some(BASIC));
         #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(file.path()).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(file.path()).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

@@ -21,6 +21,7 @@ use daku_protocol::SignalState;
 use crate::collector::{Observation, PerEnvironmentCollector, ROW_LIST_LIMIT, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::ServiceNowClient;
+use crate::signal_eval::{evaluate_ge, parse_result_array_required, row_text};
 
 pub const SCAN_SIGNAL_ID: &str = "scan";
 pub const SCAN_FINDINGS_PATH: &str = "/api/now/table/scan_finding?sysparm_fields=sys_id,priority,state,sys_updated_on&sysparm_query=ORDERBYDESCsys_updated_on&sysparm_limit=50";
@@ -31,14 +32,6 @@ struct FindingRow {
     priority: String,
     state: String,
     sys_updated_on: String,
-}
-
-fn row_text(row: &serde_json::Value, key: &str) -> String {
-    match row.get(key) {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(value) if value.is_number() => value.to_string(),
-        _ => String::new(),
-    }
 }
 
 /// Closed-ish state substrings; anything else (including empty) reads open.
@@ -62,11 +55,7 @@ fn priority_bucket(priority: &str) -> &'static str {
 }
 
 pub fn scan_state(p1_open: u64, thresholds: &Thresholds) -> SignalState {
-    if p1_open >= thresholds.scan_p1_degraded_at {
-        SignalState::Degraded
-    } else {
-        SignalState::Healthy
-    }
+    evaluate_ge(p1_open, thresholds.scan_p1_degraded_at)
 }
 
 fn fetch_findings(
@@ -83,34 +72,25 @@ fn fetch_findings(
     if response.status != 200 {
         anyhow::bail!("HTTP {}", response.status);
     }
-    let rows: Vec<FindingRow> =
-        serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("result")
-                    .and_then(|result| result.as_array())
-                    .cloned()
+    let rows: Vec<FindingRow> = parse_result_array_required(&response.body)?
+        .iter()
+        .filter_map(|row| {
+            let sys_id = row_text(row, "sys_id");
+            if sys_id.is_empty() {
+                return None;
+            }
+            let state = row_text(row, "state");
+            if !is_open(&state) {
+                return None;
+            }
+            Some(FindingRow {
+                sys_id,
+                priority: priority_bucket(&row_text(row, "priority")).into(),
+                state,
+                sys_updated_on: row_text(row, "sys_updated_on"),
             })
-            .ok_or_else(|| anyhow::anyhow!("scan findings response has no result array"))?
-            .iter()
-            .filter_map(|row| {
-                let sys_id = row_text(row, "sys_id");
-                if sys_id.is_empty() {
-                    return None;
-                }
-                let state = row_text(row, "state");
-                if !is_open(&state) {
-                    return None;
-                }
-                Some(FindingRow {
-                    sys_id,
-                    priority: priority_bucket(&row_text(row, "priority")).into(),
-                    state,
-                    sys_updated_on: row_text(row, "sys_updated_on"),
-                })
-            })
-            .collect();
+        })
+        .collect();
     Ok(Some(rows.into_iter().take(ROW_LIST_LIMIT).collect()))
 }
 

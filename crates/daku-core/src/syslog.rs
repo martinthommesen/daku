@@ -5,6 +5,7 @@ use daku_protocol::SignalState;
 use crate::collector::{Observation, PerEnvironmentCollector, ROW_LIST_LIMIT, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
+use crate::signal_eval::{evaluate_ge, fetch_table_rows, row_text};
 
 pub const SYSLOG_SIGNAL_ID: &str = "syslog";
 pub const SYSLOG_ERROR_LEVEL: u8 = 2;
@@ -24,13 +25,6 @@ struct SyslogRow {
     sys_created_on: String,
 }
 
-fn row_text(row: &serde_json::Value, key: &str) -> String {
-    row.get(key)
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_owned()
-}
-
 pub fn syslog_error_path() -> String {
     format!(
         "/api/now/stats/syslog?sysparm_count=true&sysparm_query=level={SYSLOG_ERROR_LEVEL}^sys_created_on>javascript:gs.hoursAgoStart(1)"
@@ -38,11 +32,7 @@ pub fn syslog_error_path() -> String {
 }
 
 pub fn syslog_state(error_count_1h: u64, thresholds: &Thresholds) -> SignalState {
-    if error_count_1h >= thresholds.syslog_error_degraded_at {
-        SignalState::Degraded
-    } else {
-        SignalState::Healthy
-    }
+    evaluate_ge(error_count_1h, thresholds.syslog_error_degraded_at)
 }
 
 /// Offending error rows, newest first. A failed rows request yields no rows —
@@ -52,45 +42,26 @@ fn fetch_syslog_rows(
     environment: &EnvironmentConfig,
     credentials: &dyn CredentialStore,
 ) -> (Vec<SyslogRow>, bool) {
-    let Ok(response) = client.request(
+    fetch_table_rows(
+        client,
         environment,
         credentials,
-        "GET",
         &syslog_error_rows_path(),
-        None,
-    ) else {
-        return (Vec::new(), false);
-    };
-    if response.status != 200 {
-        return (Vec::new(), false);
-    }
-    let rows: Vec<SyslogRow> =
-        serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("result")
-                    .and_then(|result| result.as_array())
-                    .cloned()
+        |row| {
+            let sys_id = row_text(row, "sys_id");
+            if sys_id.is_empty() {
+                return None;
+            }
+            // Bound the payload: messages can be stack traces.
+            let message: String = row_text(row, "message").chars().take(160).collect();
+            Some(SyslogRow {
+                sys_id,
+                source: row_text(row, "source"),
+                message,
+                sys_created_on: row_text(row, "sys_created_on"),
             })
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|row| {
-                let sys_id = row_text(row, "sys_id");
-                if sys_id.is_empty() {
-                    return None;
-                }
-                // Bound the payload: messages can be stack traces.
-                let message: String = row_text(row, "message").chars().take(160).collect();
-                Some(SyslogRow {
-                    sys_id,
-                    source: row_text(row, "source"),
-                    message,
-                    sys_created_on: row_text(row, "sys_created_on"),
-                })
-            })
-            .collect();
-    crate::collector::take_bounded(rows)
+        },
+    )
 }
 
 #[derive(Default)]

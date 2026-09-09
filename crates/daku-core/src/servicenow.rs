@@ -10,6 +10,15 @@ use serde::Deserialize;
 
 use crate::config::{AuthMethod, CredentialStore, EnvironmentConfig};
 
+/// Detail string for exhausted 429 budgets. Surfaced in signal payloads and
+/// down-snapshot errors so throttling never reads as healthy-empty.
+pub const THROTTLED_DETAIL: &str = "throttled by ServiceNow (HTTP 429); retry budget exhausted";
+
+/// Whether an HTTP status represents rate limiting.
+pub fn is_rate_limited(status: u16) -> bool {
+    status == 429
+}
+
 const MAX_429_RETRIES: u8 = 2;
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Upper bound on a single 429 back-off. Anything longer would stall the
@@ -407,6 +416,9 @@ pub fn fetch_aggregate_count(
     path: &str,
 ) -> anyhow::Result<u64> {
     let response = client.request(environment, credentials, "GET", path, None)?;
+    if is_rate_limited(response.status) {
+        anyhow::bail!("{THROTTLED_DETAIL}");
+    }
     if response.status != 200 {
         anyhow::bail!("HTTP {}", response.status);
     }
@@ -441,6 +453,9 @@ pub fn fetch_aggregate_avg(
     field: &str,
 ) -> anyhow::Result<f64> {
     let response = client.request(environment, credentials, "GET", path, None)?;
+    if is_rate_limited(response.status) {
+        anyhow::bail!("{THROTTLED_DETAIL}");
+    }
     if response.status != 200 {
         anyhow::bail!("HTTP {}", response.status);
     }

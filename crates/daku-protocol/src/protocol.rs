@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::environment::{AuthMethod, EnvironmentConfig, Thresholds};
 use crate::settings::DaemonSettings;
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "DAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "DAKU_DAEMON_ADDRESS";
@@ -102,6 +102,7 @@ pub enum EnvironmentHealth {
     Healthy,
     Degraded,
     Down,
+    Waiting,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -118,6 +119,7 @@ impl EnvironmentHealth {
             Self::Healthy => "healthy",
             Self::Degraded => "degraded",
             Self::Down => "down",
+            Self::Waiting => "waiting",
         }
     }
 
@@ -126,6 +128,7 @@ impl EnvironmentHealth {
             "healthy" => Self::Healthy,
             "degraded" => Self::Degraded,
             "down" => Self::Down,
+            "waiting" => Self::Waiting,
             _ => return None,
         })
     }
@@ -602,7 +605,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_daku_domain() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]

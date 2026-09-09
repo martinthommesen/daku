@@ -24,6 +24,7 @@ use crate::last_clone::LastCloneCollector;
 use crate::mid_ecc::MidEccCollector;
 use crate::outbound::OutboundCollector;
 use crate::persistence::{self, StateStore};
+use crate::platform_registry::{needs_slow_collectors, servicenow_subset};
 use crate::scan::ScanCollector;
 use crate::servicenow::{Clock, LimitedTransport, ServiceNowClient, SystemClock, UreqTransport};
 use crate::sessions::SessionsCollector;
@@ -223,21 +224,18 @@ impl<S: Signal + 'static> SignalCollector for PerEnvironmentCollector<S> {
     fn collect(&self) -> anyhow::Result<()> {
         let connection = self.store.open()?;
         let observed_at = unix_now();
-        let mut first_error = None;
+        let mut errors: Vec<anyhow::Error> = Vec::new();
         for environment in &self.environments {
             if let Err(error) = self.collect_environment(&connection, environment, observed_at) {
-                first_error.get_or_insert(error);
+                errors.push(error);
             }
         }
         if self.signal.keeps_samples()
             && let Err(error) = persistence::prune_signal_samples(&connection, observed_at)
         {
-            first_error.get_or_insert_with(|| anyhow::Error::from(error));
+            errors.push(anyhow::Error::from(error));
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        combine_errors(errors)
     }
 }
 
@@ -360,19 +358,19 @@ impl CollectorLoop {
                 self.interval.as_secs_f64()
             );
         }
-        let result = match errors.into_iter().next() {
+        let result = match combine_errors(errors) {
             // The tick number joins the daemon-log lines for one round
             // (overrun warnings, this failure) across threads.
-            Some(error) => Err(error.context(format!("tick {tick}"))),
-            None => Ok(()),
+            Err(error) => Err(error.context(format!("tick {tick}"))),
+            Ok(()) => Ok(()),
         };
         (result, elapsed)
     }
 
-    pub fn run(&self, shutdown: &AtomicBool, clock: &dyn Clock, after: &dyn Fn()) {
+    pub fn run(&self, shutdown: &AtomicBool, clock: &dyn Clock, after: &dyn Fn(Duration)) {
         // Publish last-known state from SQLite so a fresh subscriber is not blank
         // until the first tick completes.
-        publish(after);
+        publish(after, Duration::ZERO);
         let mut was_offline = false;
         while !shutdown.load(Ordering::Acquire) {
             if self.offline_check.as_ref().is_some_and(|check| check()) {
@@ -393,7 +391,7 @@ impl CollectorLoop {
             if let Err(error) = result {
                 eprintln!("daku collector tick failed: {error}");
             }
-            publish(after);
+            publish(after, elapsed);
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
@@ -405,32 +403,13 @@ impl CollectorLoop {
 
 /// Hosts one poll round must reach: ServiceNow and probe hosts verbatim,
 /// plus the GitHub API for repo Environments. Deduped, in config order.
+/// Delegates to the Platform registry — the rule lives there.
 pub fn poll_hosts(environments: &[EnvironmentConfig]) -> Vec<String> {
-    let mut hosts = Vec::new();
-    for environment in environments {
-        let host = match environment.platform {
-            Platform::Github => "api.github.com".to_owned(),
-            _ => host_of_url(&environment.instance_url).unwrap_or_default(),
-        };
-        if !host.is_empty() && !hosts.contains(&host) {
-            hosts.push(host);
-        }
-    }
-    hosts
+    crate::platform_registry::poll_hosts(environments)
 }
 
 pub(crate) fn host_of_url(url: &str) -> Option<String> {
-    let authority = url.split("://").nth(1)?.split('/').next()?;
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = match host.strip_prefix('[') {
-        Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
-        None => host.split(':').next().unwrap_or(""),
-    };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_owned())
-    }
+    crate::platform_registry::host_of_url(url)
 }
 
 /// True when TCP 443 reaches none of the hosts (2 s each, sequential).
@@ -455,30 +434,43 @@ pub fn all_hosts_unreachable(hosts: &[String]) -> bool {
 }
 
 /// Publishes the dashboard, costing one tick's publish rather than the whole
-/// loop if it panics.
-fn publish(after: &dyn Fn()) {
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(after)).is_err() {
+/// loop if it panics. `elapsed` is the tick that just ran (`ZERO` for the
+/// pre-first-tick publish); the callback records it for tick telemetry.
+fn publish(after: &dyn Fn(Duration), elapsed: Duration) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| after(elapsed))).is_err() {
         eprintln!("daku dashboard publish panicked");
     }
 }
 
 fn run_sequential(collectors: &[Box<dyn SignalCollector>]) -> anyhow::Result<()> {
-    let mut first_error = None;
+    let mut errors: Vec<anyhow::Error> = Vec::new();
     for collector in collectors {
         if let Err(error) = collector.collect() {
-            first_error.get_or_insert(error);
+            errors.push(error);
         }
     }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+    combine_errors(errors)
+}
+
+/// Combines per-signal errors into one tick error so operators see every
+/// failure, not just the first. Empty means success.
+fn combine_errors(errors: Vec<anyhow::Error>) -> anyhow::Result<()> {
+    let mut iter = errors.into_iter();
+    let Some(first) = iter.next() else {
+        return Ok(());
+    };
+    let mut message = format!("{first:#}");
+    for error in iter {
+        message.push_str("; ");
+        message.push_str(&format!("{error:#}"));
     }
+    Err(anyhow::anyhow!("{message}"))
 }
 
 pub fn spawn_collector_loop(
     loop_: CollectorLoop,
     shutdown: Arc<AtomicBool>,
-    after_tick: impl Fn() + Send + 'static,
+    after_tick: impl Fn(Duration) + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("daku-collector".into())
@@ -506,13 +498,12 @@ pub fn build_default_loop(
     loop_.offline_check = Some(std::sync::Arc::new(move || {
         all_hosts_unreachable(&offline_hosts)
     }));
-    let servicenow: Vec<EnvironmentConfig> = environments
-        .iter()
-        .filter(|environment| environment.platform == Platform::Servicenow)
-        .cloned()
-        .collect();
+    let servicenow: Vec<EnvironmentConfig> = servicenow_subset(&environments);
     for environment in &environments {
         let one = vec![environment.clone()];
+        // Wiring dispatch: the per-Platform Signal list is stated in
+        // `platform_registry::signals_for` — keep the two in step when
+        // adding a Platform.
         match environment.platform {
             Platform::Servicenow => loop_.register_group(vec![
                 Box::new(AvailabilityCollector::new(
@@ -606,7 +597,8 @@ pub fn build_default_loop(
     }
     // Drift, last-clone, and scan read inventories and history: they ride
     // the slow cadence, while every per-Environment Signal stays per-tick.
-    if !servicenow.is_empty() {
+    // The registry owns the "only with ServiceNow" rule.
+    if needs_slow_collectors(&environments) {
         loop_.register_slow(DriftCollector::new(
             servicenow.clone(),
             credentials.clone(),
@@ -672,15 +664,28 @@ pub fn start_default_loop_with_store(
     let dashboard_environments = environments.clone();
     let dashboard_store = store.clone();
     let webhook = std::sync::Arc::new(WebhookRelay::new());
-    let loop_ = build_default_loop(
-        environments,
-        credentials,
-        store,
-        Duration::from_secs(poll_interval_secs(settings)),
-        Duration::from_secs(slow_poll_interval_secs(settings)),
-        ServiceNowClient::new(LimitedTransport::new(UreqTransport::default()), SystemClock),
-    );
-    spawn_collector_loop(loop_, shutdown, move || {
+    // The offline check reloads the config on every probe so host edits apply
+    // without a daemon restart; a reload failure falls back to the snapshot.
+    let offline_hosts = poll_hosts(&environments);
+    let offline_path = environments_path.to_path_buf();
+    let loop_ = {
+        let mut loop_ = build_default_loop(
+            environments,
+            credentials,
+            store,
+            Duration::from_secs(poll_interval_secs(settings)),
+            Duration::from_secs(slow_poll_interval_secs(settings)),
+            ServiceNowClient::new(LimitedTransport::new(UreqTransport::default()), SystemClock),
+        );
+        loop_.offline_check = Some(std::sync::Arc::new(move || {
+            let hosts = load_environments(&offline_path)
+                .map(|envs| poll_hosts(&envs))
+                .unwrap_or_else(|_| offline_hosts.clone());
+            all_hosts_unreachable(&hosts)
+        }));
+        loop_
+    };
+    spawn_collector_loop(loop_, shutdown, move |elapsed: Duration| {
         let now = unix_now();
         if let Err(error) = publish_dashboard(
             &dashboard_environments,
@@ -689,6 +694,16 @@ pub fn start_default_loop_with_store(
             now,
         ) {
             eprintln!("daku dashboard publish failed: {error}");
+        }
+        // Tick telemetry (FEAT-004): persisted per-tick durations back the
+        // overrun counts doctor reports. Best-effort; never fails the tick.
+        // Elapsed covers collection; the pre-first-tick publish passes ZERO.
+        if let Ok(connection) = dashboard_store.open() {
+            let _ = persistence::record_tick_stat(
+                &connection,
+                now,
+                i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+            );
         }
         // Fire-and-forget: a slow forwarder must never stall polling.
         if WebhookRelay::configured_url().is_some() {
@@ -759,6 +774,10 @@ pub struct DoctorReport {
     pub poll_interval_secs: u64,
     pub slow_poll_interval_secs: u64,
     pub rows: Vec<DoctorRow>,
+    /// Ticks recorded in the retained window (FEAT-004).
+    pub tick_count: i64,
+    /// Recorded ticks at or over the poll interval.
+    pub tick_overruns: i64,
 }
 
 /// Read-only diagnosis: config, Credential presence (never the value), and a
@@ -771,8 +790,12 @@ pub fn run_doctor(
     store: StateStore,
 ) -> anyhow::Result<DoctorReport> {
     let environments = load_environments(environments_path)?;
-    let probe =
-        AvailabilityCollector::new(environments.clone(), credentials.clone(), client, store);
+    let probe = AvailabilityCollector::new(
+        environments.clone(),
+        credentials.clone(),
+        client,
+        store.clone(),
+    );
     let rows = environments
         .iter()
         .map(|environment| {
@@ -790,9 +813,10 @@ pub fn run_doctor(
                 Ok(None) => (false, None),
                 Err(error) => (false, Some(error.to_string())),
             };
+            // Per-Platform probe dispatch; transports per
+            // `platform_registry::transport_for` (ServiceNow authed,
+            // HTTP/GitHub raw). Keep in step with `signals_for`.
             let observation = match environment.platform {
-                // Each platform probes its own way; the row shape stays one
-                // line per Environment either way.
                 Platform::Servicenow => probe.probe(environment),
                 Platform::Http => crate::availability::observe_probe_signal(
                     &crate::http_probe::HttpProbeSignal,
@@ -823,11 +847,21 @@ pub fn run_doctor(
             }
         })
         .collect();
+    let (tick_count, tick_overruns) = store
+        .open()
+        .ok()
+        .and_then(|connection| {
+            persistence::load_tick_stats_summary(&connection, poll_interval_secs(settings) as i64)
+                .ok()
+        })
+        .unwrap_or((0, 0));
     Ok(DoctorReport {
         environments_path: environments_path.to_owned(),
         poll_interval_secs: poll_interval_secs(settings),
         slow_poll_interval_secs: slow_poll_interval_secs(settings),
         rows,
+        tick_count,
+        tick_overruns,
     })
 }
 
@@ -962,7 +996,7 @@ mod tests {
                 self.0.store(true, Ordering::Release);
             }
         }
-        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|| {
+        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|_| {
             calls.fetch_add(1, Ordering::Release);
         });
         assert_eq!(calls.load(Ordering::Acquire), 2);
@@ -990,7 +1024,7 @@ mod tests {
             Duration::from_millis(200),
             Arc::new(AtomicUsize::new(0)),
         ));
-        loop_.run(&shutdown, &clock, &|| {});
+        loop_.run(&shutdown, &clock, &|_| {});
         let sleeps = clock.1.lock().expect("sleeps").clone();
         assert_eq!(sleeps.len(), 1);
         assert!(
@@ -1009,7 +1043,7 @@ mod tests {
             Duration::from_millis(50),
             Arc::new(AtomicUsize::new(0)),
         ));
-        loop_.run(&shutdown, &clock, &|| {});
+        loop_.run(&shutdown, &clock, &|_| {});
         assert_eq!(*clock.1.lock().expect("sleeps"), [Duration::ZERO]);
     }
 
@@ -1105,7 +1139,7 @@ mod tests {
             }
         }
         without_panic_output(|| {
-            loop_.run(&shutdown, &StopAfterTwo(&shutdown, &calls), &|| {
+            loop_.run(&shutdown, &StopAfterTwo(&shutdown, &calls), &|_| {
                 if calls.fetch_add(1, Ordering::AcqRel) == 0 {
                     panic!("publish exploded");
                 }
@@ -1168,6 +1202,30 @@ mod tests {
             2,
             "later collectors still run"
         );
+    }
+
+    #[test]
+    fn collector_loop_tick_reports_every_failure() {
+        struct Failing(&'static str);
+        impl SignalCollector for Failing {
+            fn collect(&self) -> anyhow::Result<()> {
+                anyhow::bail!("{}", self.0)
+            }
+        }
+        let mut loop_ = CollectorLoop::new(Duration::from_secs(120));
+        loop_.register_group(vec![
+            Box::new(Failing("first")),
+            Box::new(Failing("second")),
+        ]);
+        let error = loop_.tick().unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("first"), "{text}");
+        assert!(text.contains("second"), "{text}");
+    }
+
+    #[test]
+    fn combine_errors_is_ok_for_empty() {
+        assert!(combine_errors(Vec::new()).is_ok());
     }
 
     #[test]
@@ -1332,7 +1390,7 @@ mod tests {
             }
         }
         loop_.register(SleepingCollector(Duration::ZERO, ticks.clone()));
-        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|| {});
+        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|_| {});
         assert_eq!(
             ticks.load(Ordering::Acquire),
             0,
@@ -1343,7 +1401,7 @@ mod tests {
         let shutdown = AtomicBool::new(false);
         let mut loop_ = CollectorLoop::new(Duration::from_secs(120)).with_offline_check(|| false);
         loop_.register(SleepingCollector(Duration::ZERO, ticks.clone()));
-        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|| {});
+        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|_| {});
         assert_eq!(ticks.load(Ordering::Acquire), 1);
     }
 
@@ -1527,7 +1585,7 @@ mod tests {
         assert_eq!(availability.state, "down");
         let payload: serde_json::Value = serde_json::from_str(&availability.payload_json).unwrap();
         assert_eq!(payload["reachability"], "unreachable");
-        assert_eq!(payload["error"], "HTTP 429");
+        assert_eq!(payload["error"], crate::servicenow::THROTTLED_DETAIL);
 
         // Behaviour::Panic: a gated Signal must not probe a rate-limited Environment.
         fake_collector(db.store(), Behaviour::Panic, false)

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use daku_protocol::{
     ClientMessage, Command, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, Request, ResponseOutcome,
     ResponsePayload, RpcError, ServerMessage,
@@ -50,7 +50,12 @@ struct HubState {
     next_subscriber_id: u64,
     subscribers: HashMap<u64, Sender<ServerMessage>>,
     dashboard: BTreeMap<String, ServerMessage>,
+    dropped: u64,
 }
+
+/// Bound on per-subscriber queued dashboard messages. A stalled client stops
+/// growing memory here; further publishes drop with a counter instead.
+pub const SUBSCRIBER_QUEUE_BOUND: usize = 512;
 
 #[derive(Default)]
 struct Hub {
@@ -59,14 +64,59 @@ struct Hub {
 
 impl Hub {
     /// Broadcasts a dashboard message and remembers it for late subscribers.
+    /// Slow-subscriber drops and oversize payloads are logged, never silent.
     fn publish_dashboard(&self, message: ServerMessage) {
+        let wire_bytes = serde_json::to_vec(&message).map(|v| v.len()).unwrap_or(0);
+        if wire_bytes > MAX_WIRE_MESSAGE_BYTES {
+            eprintln!(
+                "daku-daemon publish above wire cap: {} bytes for {:?}; clients will resync",
+                wire_bytes,
+                message
+                    .dashboard_cache_key()
+                    .as_deref()
+                    .unwrap_or("uncached"),
+            );
+        }
         let mut state = self.state.lock();
         if let Some(key) = message.dashboard_cache_key() {
             state.dashboard.insert(key, message.clone());
         }
-        state
+        // Snapshot senders so the drop counter mutation never aliases the
+        // subscriber borrow.
+        let senders: Vec<(u64, Sender<ServerMessage>)> = state
             .subscribers
-            .retain(|_, subscriber| subscriber.send(message.clone()).is_ok());
+            .iter()
+            .map(|(&id, sender)| (id, sender.clone()))
+            .collect();
+        let mut disconnected = Vec::new();
+        let mut drops = 0u64;
+        for (id, subscriber) in senders {
+            match subscriber.try_send(message.clone()) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                    drops = drops.saturating_add(1);
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    disconnected.push(id);
+                }
+            }
+        }
+        if drops > 0 {
+            state.dropped = state.dropped.saturating_add(drops);
+            if state.dropped % 20 == 1 || drops > 1 {
+                eprintln!(
+                    "daku-daemon dropped {} dashboard messages for slow subscribers",
+                    state.dropped,
+                );
+            }
+        }
+        let removed = disconnected.len();
+        for id in disconnected {
+            state.subscribers.remove(&id);
+        }
+        if removed > 0 {
+            eprintln!("daku-daemon removed {removed} disconnected dashboard subscribers");
+        }
     }
 
     fn subscribe(&self, sender: Sender<ServerMessage>) -> u64 {
@@ -225,7 +275,7 @@ fn handle_connection(
         .get_mut()
         .set_read_timeout(Some(SOCKET_POLL_INTERVAL))?;
 
-    let (outgoing, outgoing_rx) = unbounded();
+    let (outgoing, outgoing_rx) = bounded(SUBSCRIBER_QUEUE_BOUND);
     let subscriber_id = hub.subscribe(outgoing.clone());
 
     'connection: while !shutdown.load(Ordering::Acquire) {
@@ -373,6 +423,7 @@ fn write_json<S: io::Read + io::Write, T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossbeam_channel::unbounded;
 
     use daku_protocol::ServerMessage;
 
@@ -423,5 +474,32 @@ mod tests {
             replayed[1],
             ServerMessage::SignalSnapshotsUpdated { .. }
         ));
+    }
+
+    #[test]
+    fn hub_bounds_slow_subscribers_with_drop_counter() {
+        let hub = Hub::default();
+        let (tx, rx) = bounded(1);
+        hub.subscribe(tx);
+        for _ in 0..5 {
+            hub.publish_dashboard(ServerMessage::EnvironmentsUpdated {
+                environments: vec![],
+            });
+        }
+        // Bounded queue keeps the first message; the rest drop with a counter.
+        assert!(rx.try_iter().count() >= 1);
+        assert!(hub.state.lock().dropped >= 4);
+    }
+
+    #[test]
+    fn hub_removes_disconnected_subscribers() {
+        let hub = Hub::default();
+        let (tx, rx) = bounded::<ServerMessage>(8);
+        hub.subscribe(tx);
+        drop(rx);
+        hub.publish_dashboard(ServerMessage::EnvironmentsUpdated {
+            environments: vec![],
+        });
+        assert!(hub.state.lock().subscribers.is_empty());
     }
 }

@@ -5,6 +5,7 @@ use crossbeam_channel::Sender;
 use daku_protocol::{
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, Reachability,
     RollupPoint, SamplePoint, ServerMessage, SignalEventDto, SignalSnapshotDto, SignalState,
+    parse_build, parse_reachability,
 };
 
 use crate::availability::AVAILABILITY_SIGNAL_ID;
@@ -18,6 +19,70 @@ use crate::syslog::SYSLOG_SIGNAL_ID;
 use daku_protocol::NON_VOTING_SIGNALS;
 
 pub const SERVICENOW_PLATFORM_ID: &str = "servicenow";
+
+/// Signals whose 24 h samples ride `SignalSamplesUpdated` and whose hourly
+/// buckets ride `SignalRollupsUpdated`. One const — a new trend Signal
+/// edits here, not three call sites.
+pub const TREND_SIGNALS: [&str; 3] = [AVAILABILITY_SIGNAL_ID, JOBS_SIGNAL_ID, SYSLOG_SIGNAL_ID];
+
+/// Whether one vote counts toward Environment health.
+/// Informational Signals never vote (`NON_VOTING_SIGNALS`); skipped probes
+/// never vote either. Single predicate — daemon and desktop share the rule.
+pub fn votes(signal_id: &str, state: SignalState) -> bool {
+    !NON_VOTING_SIGNALS.contains(&signal_id) && state != SignalState::Skipped
+}
+
+/// Decided health for one Environment's snapshots: reachability, votes,
+/// rollup, and build. Pure over loaded snapshots — the test surface for
+/// votership, unknown-state fallback, and build extraction.
+pub struct DecideOut {
+    pub reachability: Reachability,
+    pub health: EnvironmentHealth,
+    pub build: Option<String>,
+    pub votes: Vec<(String, SignalState)>,
+}
+
+pub fn decide(env_snaps: &[&persistence::SignalSnapshot]) -> DecideOut {
+    let reachability = env_snaps
+        .iter()
+        .find(|snapshot| snapshot.signal_id == AVAILABILITY_SIGNAL_ID)
+        .map(|snapshot| wire_reachability(&snapshot.payload_json))
+        .unwrap_or(Reachability::Reachable);
+    let votes: Vec<(String, SignalState)> = env_snaps
+        .iter()
+        .map(|snapshot| {
+            (
+                snapshot.signal_id.clone(),
+                // Unknown state text never votes.
+                SignalState::parse(&snapshot.state).unwrap_or(SignalState::Skipped),
+            )
+        })
+        .collect();
+    let vote_refs: Vec<(&str, SignalState)> = votes
+        .iter()
+        .map(|(id, state)| (id.as_str(), *state))
+        .collect();
+    // `health_rollup` already skips non-voters; `votes()` is the shared
+    // predicate for desktop/tests that need the same rule without a rollup.
+    let health = health_rollup(reachability, &vote_refs);
+    let build = env_snaps
+        .iter()
+        .find(|snapshot| snapshot.signal_id == AVAILABILITY_SIGNAL_ID)
+        .and_then(|snapshot| wire_build(&snapshot.payload_json));
+    DecideOut {
+        reachability,
+        health,
+        build,
+        votes,
+    }
+}
+
+/// Pure publish plan: summaries + messages without touching SQLite writes.
+/// `publish_dashboard` stays the thin wrapper that records events, prunes,
+/// and sends — the decision lives in `decide`.
+pub struct PublishOut {
+    pub summaries: Vec<EnvironmentSummary>,
+}
 
 /// Health events kept per Environment per publish (the table holds more;
 /// the wire carries what the timeline needs).
@@ -37,6 +102,10 @@ pub fn health_rollup(
         Reachability::Asleep => return EnvironmentHealth::Healthy,
         Reachability::Reachable => {}
     }
+    if signals.is_empty() {
+        // No observation yet: never present cold start as healthy.
+        return EnvironmentHealth::Waiting;
+    }
     let mut health = EnvironmentHealth::Healthy;
     for &(signal_id, state) in signals {
         // Informational Signals never vote (`NON_VOTING_SIGNALS`: history and
@@ -55,11 +124,7 @@ fn wire_reachability(payload_json: &str) -> Reachability {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) else {
         return Reachability::Reachable;
     };
-    value
-        .get("reachability")
-        .and_then(|item| item.as_str())
-        .and_then(Reachability::parse)
-        .unwrap_or(Reachability::Reachable)
+    parse_reachability(&value)
 }
 
 pub fn publish_dashboard(
@@ -93,26 +158,15 @@ pub fn publish_dashboard(
             .get(environment.id.as_str())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let reachability = env_snaps
+        let decided = decide(env_snaps);
+        let reachability = decided.reachability;
+        let health = decided.health;
+        let build = decided.build;
+        let votes: Vec<(&str, SignalState)> = decided
+            .votes
             .iter()
-            .find(|snapshot| snapshot.signal_id == AVAILABILITY_SIGNAL_ID)
-            .map(|snapshot| wire_reachability(&snapshot.payload_json))
-            .unwrap_or(Reachability::Reachable);
-        let votes: Vec<_> = env_snaps
-            .iter()
-            .map(|snapshot| {
-                (
-                    snapshot.signal_id.as_str(),
-                    // Unknown state text never votes.
-                    SignalState::parse(&snapshot.state).unwrap_or(SignalState::Skipped),
-                )
-            })
+            .map(|(id, state)| (id.as_str(), *state))
             .collect();
-        let health = health_rollup(reachability, &votes);
-        let build = env_snaps
-            .iter()
-            .find(|snapshot| snapshot.signal_id == AVAILABILITY_SIGNAL_ID)
-            .and_then(|snapshot| wire_build(&snapshot.payload_json));
         record_health_and_build_events(&connection, &environment.id, health, build.clone(), now)?;
         record_signal_events(&connection, &environment.id, &votes, now)?;
         published.push(Published {
@@ -155,7 +209,7 @@ pub fn publish_dashboard(
             environment_id: environment.id.clone(),
             snapshots: env_snaps,
         });
-        for signal_id in [AVAILABILITY_SIGNAL_ID, JOBS_SIGNAL_ID, SYSLOG_SIGNAL_ID] {
+        for signal_id in TREND_SIGNALS {
             let points = persistence::load_signal_samples(&connection, &environment.id, signal_id)?
                 .into_iter()
                 .filter(|sample| sample.observed_at >= cutoff)
@@ -244,11 +298,7 @@ pub fn publish_dashboard(
 /// Build string from an availability snapshot payload, if the probe read one.
 fn wire_build(payload_json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(payload_json).ok()?;
-    value
-        .get("build")
-        .and_then(|item| item.as_str())
-        .filter(|build| !build.is_empty())
-        .map(str::to_owned)
+    parse_build(&value)
 }
 
 /// Bounded `health_events` writes for one Environment publish.
@@ -304,8 +354,18 @@ fn record_health_and_build_events(
             } else {
                 (1, Some(state.last_health.clone()))
             };
+            // Cold start must not notify: Waiting itself never emits, and the
+            // Waiting-to-Healthy confirmation is the first real poll, not a
+            // recovery. But a confirmed Waiting-to-Degraded/Down transition
+            // is the first genuine incident and must alert (the webhook
+            // relay posts health events).
+            let cold_start_recovery = previous_health.as_deref()
+                == Some(EnvironmentHealth::Waiting.as_str())
+                && current.as_str() == EnvironmentHealth::Healthy.as_str();
             if current == state.last_health
                 && consecutive == 2
+                && current.as_str() != EnvironmentHealth::Waiting.as_str()
+                && !cold_start_recovery
                 && previous_health
                     .as_deref()
                     .is_some_and(|previous| previous != current.as_str())
@@ -434,6 +494,54 @@ mod tests {
     use crate::test_support::{TempDb, prod};
 
     #[test]
+    fn votes_skips_non_voting_and_skipped() {
+        assert!(!votes("last_clone", SignalState::Degraded));
+        assert!(!votes("sessions", SignalState::Down));
+        assert!(!votes("jobs", SignalState::Skipped));
+        assert!(votes("jobs", SignalState::Degraded));
+        assert!(votes("jobs", SignalState::Healthy));
+    }
+
+    #[test]
+    fn decide_unknown_state_never_votes_and_build_extracts() {
+        let snaps = [
+            persistence::SignalSnapshot {
+                environment_id: "prod".into(),
+                signal_id: AVAILABILITY_SIGNAL_ID.into(),
+                observed_at: 100,
+                state: "healthy".into(),
+                payload_json: r#"{"reachability":"reachable","build":"v1"}"#.into(),
+            },
+            persistence::SignalSnapshot {
+                environment_id: "prod".into(),
+                signal_id: "jobs".into(),
+                observed_at: 100,
+                state: "bogus".into(),
+                payload_json: r#"{"overdue_ready": 99}"#.into(),
+            },
+        ];
+        let refs: Vec<&persistence::SignalSnapshot> = snaps.iter().collect();
+        let out = decide(&refs);
+        assert_eq!(out.health, EnvironmentHealth::Healthy);
+        assert_eq!(out.build, Some("v1".into()));
+        assert_eq!(out.votes.len(), 2);
+    }
+
+    #[test]
+    fn decide_empty_is_waiting_never_healthy() {
+        let out = decide(&[]);
+        assert_eq!(out.health, EnvironmentHealth::Waiting);
+    }
+
+    #[test]
+    fn trend_signals_cover_samples_and_rollups() {
+        assert_eq!(
+            TREND_SIGNALS,
+            [AVAILABILITY_SIGNAL_ID, JOBS_SIGNAL_ID, SYSLOG_SIGNAL_ID]
+        );
+    }
+
+    #[test]
     fn health_rollup_unreachable_is_down() {
         assert_eq!(
             health_rollup(Reachability::Unreachable, &[("jobs", SignalState::Healthy)]),
@@ -491,10 +599,10 @@ mod tests {
     }
 
     #[test]
-    fn health_rollup_reachable_no_snapshots_is_healthy() {
+    fn health_rollup_reachable_no_snapshots_is_waiting() {
         assert_eq!(
             health_rollup(Reachability::Reachable, &[]),
-            EnvironmentHealth::Healthy
+            EnvironmentHealth::Waiting
         );
     }
 
@@ -609,6 +717,35 @@ mod tests {
         // Third consecutive publish must not duplicate the transition.
         write_votes(&connection, 400, SignalState::Degraded, None);
         assert_eq!(published_health_events(&store, 400).len(), 1);
+    }
+
+    #[test]
+    fn cold_start_incident_after_waiting_still_emits_but_recovery_stays_quiet() {
+        let db = TempDb::new("health-cold-start");
+        let store = db.store();
+        // No snapshots yet: the first publish records Waiting without events.
+        assert!(published_health_events(&store, 100).is_empty());
+        // First genuine incident confirms over two publishes and must alert.
+        let connection = store.open().unwrap();
+        write_votes(&connection, 200, SignalState::Degraded, None);
+        assert!(published_health_events(&store, 200).is_empty());
+        write_votes(&connection, 300, SignalState::Degraded, None);
+        let events = published_health_events(&store, 300);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].from_health, Some(EnvironmentHealth::Waiting));
+        assert_eq!(events[0].to_health, EnvironmentHealth::Degraded);
+    }
+
+    #[test]
+    fn cold_start_recovery_to_healthy_emits_no_event() {
+        let db = TempDb::new("health-cold-recovery");
+        let store = db.store();
+        assert!(published_health_events(&store, 100).is_empty());
+        let connection = store.open().unwrap();
+        write_votes(&connection, 200, SignalState::Healthy, None);
+        assert!(published_health_events(&store, 200).is_empty());
+        write_votes(&connection, 300, SignalState::Healthy, None);
+        assert!(published_health_events(&store, 300).is_empty());
     }
 
     /// Drives one Signal through healthy → degraded → degraded and returns

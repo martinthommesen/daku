@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use daku_protocol::{
     EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, NON_VOTING_SIGNALS,
     Reachability, RollupPoint, SamplePoint, ServerMessage, SignalEventDto, SignalSnapshotDto,
-    is_supported_instance_url,
+    drift_mismatch as payload_drift_mismatch, drift_role, is_supported_instance_url, parse_build,
+    skipped_reason,
 };
 
 pub const SIGNAL_IDS: [&str; 15] = [
@@ -50,6 +51,13 @@ pub fn known_signal_id(signal_id: &str) -> Option<&'static str> {
         .chain(PLATFORM_SIGNAL_IDS.iter())
         .find(|&&id| id == signal_id)
         .copied()
+}
+
+/// True for Signals that vote toward Environment health. The shell renders
+/// these as full cards; the rest (`NON_VOTING_SIGNALS`: last_clone, sessions,
+/// table_growth) render as a compact strip that never competes for attention.
+pub fn is_voting_signal(signal_id: &str) -> bool {
+    !NON_VOTING_SIGNALS.contains(&signal_id)
 }
 
 pub const WAITING: &str = "Waiting";
@@ -106,6 +114,10 @@ pub fn platform_label(platform_id: &str) -> String {
 pub const TREND_WINDOW_LABEL: &str = "24 h";
 
 /// The Drill-in is a bounded region, not a table browser.
+/// Note the daemon cap: collectors bound row lists to `ROW_LIST_LIMIT`
+/// (10) per query, so the Drill-in shows at most 10 daemon rows despite
+/// 50 slots — the slots also cover locally merged lists. Raising the UI
+/// limit alone changes nothing until the collector cap moves with it.
 const DRILL_IN_ROW_LIMIT: usize = 50;
 
 /// ServiceNow encoded-query operators are not legal in a URL; percent-encode
@@ -215,6 +227,17 @@ impl TrendWindow {
         (TrendWindow::Day7, "7d"),
         (TrendWindow::Day30, "30d"),
     ];
+
+    /// Caption rendered under a trend so the window it spans is never
+    /// mislabeled: the drill-in passes its active window, the card its 24 h
+    /// samples (see `TREND_WINDOW_LABEL`).
+    pub fn caption(self) -> &'static str {
+        match self {
+            TrendWindow::Day24 => TREND_WINDOW_LABEL,
+            TrendWindow::Day7 => "7 days",
+            TrendWindow::Day30 => "30 days",
+        }
+    }
 
     /// Rollup cutoff in unix seconds: points at or after this render.
     pub fn cutoff_secs(self, now: i64) -> i64 {
@@ -619,6 +642,7 @@ impl DashboardState {
             EnvironmentHealth::Healthy => "healthy",
             EnvironmentHealth::Degraded => "degraded",
             EnvironmentHealth::Down => "down",
+            EnvironmentHealth::Waiting => "waiting",
         };
         let fresh = freshness(selected.last_observed_at, now);
         let mut lines = vec![format!(
@@ -976,6 +1000,9 @@ impl DashboardState {
             "scan" => self
                 .scan_rows(value)
                 .unwrap_or_else(|| self.drill_in_text(signal_id)),
+            "sessions" => self
+                .session_rows(value)
+                .unwrap_or_else(|| self.drill_in_text(signal_id)),
             "http_probe" => self.drill_in_text(signal_id),
             "actions" => self
                 .actions_rows(value)
@@ -995,12 +1022,7 @@ impl DashboardState {
                     self.selected_id.clone().unwrap_or_default(),
                     signal_id.to_owned(),
                 ))
-                .map(|points| {
-                    points
-                        .iter()
-                        .map(|point| point.value_real.unwrap_or(0.0))
-                        .collect()
-                })
+                .map(|points| points.iter().filter_map(|point| point.value_real).collect())
                 .unwrap_or_default(),
             window @ (TrendWindow::Day7 | TrendWindow::Day30) => {
                 let cutoff = window.cutoff_secs(now);
@@ -1013,7 +1035,7 @@ impl DashboardState {
                         points
                             .iter()
                             .filter(|point| point.hour_start >= cutoff)
-                            .map(|point| point.avg_real.unwrap_or(0.0))
+                            .filter_map(|point| point.avg_real)
                             .collect()
                     })
                     .unwrap_or_default()
@@ -1335,6 +1357,35 @@ impl DashboardState {
         })
     }
 
+    /// Logged-on users the daemon read with the count. Each row links its
+    /// `sys_user` record when the reference carried an id. `None` when there
+    /// are no rows, so the count text renders instead.
+    fn session_rows(&self, value: &serde_json::Value) -> Option<DrillIn> {
+        let list = value
+            .get("session_rows")
+            .and_then(|item| item.as_array())
+            .filter(|list| !list.is_empty())?;
+        Some(DrillIn::Rows {
+            headers: vec!["User", "Since"],
+            rows: list
+                .iter()
+                .take(DRILL_IN_ROW_LIMIT)
+                .map(|entry| {
+                    let user_id = entry
+                        .get("user_id")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("");
+                    DrillInRow {
+                        cells: vec![cell(entry, "user"), cell(entry, "sys_created_on")],
+                        link: self.record_url("sys_user", user_id),
+                    }
+                })
+                .collect(),
+            truncated: value.get("session_rows_truncated") == Some(&serde_json::Value::Bool(true))
+                || list.len() > DRILL_IN_ROW_LIMIT,
+        })
+    }
+
     /// Failed GitHub Actions runs. Each row links the run page, which is an
     /// absolute `html_url` from the API — not an instance record — so the
     /// link passes through verbatim after an https check.
@@ -1451,10 +1502,10 @@ impl DashboardState {
                     self.samples
                         .get(&(environment_id.to_owned(), signal_id.to_owned()))
                         .map(|points| {
-                            points
-                                .iter()
-                                .map(|point| point.value_real.unwrap_or(0.0))
-                                .collect()
+                            // Gaps (skipped ticks) are dropped, never zeroed:
+                            // the segment spans the gap instead of inventing
+                            // a recovery-or-outage that never happened.
+                            points.iter().filter_map(|point| point.value_real).collect()
                         })
                         .unwrap_or_default()
                 } else {
@@ -1545,7 +1596,8 @@ impl DashboardState {
                 else {
                     return false;
                 };
-                snapshot.payload.get("role").and_then(|item| item.as_str()) == Some("source")
+                // Typed payload seam: role parsing lives in daku-protocol.
+                drift_role(&snapshot.payload) == Some("source".into())
             })
             .map(|environment| environment.id.as_str())
     }
@@ -1569,8 +1621,7 @@ impl DashboardState {
                 .snapshots
                 .get(environment_id)
                 .and_then(|map| map.get("availability"))
-                .and_then(|snapshot| snapshot.payload.get("build"))
-                .and_then(|build| build.as_str());
+                .and_then(|snapshot| parse_build(&snapshot.payload));
             if let Some(build) = build {
                 return format!("{summary} \u{b7} {build}");
             }
@@ -1586,9 +1637,8 @@ impl DashboardState {
             .as_deref()
             .and_then(|environment_id| self.snapshots.get(environment_id))
             .and_then(|map| map.get(signal_id))
-            .and_then(|snapshot| snapshot.payload.get("skipped"))
-            .and_then(|reason| reason.as_str());
-        match reason {
+            .and_then(|snapshot| skipped_reason(&snapshot.payload));
+        match reason.as_deref() {
             Some("no_clone_source") => "mark one Environment \"clone_source\": true",
             Some("need_two_environments") => "add a second Environment",
             _ => "",
@@ -1622,7 +1672,7 @@ impl DashboardState {
         signal_ids_for(platform_id)
             .iter()
             .copied()
-            .filter(|signal_id| !NON_VOTING_SIGNALS.contains(signal_id))
+            .filter(|signal_id| is_voting_signal(signal_id))
             .filter_map(|signal_id| {
                 let snapshot = snapshots.get(signal_id)?;
                 if !matches!(snapshot.dto.state.as_str(), "degraded" | "down") {
@@ -1792,6 +1842,7 @@ impl DashboardState {
                 EnvironmentHealth::Healthy => 0,
                 EnvironmentHealth::Degraded => 1,
                 EnvironmentHealth::Down => 2,
+                EnvironmentHealth::Waiting => -1,
             })
     }
 
@@ -1977,6 +2028,7 @@ fn health_word(health: EnvironmentHealth) -> &'static str {
         EnvironmentHealth::Healthy => "healthy",
         EnvironmentHealth::Degraded => "degraded",
         EnvironmentHealth::Down => "down",
+        EnvironmentHealth::Waiting => "waiting",
     }
 }
 
@@ -2034,22 +2086,13 @@ fn environment_build(
     snapshots: &HashMap<String, HashMap<String, Snapshot>>,
     environment_id: &str,
 ) -> Option<String> {
-    snapshots
-        .get(environment_id)?
-        .get("availability")?
-        .payload
-        .get("build")?
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+    // Typed payload seam: build parsing lives in daku-protocol.
+    parse_build(&snapshots.get(environment_id)?.get("availability")?.payload)
 }
 
 fn drift_mismatch(value: &serde_json::Value) -> bool {
-    value.get("build_matches") == Some(&serde_json::Value::Bool(false))
-        || value
-            .get("mismatches")
-            .and_then(|item| item.as_u64())
-            .is_some_and(|count| count > 0)
+    // Typed payload seam: mismatch rule lives in daku-protocol.
+    payload_drift_mismatch(value)
 }
 
 /// Compact row counts for the table-growth summary: 950 → "950", 41_000 →
@@ -2628,7 +2671,11 @@ mod tests {
         // under the latency number.
         ("availability_reachable", "142 ms", ""),
         ("availability_reachable_other_build", "142 ms", ""),
-        ("availability_unreachable", "142 ms", "HTTP 429"),
+        (
+            "availability_unreachable",
+            "142 ms",
+            "throttled by ServiceNow (HTTP 429); retry budget exhausted",
+        ),
         // A failed probe carries no counts, so there is no summary to render:
         // the card falls back to its status word and the detail says why.
         ("down_probe_failed", "", "HTTP 429"),
@@ -3661,6 +3708,84 @@ mod tests {
     }
 
     #[test]
+    fn drill_in_lists_active_users_with_record_links() {
+        let state = loaded();
+        assert_eq!(
+            state.drill_in("sessions", TEST_NOW),
+            DrillIn::Rows {
+                headers: vec!["User", "Since"],
+                rows: vec![
+                    DrillInRow {
+                        cells: vec!["Fred Johnson".to_owned(), "2026-01-27 00:12:00".to_owned(),],
+                        link: Some(
+                            "https://prod.example.service-now.com/sys_user.do?sys_id=u1".to_owned()
+                        ),
+                    },
+                    DrillInRow {
+                        cells: vec!["Ada Lovelace".to_owned(), "2026-01-27 00:10:00".to_owned(),],
+                        link: Some(
+                            "https://prod.example.service-now.com/sys_user.do?sys_id=u2".to_owned()
+                        ),
+                    },
+                    DrillInRow {
+                        cells: vec!["Grace Hopper".to_owned(), "2026-01-27 00:08:00".to_owned(),],
+                        link: Some(
+                            "https://prod.example.service-now.com/sys_user.do?sys_id=u3".to_owned()
+                        ),
+                    },
+                ],
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drill_in_sessions_falls_back_to_count_text_without_rows() {
+        let mut state = loaded();
+        state.select("test");
+        assert_eq!(
+            state.drill_in("sessions", TEST_NOW),
+            DrillIn::Text("0 active sessions".into())
+        );
+    }
+
+    #[test]
+    fn drill_in_sessions_renders_dash_without_user_link() {
+        let mut state = DashboardState::new();
+        state.set_connected(true);
+        state.apply_all(&[
+            ServerMessage::EnvironmentsUpdated {
+                environments: vec![env(
+                    "e",
+                    "E",
+                    EnvironmentHealth::Healthy,
+                    Reachability::Reachable,
+                )],
+            },
+            ServerMessage::SignalSnapshotsUpdated {
+                environment_id: "e".into(),
+                snapshots: vec![snap(
+                    "sessions",
+                    "healthy",
+                    r#"{"active_sessions":1,"truncated":false,"session_rows":[{"sys_id":"s1","user":"","user_id":"","sys_created_on":"2026-01-27 00:12:00"}],"session_rows_truncated":false}"#,
+                )],
+            },
+        ]);
+        state.select("e");
+        assert_eq!(
+            state.drill_in("sessions", TEST_NOW),
+            DrillIn::Rows {
+                headers: vec!["User", "Since"],
+                rows: vec![DrillInRow {
+                    cells: vec!["—".to_owned(), "2026-01-27 00:12:00".to_owned()],
+                    link: None,
+                }],
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
     fn drill_in_lists_open_findings_with_record_links() {
         let state = loaded();
         assert_eq!(
@@ -4484,7 +4609,14 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_state_none_sample_becomes_zero() {
+    fn trend_window_captions_match_the_selected_range() {
+        assert_eq!(TrendWindow::Day24.caption(), "24 h");
+        assert_eq!(TrendWindow::Day7.caption(), "7 days");
+        assert_eq!(TrendWindow::Day30.caption(), "30 days");
+    }
+
+    #[test]
+    fn dashboard_state_skipped_samples_span_gaps_without_zero_fill() {
         let mut state = loaded();
         let points = vec![
             SamplePoint {
@@ -4514,7 +4646,7 @@ mod tests {
                 .find(|card| card.signal_id == signal_id)
                 .unwrap()
         };
-        assert_eq!(card("jobs").sparkline, vec![0.0, 4.0]);
+        assert_eq!(card("jobs").sparkline, vec![4.0]);
         assert!(card("outbound").sparkline.is_empty());
     }
 
@@ -4537,6 +4669,21 @@ mod tests {
         assert!(severity_rank("down") < severity_rank("degraded"));
         assert!(severity_rank("degraded") < severity_rank("healthy"));
         assert!(severity_rank("healthy") < severity_rank("skipped"));
+    }
+
+    #[test]
+    fn voting_split_covers_every_signal_exactly_once() {
+        // The shell partitions the grid on this: voting Signals render as
+        // full cards, the rest as the compact never-votes strip.
+        for signal_id in SIGNAL_IDS {
+            assert_eq!(
+                is_voting_signal(signal_id),
+                !NON_VOTING_SIGNALS.contains(&signal_id),
+                "{signal_id}"
+            );
+        }
+        let voting = SIGNAL_IDS.iter().filter(|id| is_voting_signal(id)).count();
+        assert_eq!(voting, SIGNAL_IDS.len() - NON_VOTING_SIGNALS.len());
     }
 
     #[test]

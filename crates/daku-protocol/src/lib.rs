@@ -4,6 +4,7 @@
 
 pub mod environment;
 pub mod identity;
+pub mod payload;
 pub mod settings;
 
 mod protocol;
@@ -11,6 +12,10 @@ mod protocol;
 pub use environment::{
     AuthMethod, CredentialShapeError, EnvironmentConfig, NON_VOTING_SIGNALS, Platform, Thresholds,
     split_github_repo, validate_credential,
+};
+pub use payload::{
+    TypedPayload, drift_mismatch, drift_role, parse, parse_build, parse_reachability,
+    skipped_reason,
 };
 pub use protocol::{
     APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,

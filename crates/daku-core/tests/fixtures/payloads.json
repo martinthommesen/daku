@@ -57,7 +57,7 @@
   "availability_unreachable": {
     "payload": {
       "build": null,
-      "error": "HTTP 429",
+      "error": "throttled by ServiceNow (HTTP 429); retry budget exhausted",
       "reachability": "unreachable",
       "rtt_ms": 142
     },
@@ -343,6 +343,27 @@
   "sessions_count": {
     "payload": {
       "active_sessions": 3,
+      "session_rows": [
+        {
+          "sys_created_on": "2026-01-27 00:12:00",
+          "sys_id": "s1",
+          "user": "Fred Johnson",
+          "user_id": "u1"
+        },
+        {
+          "sys_created_on": "2026-01-27 00:10:00",
+          "sys_id": "s2",
+          "user": "Ada Lovelace",
+          "user_id": "u2"
+        },
+        {
+          "sys_created_on": "2026-01-27 00:08:00",
+          "sys_id": "s3",
+          "user": "Grace Hopper",
+          "user_id": "u3"
+        }
+      ],
+      "session_rows_truncated": false,
       "truncated": false
     },
     "signal_id": "sessions",
@@ -351,6 +372,8 @@
   "sessions_zero": {
     "payload": {
       "active_sessions": 0,
+      "session_rows": [],
+      "session_rows_truncated": false,
       "truncated": false
     },
     "signal_id": "sessions",

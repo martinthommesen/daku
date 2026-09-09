@@ -72,7 +72,9 @@ impl HttpTransport for ContractTransport {
                 ("ecc_queue", false) => 12,
                 ("sys_attachment", false) => 900,
                 ("task", false) => 9_500,
-                _ => panic!("unexpected growth table: {url}"),
+                _ => anyhow::bail!(
+                    "payload contract has no mapping for growth table {table:?} (URL: {url}); add it to ContractTransport"
+                ),
             };
             return Ok(HttpResponse {
                 status: 200,
@@ -197,7 +199,11 @@ impl HttpTransport for ContractTransport {
             }
         } else if url.contains("/api/now/table/v_user_session") {
             if source {
-                r#"{"result":[{"sys_id":"s1"},{"sys_id":"s2"},{"sys_id":"s3"}]}"#
+                r#"{"result":[
+                    {"sys_id":"s1","user":{"display_value":"Fred Johnson","link":"https://acme-prod.example.service-now.com/api/now/table/sys_user/u1"},"sys_created_on":"2026-01-27 00:12:00"},
+                    {"sys_id":"s2","user":{"display_value":"Ada Lovelace","link":"https://acme-prod.example.service-now.com/api/now/table/sys_user/u2"},"sys_created_on":"2026-01-27 00:10:00"},
+                    {"sys_id":"s3","user":{"display_value":"Grace Hopper","link":"https://acme-prod.example.service-now.com/api/now/table/sys_user/u3"},"sys_created_on":"2026-01-27 00:08:00"}
+                ]}"#
             } else {
                 r#"{"result":[]}"#
             }
@@ -229,7 +235,9 @@ impl HttpTransport for ContractTransport {
         } else if url.contains("api.github.com/repos/acme/quiet/actions/runs") {
             r#"{"workflow_runs":[]}"#
         } else {
-            panic!("unexpected URL: {url}");
+            anyhow::bail!(
+                "payload contract has no mapping for URL: {url}; add it to ContractTransport"
+            );
         };
         Ok(HttpResponse {
             status: 200,
@@ -643,48 +651,33 @@ fn pinned_payloads_match_what_the_collectors_write() {
 /// cannot land without fixture data for the desktop's `fixture_events()`.
 #[test]
 fn every_known_signal_has_a_pinned_case() {
-    use crate::availability::AVAILABILITY_SIGNAL_ID;
+    use crate::config::Platform;
     use crate::drift::DRIFT_SIGNAL_ID;
-    use crate::email::EMAIL_SIGNAL_ID;
-    use crate::flow::FLOW_SIGNAL_ID;
-    use crate::github::ACTIONS_SIGNAL_ID;
-    use crate::http_probe::HTTP_PROBE_SIGNAL_ID;
-    use crate::jobs::JOBS_SIGNAL_ID;
     use crate::last_clone::LAST_CLONE_SIGNAL_ID;
-    use crate::mid_ecc::MID_ECC_SIGNAL_ID;
-    use crate::outbound::OUTBOUND_SIGNAL_ID;
-    use crate::sessions::SESSIONS_SIGNAL_ID;
-    use crate::syslog::SYSLOG_SIGNAL_ID;
-    use crate::table_growth::TABLE_GROWTH_SIGNAL_ID;
-    use crate::transaction::TRANSACTION_SIGNAL_ID;
-    use crate::update_sets::UPDATE_SETS_SIGNAL_ID;
-    use crate::upgrade::UPGRADE_SIGNAL_ID;
+    use crate::platform_registry::signals_for;
+    use crate::scan::SCAN_SIGNAL_ID;
 
-    const KNOWN: [&str; 17] = [
-        AVAILABILITY_SIGNAL_ID,
-        JOBS_SIGNAL_ID,
-        SYSLOG_SIGNAL_ID,
-        MID_ECC_SIGNAL_ID,
-        OUTBOUND_SIGNAL_ID,
-        FLOW_SIGNAL_ID,
-        EMAIL_SIGNAL_ID,
-        UPGRADE_SIGNAL_ID,
-        SESSIONS_SIGNAL_ID,
-        TABLE_GROWTH_SIGNAL_ID,
-        TRANSACTION_SIGNAL_ID,
-        UPDATE_SETS_SIGNAL_ID,
-        SCAN_SIGNAL_ID,
-        HTTP_PROBE_SIGNAL_ID,
-        ACTIONS_SIGNAL_ID,
-        DRIFT_SIGNAL_ID,
-        LAST_CLONE_SIGNAL_ID,
-    ];
+    // Derived from the registry so a new Signal updates one place, not three:
+    // per-tick ServiceNow ids plus slow ids plus single-signal platforms.
+    let mut known: Vec<&str> = signals_for(Platform::Servicenow).to_vec();
+    for slow in [DRIFT_SIGNAL_ID, LAST_CLONE_SIGNAL_ID, SCAN_SIGNAL_ID] {
+        if !known.contains(&slow) {
+            known.push(slow);
+        }
+    }
+    for platform in [Platform::Http, Platform::Github] {
+        for signal_id in signals_for(platform) {
+            if !known.contains(signal_id) {
+                known.push(signal_id);
+            }
+        }
+    }
     let generated = generate();
     let covered: std::collections::HashSet<&str> = generated
         .values()
         .filter_map(|case| case.get("signal_id")?.as_str())
         .collect();
-    for signal_id in KNOWN {
+    for signal_id in known {
         assert!(
             covered.contains(signal_id),
             "no pinned payload case for signal {signal_id:?} — add one in generate()"

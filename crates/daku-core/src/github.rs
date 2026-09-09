@@ -16,6 +16,7 @@ use crate::collector::{Observation, PerEnvironmentCollector, ROW_LIST_LIMIT, Sig
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds, split_github_repo};
 use crate::last_clone::age_days;
 use crate::servicenow::{HttpRequest, ServiceNowClient};
+use crate::signal_eval::{evaluate_ge, row_text};
 
 pub const ACTIONS_SIGNAL_ID: &str = "actions";
 pub const ACTIONS_RUNS_PATH: &str = "/repos/{owner}/{repo}/actions/runs?per_page=30";
@@ -31,20 +32,8 @@ struct RunRow {
     html_url: String,
 }
 
-fn row_text(row: &serde_json::Value, key: &str) -> String {
-    match row.get(key) {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(value) if value.is_number() => value.to_string(),
-        _ => String::new(),
-    }
-}
-
 pub fn actions_state(failed_24h: u64, thresholds: &Thresholds) -> SignalState {
-    if failed_24h >= thresholds.actions_failed_degraded_at {
-        SignalState::Degraded
-    } else {
-        SignalState::Healthy
-    }
+    evaluate_ge(failed_24h, thresholds.actions_failed_degraded_at)
 }
 
 fn bearer_token(credentials: &dyn CredentialStore, environment_id: &str) -> anyhow::Result<String> {

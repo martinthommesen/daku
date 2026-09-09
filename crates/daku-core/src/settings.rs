@@ -1,11 +1,7 @@
 //! Daemon-owned, user-editable configuration.
 
 use std::fs;
-use std::fs::OpenOptions;
 use std::io;
-use std::io::Write as _;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub use daku_protocol::settings::DaemonSettings;
@@ -71,26 +67,9 @@ fn quarantine_corrupt_settings(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn write_atomic(path: &Path, settings: &DaemonSettings) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let data = serde_json::to_vec_pretty(settings).map_err(to_io_error)?;
-    let temporary = path.with_extension("json.tmp");
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&temporary)?;
-    file.write_all(&data)?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-fn to_io_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
+    let data = serde_json::to_vec_pretty(settings)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    crate::atomic_write::atomic_write(path, &data).map_err(io::Error::other)
 }
 
 #[cfg(test)]
@@ -107,6 +86,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_settings_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
         let directory = temp_directory();
         let path = directory.join("settings.json");
         let store = DaemonSettingsStore::open(path.clone()).unwrap();

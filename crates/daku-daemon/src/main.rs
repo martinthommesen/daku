@@ -1,5 +1,5 @@
 use std::io::Write as _;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -40,6 +40,7 @@ fn main() -> anyhow::Result<()> {
     // before any provider or workspace subprocess can inherit the daemon's
     // environment.
     unsafe { std::env::remove_var(DAEMON_TOKEN_ENV) };
+    ensure_bind_request_allowed(&arguments.bind, arguments.allow_non_loopback)?;
     let listener = TcpListener::bind(&arguments.bind)
         .with_context(|| format!("could not bind daku daemon to {}", arguments.bind))?;
     let address = listener.local_addr()?;
@@ -75,6 +76,8 @@ fn main() -> anyhow::Result<()> {
     store
         .open()
         .with_context(|| format!("could not open {}", store.path().display()))?;
+    // A stalled daemon retains beyond bounds until the next tick otherwise.
+    store.prune_all_for_startup();
     let settings =
         daku_core::DaemonSettingsStore::open(daku_core::DaemonSettingsStore::default_path())
             .context("could not load daemon settings")?;
@@ -248,12 +251,13 @@ fn run_mcp_command() -> anyhow::Result<()> {
 /// and saves one Environment plus its Credential. The secret arrives via
 /// `--secret-file`, never argv. Needs no token; writes config + store.
 fn run_setup_command(arguments: &Arguments) -> anyhow::Result<()> {
-    use daku_core::config::{AuthMethod, Platform};
-    let platform = match arguments.setup_platform.as_deref().unwrap_or("servicenow") {
-        "http" => Platform::Http,
-        "github" => Platform::Github,
-        _ => Platform::Servicenow,
-    };
+    use daku_core::config::AuthMethod;
+    // Single string→Platform site: `Platform::parse` (registry shape).
+    let platform = arguments
+        .setup_platform
+        .as_deref()
+        .and_then(daku_core::config::Platform::parse)
+        .unwrap_or(daku_core::config::Platform::Servicenow);
     let auth_method = match arguments.setup_auth.as_deref().unwrap_or("oauth") {
         "basic" => AuthMethod::Basic,
         _ => AuthMethod::OauthClientCredentials,
@@ -380,6 +384,10 @@ fn run_doctor_command(fix: bool, check_roles: bool, arguments: &Arguments) -> an
     println!("config: {}", report.environments_path.display());
     println!("poll interval: {} s", report.poll_interval_secs);
     println!("slow interval: {} s", report.slow_poll_interval_secs);
+    println!(
+        "ticks: {} recorded, {} overruns",
+        report.tick_count, report.tick_overruns
+    );
     for row in &report.rows {
         println!("{}", format_doctor_row(row));
     }
@@ -463,6 +471,33 @@ fn ensure_bind_allowed(address: SocketAddr, allow_non_loopback: bool) -> anyhow:
     bail!(
         "refusing non-loopback daemon bind {address}; pass --allow-non-loopback only after configuring authentication and exact browser origins"
     )
+}
+
+/// Pre-bind authorization for the requested bind string: a non-loopback
+/// literal without the explicit flag is refused before any socket exists,
+/// closing the brief listen window the post-bind check left behind.
+/// Hostnames resolve best-effort; unresolvable names fall through to the
+/// post-bind check on the bound address.
+fn ensure_bind_request_allowed(bind: &str, allow_non_loopback: bool) -> anyhow::Result<()> {
+    if allow_non_loopback {
+        return Ok(());
+    }
+    if let Ok(address) = bind.parse::<SocketAddr>() {
+        return ensure_bind_allowed(address, false);
+    }
+    if let Ok(mut addrs) = bind.to_socket_addrs() {
+        let mut resolved_any = false;
+        for addr in addrs.by_ref() {
+            resolved_any = true;
+            if !addr.ip().is_loopback() {
+                return ensure_bind_allowed(addr, false);
+            }
+        }
+        if resolved_any {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 struct Arguments {
@@ -777,6 +812,15 @@ mod tests {
         assert!(ensure_bind_allowed("0.0.0.0:3000".parse().unwrap(), false).is_err());
         assert!(ensure_bind_allowed("[::]:3000".parse().unwrap(), false).is_err());
         assert!(ensure_bind_allowed("0.0.0.0:3000".parse().unwrap(), true).is_ok());
+    }
+
+    #[test]
+    fn pre_bind_check_refuses_non_loopback_before_any_socket() {
+        assert!(ensure_bind_request_allowed("127.0.0.1:0", false).is_ok());
+        assert!(ensure_bind_request_allowed("127.0.0.1:0", true).is_ok());
+        assert!(ensure_bind_request_allowed("0.0.0.0:0", false).is_err());
+        assert!(ensure_bind_request_allowed("0.0.0.0:0", true).is_ok());
+        assert!(ensure_bind_request_allowed("localhost:0", false).is_ok());
     }
 
     #[test]

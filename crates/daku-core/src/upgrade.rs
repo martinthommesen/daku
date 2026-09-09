@@ -14,6 +14,7 @@ use crate::collector::{Observation, PerEnvironmentCollector, ROW_LIST_LIMIT, Sig
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::last_clone::age_days;
 use crate::servicenow::ServiceNowClient;
+use crate::signal_eval::{evaluate_ge, parse_result_array, row_text};
 
 pub const UPGRADE_SIGNAL_ID: &str = "upgrade";
 pub const UPGRADE_HISTORY_PATH: &str = "/api/now/table/sys_upgrade_history?sysparm_fields=sys_id,from_version,to_version,state,upgrade_started,upgrade_finished&sysparm_query=ORDERBYDESCupgrade_finished&sysparm_limit=10";
@@ -33,14 +34,6 @@ struct UpgradeRow {
     upgrade_finished: String,
 }
 
-fn row_text(row: &serde_json::Value, key: &str) -> String {
-    match row.get(key) {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(value) if value.is_number() => value.to_string(),
-        _ => String::new(),
-    }
-}
-
 fn is_failed(state: &str) -> bool {
     let lower = state.to_lowercase();
     ["fail", "error", "cancel", "abort"]
@@ -49,11 +42,7 @@ fn is_failed(state: &str) -> bool {
 }
 
 pub fn upgrade_state(failed_7d: u64, thresholds: &Thresholds) -> SignalState {
-    if failed_7d >= thresholds.upgrade_failed_degraded_at {
-        SignalState::Degraded
-    } else {
-        SignalState::Healthy
-    }
+    evaluate_ge(failed_7d, thresholds.upgrade_failed_degraded_at)
 }
 
 fn fetch_upgrades(
@@ -65,32 +54,23 @@ fn fetch_upgrades(
     if response.status != 200 {
         anyhow::bail!("HTTP {}", response.status);
     }
-    let rows: Vec<UpgradeRow> =
-        serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("result")
-                    .and_then(|result| result.as_array())
-                    .cloned()
+    let rows: Vec<UpgradeRow> = parse_result_array(&response.body)
+        .iter()
+        .filter_map(|row| {
+            let sys_id = row_text(row, "sys_id");
+            if sys_id.is_empty() {
+                return None;
+            }
+            Some(UpgradeRow {
+                sys_id,
+                from_version: row_text(row, "from_version"),
+                to_version: row_text(row, "to_version"),
+                state: row_text(row, "state"),
+                upgrade_started: row_text(row, "upgrade_started"),
+                upgrade_finished: row_text(row, "upgrade_finished"),
             })
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|row| {
-                let sys_id = row_text(row, "sys_id");
-                if sys_id.is_empty() {
-                    return None;
-                }
-                Some(UpgradeRow {
-                    sys_id,
-                    from_version: row_text(row, "from_version"),
-                    to_version: row_text(row, "to_version"),
-                    state: row_text(row, "state"),
-                    upgrade_started: row_text(row, "upgrade_started"),
-                    upgrade_finished: row_text(row, "upgrade_finished"),
-                })
-            })
-            .collect();
+        })
+        .collect();
     Ok(rows.into_iter().take(ROW_LIST_LIMIT).collect())
 }
 

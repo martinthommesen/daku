@@ -29,7 +29,7 @@ what the Operator asked for:
      including a bootstrap event on first build observed. Published as its own
      `ServerMessage` with its own Hub cache key.
   2. `signal_rollups_hourly` (`078`) — idempotent hourly aggregates (avg for
-     latency, max for backlog/error counts), 30 d retention, own message so the
+     latency, max for backlog/error counts), 30 d retention (superseded by ADR-0012: 90 d), own message so the
      24 h raw series is untouched. Drill-in gains a 24 h / 7 d / 30 d switch.
 * **Reload without relaunch** (`070`): `DaemonClient::shutdown` + supervisor
   respawn re-reads config and ticks immediately (~0.5 s measured). Gated to

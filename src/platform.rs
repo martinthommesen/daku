@@ -160,6 +160,7 @@ pub fn reflect_ambient_health(
             (_, Some(daku_protocol::EnvironmentHealth::Healthy)) => NSColor::systemGreenColor(),
             (_, Some(daku_protocol::EnvironmentHealth::Degraded)) => NSColor::systemYellowColor(),
             (_, Some(daku_protocol::EnvironmentHealth::Down)) => NSColor::systemRedColor(),
+            (_, Some(daku_protocol::EnvironmentHealth::Waiting)) => NSColor::systemGrayColor(),
         };
         // A bare title cannot carry colour; one foreground-color attribute does.
         let attrs: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> = unsafe {

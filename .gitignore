@@ -18,3 +18,5 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+
+.context/compound-engineering/

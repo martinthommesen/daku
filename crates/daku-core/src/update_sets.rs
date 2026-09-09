@@ -19,6 +19,7 @@ use daku_protocol::SignalState;
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::ServiceNowClient;
+use crate::signal_eval::{evaluate_ge, fetch_table_rows_required, row_text};
 
 pub const UPDATE_SETS_SIGNAL_ID: &str = "update_sets";
 pub const UPDATE_SETS_PATH: &str = "/api/now/table/sys_update_set?sysparm_fields=sys_id,name,state,sys_updated_on&sysparm_query=ORDERBYDESCsys_updated_on&sysparm_limit=10";
@@ -34,25 +35,13 @@ struct UpdateSetRow {
     sys_updated_on: String,
 }
 
-fn row_text(row: &serde_json::Value, key: &str) -> String {
-    match row.get(key) {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(value) if value.is_number() => value.to_string(),
-        _ => String::new(),
-    }
-}
-
 fn is_open(state: &str) -> bool {
     let lower = state.to_lowercase();
     OPEN_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 pub fn update_sets_state(open_count: u64, thresholds: &Thresholds) -> SignalState {
-    if open_count >= thresholds.update_sets_open_degraded_at {
-        SignalState::Degraded
-    } else {
-        SignalState::Healthy
-    }
+    evaluate_ge(open_count, thresholds.update_sets_open_degraded_at)
 }
 
 fn fetch_update_sets(
@@ -60,35 +49,18 @@ fn fetch_update_sets(
     environment: &EnvironmentConfig,
     credentials: &dyn CredentialStore,
 ) -> anyhow::Result<(Vec<UpdateSetRow>, bool)> {
-    let response = client.request(environment, credentials, "GET", UPDATE_SETS_PATH, None)?;
-    if response.status != 200 {
-        anyhow::bail!("HTTP {}", response.status);
-    }
-    let rows: Vec<UpdateSetRow> =
-        serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("result")
-                    .and_then(|result| result.as_array())
-                    .cloned()
-            })
-            .ok_or_else(|| anyhow::anyhow!("update set response has no result array"))?
-            .iter()
-            .filter_map(|row| {
-                let sys_id = row_text(row, "sys_id");
-                if sys_id.is_empty() {
-                    return None;
-                }
-                Some(UpdateSetRow {
-                    sys_id,
-                    name: row_text(row, "name"),
-                    state: row_text(row, "state"),
-                    sys_updated_on: row_text(row, "sys_updated_on"),
-                })
-            })
-            .collect();
-    Ok(crate::collector::take_bounded(rows))
+    fetch_table_rows_required(client, environment, credentials, UPDATE_SETS_PATH, |row| {
+        let sys_id = row_text(row, "sys_id");
+        if sys_id.is_empty() {
+            return None;
+        }
+        Some(UpdateSetRow {
+            sys_id,
+            name: row_text(row, "name"),
+            state: row_text(row, "state"),
+            sys_updated_on: row_text(row, "sys_updated_on"),
+        })
+    })
 }
 
 #[derive(Default)]

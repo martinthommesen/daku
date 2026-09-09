@@ -16,6 +16,7 @@ use daku_protocol::SignalState;
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_avg};
+use crate::signal_eval::{fetch_table_rows, redact_url, row_text};
 
 pub const TRANSACTION_SIGNAL_ID: &str = "slow_txn";
 pub const TRANSACTION_AVG_FIELD: &str = "response_time";
@@ -30,21 +31,6 @@ struct SlowRow {
     url: String,
     response_time: String,
     sys_created_on: String,
-}
-
-/// Keeps scheme + host + path; drops query and fragment, which can carry
-/// session tokens the drill-in never needs.
-fn redact_url(url: String) -> String {
-    let without_fragment = url.split('#').next().unwrap_or("").to_owned();
-    without_fragment.split('?').next().unwrap_or("").to_owned()
-}
-
-fn row_text(row: &serde_json::Value, key: &str) -> String {
-    match row.get(key) {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(value) if value.is_number() => value.to_string(),
-        _ => String::new(),
-    }
 }
 
 pub fn transaction_state(avg_ms: f64, thresholds: &Thresholds) -> SignalState {
@@ -65,42 +51,24 @@ fn fetch_slow_rows(
     environment: &EnvironmentConfig,
     credentials: &dyn CredentialStore,
 ) -> (Vec<SlowRow>, bool) {
-    let Ok(response) = client.request(
+    fetch_table_rows(
+        client,
         environment,
         credentials,
-        "GET",
         TRANSACTION_SLOW_ROWS_PATH,
-        None,
-    ) else {
-        return (Vec::new(), false);
-    };
-    if response.status != 200 {
-        return (Vec::new(), false);
-    }
-    let rows: Vec<SlowRow> = serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
-        .ok()
-        .and_then(|value| {
-            value
-                .get("result")
-                .and_then(|result| result.as_array())
-                .cloned()
-        })
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|row| {
+        |row| {
             let sys_id = row_text(row, "sys_id");
             if sys_id.is_empty() {
                 return None;
             }
             Some(SlowRow {
                 sys_id,
-                url: redact_url(row_text(row, "url")),
+                url: redact_url(&row_text(row, "url")),
                 response_time: row_text(row, "response_time"),
                 sys_created_on: row_text(row, "sys_created_on"),
             })
-        })
-        .collect();
-    crate::collector::take_bounded(rows)
+        },
+    )
 }
 
 #[derive(Default)]

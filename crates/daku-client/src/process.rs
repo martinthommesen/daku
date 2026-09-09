@@ -149,8 +149,28 @@ impl Drop for DaemonProcess {
     }
 }
 
+/// Test-only spelling of the production log path: production resolves the
+/// home via [`daemon_home_dir`] (which honors `DAKU_HOME`), then appends
+/// `daemon.log` directly.
+#[cfg(test)]
 fn daemon_log_path(home: &Path) -> PathBuf {
     home.join(".daku").join("daemon.log")
+}
+
+/// Operator data directory honoring `DAKU_HOME`, mirroring
+/// `daku_core::config::daku_home_dir` (daku-client must not depend on
+/// daku-core outside tests): `DAKU_HOME` when set and non-empty, else
+/// `~/.daku/`. The daemon log, DB, and config then share one root instead
+/// of splitting logs and state across two directories under automation.
+fn daemon_home_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("DAKU_HOME")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".daku")
 }
 
 fn open_daemon_log(path: &Path) -> std::io::Result<std::fs::File> {
@@ -171,7 +191,7 @@ fn open_daemon_log(path: &Path) -> std::io::Result<std::fs::File> {
 /// to stderr; a packaged app has no terminal, so the supervisor points stderr
 /// here. Falls back to inheriting stderr when the file cannot be opened.
 fn daemon_log_stdio() -> Stdio {
-    let path = daemon_log_path(&dirs::home_dir().unwrap_or_else(std::env::temp_dir));
+    let path = daemon_home_dir().join("daemon.log");
     match open_daemon_log(&path) {
         Ok(file) => Stdio::from(file),
         Err(error) => {
@@ -526,5 +546,19 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn daemon_home_honors_override_and_log_shares_it() {
+        let override_dir = std::env::temp_dir().join(format!("daku-home-{}", Uuid::new_v4()));
+        // SAFETY: test-only env mutation, restored below.
+        unsafe { std::env::set_var("DAKU_HOME", &override_dir) };
+        assert_eq!(daemon_home_dir(), override_dir);
+        assert_eq!(
+            daemon_home_dir().join("daemon.log"),
+            override_dir.join("daemon.log")
+        );
+        unsafe { std::env::remove_var("DAKU_HOME") };
+        std::fs::remove_dir_all(&override_dir).ok();
     }
 }

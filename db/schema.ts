@@ -1,5 +1,7 @@
 /**
- * daku local SQLite schema — Signal snapshots and ~24h samples only.
+ * daku local SQLite schema — Signal snapshots, ~24h raw samples, 90d hourly
+ * rollups and events (ADR-0012 is the authority: 24h raw plus 90d rollups
+ * plus 500 per-Environment event cap).
  *
  * Drizzle is a build-time tool: `bun run db:generate` diffs this file and
  * writes plain SQL into `db/migrations`, which the Rust app applies at startup

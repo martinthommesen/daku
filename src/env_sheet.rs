@@ -705,7 +705,18 @@ pub fn validate_fields(
         return Err(reason.to_owned());
     }
     if platform == Platform::Github && daku_protocol::split_github_repo(instance_url).is_none() {
-        return Err("github URL must look like https://github.com/<owner>/<repo>".to_owned());
+        return Err(format!(
+            "environment {id}: github instance_url must look like https://github.com/<owner>/<repo>"
+        ));
+    }
+    Ok(())
+}
+
+/// Duplicate-id check shared with the daemon loader: the sheet surfaces the
+/// same refusal before anything is written.
+pub fn validate_id_unique(id: &str, existing_ids: &[String]) -> Result<(), String> {
+    if existing_ids.iter().any(|other| other == id) {
+        return Err(format!("duplicate environment id {id:?}"));
     }
     Ok(())
 }
@@ -766,6 +777,10 @@ mod tests {
         assert!(validate_fields("a", "L", "https://github.com/acme/app.git", github).is_ok());
         assert!(validate_fields("a", "L", "https://github.com/acme", github).is_err());
         assert!(validate_fields("a", "L", "https://example.com/acme/app", github).is_err());
+        let error = validate_fields("a", "L", "https://github.com/acme", github).unwrap_err();
+        assert!(error.contains("github instance_url"), "{error}");
+        assert!(validate_id_unique("a", &["b".to_owned()]).is_ok());
+        assert!(validate_id_unique("a", &["a".to_owned()]).is_err());
         // HTTP probes take any https URL.
         assert!(
             validate_fields(

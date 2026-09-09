@@ -5,6 +5,7 @@ use daku_protocol::SignalState;
 use crate::collector::{Observation, PerEnvironmentCollector, Signal};
 use crate::config::{CredentialStore, EnvironmentConfig, Thresholds};
 use crate::servicenow::{ServiceNowClient, fetch_aggregate_count};
+use crate::signal_eval::{evaluate_ge, fetch_table_rows, redact_url, row_text};
 
 pub const OUTBOUND_SIGNAL_ID: &str = "outbound";
 pub const OUTBOUND_HTTP_PATH: &str = "/api/now/stats/sys_outbound_http_log?sysparm_count=true&sysparm_query=http_status>=400^sys_created_on>javascript:gs.hoursAgoStart(1)";
@@ -19,27 +20,11 @@ struct OutboundRow {
     sys_created_on: String,
 }
 
-/// Keeps scheme + host + path; drops query and fragment, which can carry
-/// third-party secrets the drill-in never needs.
-fn redact_url(url: String) -> String {
-    let without_fragment = url.split('#').next().unwrap_or("").to_owned();
-    without_fragment.split('?').next().unwrap_or("").to_owned()
-}
-
-fn row_text(row: &serde_json::Value, key: &str) -> String {
-    match row.get(key) {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(value) if value.is_number() => value.to_string(),
-        _ => String::new(),
-    }
-}
-
 pub fn outbound_state(outbound_http_4xx_5xx_1h: u64, thresholds: &Thresholds) -> SignalState {
-    if outbound_http_4xx_5xx_1h >= thresholds.outbound_failures_degraded_at {
-        SignalState::Degraded
-    } else {
-        SignalState::Healthy
-    }
+    evaluate_ge(
+        outbound_http_4xx_5xx_1h,
+        thresholds.outbound_failures_degraded_at,
+    )
 }
 
 /// Offending failure rows, newest first. A failed rows request yields no
@@ -49,43 +34,24 @@ fn fetch_outbound_rows(
     environment: &EnvironmentConfig,
     credentials: &dyn CredentialStore,
 ) -> (Vec<OutboundRow>, bool) {
-    let Ok(response) = client.request(
+    fetch_table_rows(
+        client,
         environment,
         credentials,
-        "GET",
         OUTBOUND_FAILURE_ROWS_PATH,
-        None,
-    ) else {
-        return (Vec::new(), false);
-    };
-    if response.status != 200 {
-        return (Vec::new(), false);
-    }
-    let rows: Vec<OutboundRow> =
-        serde_json::from_slice::<serde_json::Value>(response.body.as_bytes())
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("result")
-                    .and_then(|result| result.as_array())
-                    .cloned()
+        |row| {
+            let sys_id = row_text(row, "sys_id");
+            if sys_id.is_empty() {
+                return None;
+            }
+            Some(OutboundRow {
+                sys_id,
+                url: redact_url(&row_text(row, "url")),
+                http_status: row_text(row, "http_status"),
+                sys_created_on: row_text(row, "sys_created_on"),
             })
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|row| {
-                let sys_id = row_text(row, "sys_id");
-                if sys_id.is_empty() {
-                    return None;
-                }
-                Some(OutboundRow {
-                    sys_id,
-                    url: redact_url(row_text(row, "url")),
-                    http_status: row_text(row, "http_status"),
-                    sys_created_on: row_text(row, "sys_created_on"),
-                })
-            })
-            .collect();
-    crate::collector::take_bounded(rows)
+        },
+    )
 }
 
 #[derive(Default)]

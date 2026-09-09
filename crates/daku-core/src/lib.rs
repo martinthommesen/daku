@@ -1,5 +1,6 @@
 //! daku's daemon-side core.
 
+pub mod atomic_write;
 pub mod availability;
 pub mod collector;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod mcp;
 pub mod mid_ecc;
 pub mod outbound;
 pub mod persistence;
+pub mod platform_registry;
 pub mod roles;
 pub mod rotate;
 pub mod scan;
@@ -26,6 +28,7 @@ pub mod sessions;
 pub mod settings;
 pub mod settings_backend;
 pub mod setup;
+pub mod signal_eval;
 pub mod syslog;
 pub mod table_growth;
 pub mod transaction;

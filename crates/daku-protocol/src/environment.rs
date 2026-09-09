@@ -77,6 +77,7 @@ pub fn split_github_repo(instance_url: &str) -> Option<(String, String)> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
     pub id: String,
     pub label: String,

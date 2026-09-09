@@ -175,6 +175,34 @@ impl StateStore {
         fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
         Ok(connection)
     }
+
+    /// Enforces retention once at daemon startup (not on every open, so
+    /// tests with fake timestamps stay deterministic): a stalled daemon
+    /// prunes on restart instead of retaining beyond bounds until the next
+    /// tick. Best-effort; failures are ignored.
+    pub fn prune_all_for_startup(&self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let Ok(connection) = self.open() else {
+            return;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let environments: Vec<String> = connection
+            .prepare("SELECT DISTINCT environment_id FROM health_events")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get(0))?
+                    .collect::<Result<_, _>>()
+            })
+            .unwrap_or_default();
+        for environment_id in &environments {
+            let _ = prune_health_events(&connection, environment_id, now);
+            let _ = prune_signal_events(&connection, environment_id, now);
+        }
+        let _ = prune_signal_samples(&connection, now);
+        let _ = prune_signal_rollups(&connection, now);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -860,6 +888,162 @@ pub fn store_publish_state(
     Ok(())
 }
 
+/// Additive webhook delivery tables, created idempotently outside the
+/// numbered migration chain so old binaries keep working: they simply never
+/// create or read these tables. New binaries treat a missing row as
+/// "seed at current time" to avoid an initial burst.
+pub fn ensure_webhook_tables(connection: &Connection) -> io::Result<()> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS webhook_cursor (
+                environment_id TEXT PRIMARY KEY,
+                last_sent INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS webhook_dead_letters (
+                environment_id TEXT NOT NULL,
+                observed_at INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                error TEXT NOT NULL,
+                PRIMARY KEY (environment_id, observed_at, kind)
+             );",
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+pub fn load_webhook_cursor(
+    connection: &Connection,
+    environment_id: &str,
+) -> io::Result<Option<i64>> {
+    ensure_webhook_tables(connection)?;
+    let mut statement = connection
+        .prepare("SELECT last_sent FROM webhook_cursor WHERE environment_id = ?1")
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![environment_id])
+        .map_err(to_io_error)?;
+    let Some(row) = rows.next().map_err(to_io_error)? else {
+        return Ok(None);
+    };
+    Ok(Some(row.get(0).map_err(to_io_error)?))
+}
+
+pub fn store_webhook_cursor(
+    connection: &Connection,
+    environment_id: &str,
+    last_sent: i64,
+) -> io::Result<()> {
+    ensure_webhook_tables(connection)?;
+    connection
+        .execute(
+            "INSERT INTO webhook_cursor (environment_id, last_sent)
+             VALUES (?1, ?2)
+             ON CONFLICT(environment_id) DO UPDATE SET last_sent = excluded.last_sent",
+            params![environment_id, last_sent],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+pub fn record_webhook_dead_letter(
+    connection: &Connection,
+    environment_id: &str,
+    observed_at: i64,
+    kind: &str,
+    error: &str,
+) -> io::Result<()> {
+    ensure_webhook_tables(connection)?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO webhook_dead_letters
+                (environment_id, observed_at, kind, error)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![environment_id, observed_at, kind, error],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+pub fn load_webhook_dead_letter_count(
+    connection: &Connection,
+    environment_id: &str,
+) -> io::Result<i64> {
+    ensure_webhook_tables(connection)?;
+    let mut statement = connection
+        .prepare("SELECT COUNT(*) FROM webhook_dead_letters WHERE environment_id = ?1")
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![environment_id])
+        .map_err(to_io_error)?;
+    let Some(row) = rows.next().map_err(to_io_error)? else {
+        return Ok(0);
+    };
+    row.get(0).map_err(to_io_error)
+}
+
+/// Additive per-tick timing telemetry (FEAT-004): one row per tick with its
+/// wall-clock duration, created idempotently outside the numbered migration
+/// chain like the webhook tables. Bounded to the newest 10_000 ticks.
+pub fn ensure_tick_stats_table(connection: &Connection) -> io::Result<()> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS tick_stats (
+                started_at INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS tick_stats_by_time ON tick_stats (started_at);",
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+pub fn record_tick_stat(
+    connection: &Connection,
+    started_at: i64,
+    duration_ms: i64,
+) -> io::Result<()> {
+    ensure_tick_stats_table(connection)?;
+    connection
+        .execute(
+            "INSERT INTO tick_stats (started_at, duration_ms) VALUES (?1, ?2)",
+            params![started_at, duration_ms],
+        )
+        .map_err(to_io_error)?;
+    connection
+        .execute(
+            "DELETE FROM tick_stats WHERE rowid NOT IN (
+                 SELECT rowid FROM tick_stats ORDER BY started_at DESC LIMIT 10000
+             )",
+            [],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+/// `(ticks, overruns)` over the retained window: a tick overruns when its
+/// duration meets or exceeds the poll interval.
+pub fn load_tick_stats_summary(
+    connection: &Connection,
+    interval_secs: i64,
+) -> io::Result<(i64, i64)> {
+    ensure_tick_stats_table(connection)?;
+    let mut statement = connection
+        .prepare("SELECT COUNT(*), SUM(CASE WHEN duration_ms >= ?1 * 1000 THEN 1 ELSE 0 END) FROM tick_stats")
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![interval_secs])
+        .map_err(to_io_error)?;
+    let Some(row) = rows.next().map_err(to_io_error)? else {
+        return Ok((0, 0));
+    };
+    Ok((
+        row.get(0).map_err(to_io_error)?,
+        row.get::<_, Option<i64>>(1)
+            .map_err(to_io_error)?
+            .unwrap_or(0),
+    ))
+}
+
 pub fn prune_signal_samples(connection: &Connection, now: i64) -> io::Result<usize> {
     let cutoff = now.saturating_sub(SAMPLE_RETENTION_SECS);
     connection
@@ -896,6 +1080,18 @@ mod tests {
         assert!(!table_exists(&connection, "environments"));
         assert!(!table_exists(&connection, "projects"));
         assert_eq!(apply_migrations(&connection).unwrap(), 0);
+    }
+
+    #[test]
+    fn tick_stats_record_and_summarize_overruns() {
+        let db = TempDb::new("ticks");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        assert_eq!(load_tick_stats_summary(&connection, 60).unwrap(), (0, 0));
+        record_tick_stat(&connection, 1000, 5_000).unwrap();
+        record_tick_stat(&connection, 2000, 90_000).unwrap();
+        assert_eq!(load_tick_stats_summary(&connection, 60).unwrap(), (2, 1));
+        store.prune_all_for_startup();
     }
 
     #[test]
