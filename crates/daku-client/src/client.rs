@@ -37,6 +37,131 @@ struct ClientInner {
     disconnected: AtomicBool,
 }
 
+/// One inbound chunked transfer being reassembled. Keyed by transfer id;
+/// only the reader thread touches the map, so no lock is needed.
+enum TransferAssembly {
+    Samples {
+        environment_id: String,
+        signal_id: String,
+        count: u32,
+        parts: BTreeMap<u32, Vec<daku_protocol::SamplePoint>>,
+    },
+    Rollups {
+        environment_id: String,
+        signal_id: String,
+        count: u32,
+        parts: BTreeMap<u32, Vec<daku_protocol::RollupPoint>>,
+    },
+    Snapshots {
+        environment_id: String,
+        count: u32,
+        parts: BTreeMap<u32, Vec<daku_protocol::SignalSnapshotDto>>,
+    },
+}
+
+/// Incomplete transfers retained per connection. A newer transfer for the
+/// same series evicts the older one; the cap bounds a malicious or
+/// pathological peer that opens transfers without finishing them.
+const MAX_INCOMPLETE_TRANSFERS: usize = 64;
+
+/// Registers a fresh transfer, evicting any incomplete transfer for the
+/// same series and capping total incomplete transfers.
+fn insert_chunk(
+    transfers: &mut BTreeMap<u64, TransferAssembly>,
+    transfer_id: u64,
+    fresh: TransferAssembly,
+) {
+    if transfers.contains_key(&transfer_id) {
+        return;
+    }
+    let series = fresh.series();
+    transfers.retain(|_, assembly| assembly.series() != series);
+    transfers.insert(transfer_id, fresh);
+    while transfers.len() > MAX_INCOMPLETE_TRANSFERS {
+        transfers.pop_first();
+    }
+}
+
+/// Stores one chunk part, returning the assembled whole message once the
+/// transfer is complete.
+fn ingest_chunk(
+    transfers: &mut BTreeMap<u64, TransferAssembly>,
+    transfer_id: u64,
+    fresh: TransferAssembly,
+    insert: impl FnOnce(&mut TransferAssembly),
+) -> Option<ServerMessage> {
+    insert_chunk(transfers, transfer_id, fresh);
+    if let Some(assembly) = transfers.get_mut(&transfer_id) {
+        insert(assembly);
+    }
+    let whole = transfers
+        .get(&transfer_id)
+        .and_then(TransferAssembly::assembled)?;
+    transfers.remove(&transfer_id);
+    Some(whole)
+}
+
+impl TransferAssembly {
+    /// Series this transfer fills, for stale-transfer eviction.
+    fn series(&self) -> (String, String) {
+        match self {
+            Self::Samples {
+                environment_id,
+                signal_id,
+                ..
+            } => (environment_id.clone(), signal_id.clone()),
+            Self::Rollups {
+                environment_id,
+                signal_id,
+                ..
+            } => (environment_id.clone(), signal_id.clone()),
+            Self::Snapshots { environment_id, .. } => (environment_id.clone(), String::new()),
+        }
+    }
+
+    /// The complete message once every part has arrived.
+    fn assembled(&self) -> Option<ServerMessage> {
+        let complete = match self {
+            Self::Samples { count, parts, .. } => parts.len() as u32 == *count,
+            Self::Rollups { count, parts, .. } => parts.len() as u32 == *count,
+            Self::Snapshots { count, parts, .. } => parts.len() as u32 == *count,
+        };
+        if !complete {
+            return None;
+        }
+        Some(match self {
+            Self::Samples {
+                environment_id,
+                signal_id,
+                parts,
+                ..
+            } => ServerMessage::SignalSamplesUpdated {
+                environment_id: environment_id.clone(),
+                signal_id: signal_id.clone(),
+                points: parts.values().flatten().cloned().collect(),
+            },
+            Self::Rollups {
+                environment_id,
+                signal_id,
+                parts,
+                ..
+            } => ServerMessage::SignalRollupsUpdated {
+                environment_id: environment_id.clone(),
+                signal_id: signal_id.clone(),
+                points: parts.values().flatten().cloned().collect(),
+            },
+            Self::Snapshots {
+                environment_id,
+                parts,
+                ..
+            } => ServerMessage::SignalSnapshotsUpdated {
+                environment_id: environment_id.clone(),
+                snapshots: parts.values().flatten().cloned().collect(),
+            },
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct DaemonClient {
     inner: Arc<ClientInner>,
@@ -171,6 +296,20 @@ fn run_client(
     outgoing: Receiver<Outgoing>,
     inner: Arc<ClientInner>,
 ) {
+    let outgoing_tx = inner.outgoing.clone();
+    let mut transfers: BTreeMap<u64, TransferAssembly> = BTreeMap::new();
+    // One automatic resync per connection: a lossy replay triggers a
+    // single explicit replay, and the next live tick converges regardless.
+    let mut resync_requested = false;
+    let forward = |message: ServerMessage| {
+        if let Some(key) = message.dashboard_cache_key() {
+            inner.dashboard_cache.lock().insert(key, message.clone());
+        }
+        inner
+            .dashboard
+            .lock()
+            .retain(|subscriber| subscriber.send(message.clone()).is_ok());
+    };
     'connection: loop {
         while let Ok(message) = outgoing.try_recv() {
             match message {
@@ -211,13 +350,95 @@ fn run_client(
                     | ServerMessage::HealthEventsUpdated { .. }
                     | ServerMessage::SignalEventsUpdated { .. }
                     | ServerMessage::SignalRollupsUpdated { .. } => {
-                        if let Some(key) = message.dashboard_cache_key() {
-                            inner.dashboard_cache.lock().insert(key, message.clone());
+                        forward(message);
+                    }
+                    ServerMessage::SignalSamplesChunk {
+                        environment_id,
+                        signal_id,
+                        transfer_id,
+                        chunk_index,
+                        chunk_count,
+                        points,
+                    } => {
+                        if let Some(whole) = ingest_chunk(
+                            &mut transfers,
+                            transfer_id,
+                            TransferAssembly::Samples {
+                                environment_id,
+                                signal_id,
+                                count: chunk_count,
+                                parts: BTreeMap::new(),
+                            },
+                            |assembly| {
+                                if let TransferAssembly::Samples { parts, .. } = assembly {
+                                    parts.insert(chunk_index, points);
+                                }
+                            },
+                        ) {
+                            forward(whole);
                         }
-                        inner
-                            .dashboard
-                            .lock()
-                            .retain(|subscriber| subscriber.send(message.clone()).is_ok());
+                    }
+                    ServerMessage::SignalRollupsChunk {
+                        environment_id,
+                        signal_id,
+                        transfer_id,
+                        chunk_index,
+                        chunk_count,
+                        points,
+                    } => {
+                        if let Some(whole) = ingest_chunk(
+                            &mut transfers,
+                            transfer_id,
+                            TransferAssembly::Rollups {
+                                environment_id,
+                                signal_id,
+                                count: chunk_count,
+                                parts: BTreeMap::new(),
+                            },
+                            |assembly| {
+                                if let TransferAssembly::Rollups { parts, .. } = assembly {
+                                    parts.insert(chunk_index, points);
+                                }
+                            },
+                        ) {
+                            forward(whole);
+                        }
+                    }
+                    ServerMessage::SignalSnapshotsChunk {
+                        environment_id,
+                        transfer_id,
+                        chunk_index,
+                        chunk_count,
+                        snapshots,
+                    } => {
+                        if let Some(whole) = ingest_chunk(
+                            &mut transfers,
+                            transfer_id,
+                            TransferAssembly::Snapshots {
+                                environment_id,
+                                count: chunk_count,
+                                parts: BTreeMap::new(),
+                            },
+                            |assembly| {
+                                if let TransferAssembly::Snapshots { parts, .. } = assembly {
+                                    parts.insert(chunk_index, snapshots);
+                                }
+                            },
+                        ) {
+                            forward(whole);
+                        }
+                    }
+                    ServerMessage::DashboardSyncNeeded { .. } => {
+                        forward(message);
+                        if !resync_requested {
+                            resync_requested = true;
+                            let _ = outgoing_tx.send(Outgoing::Message(Box::new(
+                                ClientMessage::Request(Request {
+                                    request_id: Uuid::new_v4(),
+                                    command: Command::RequestDashboardSync,
+                                }),
+                            )));
+                        }
                     }
                     ServerMessage::ShuttingDown => break,
                     ServerMessage::Hello { .. } | ServerMessage::Rejected { .. } => {}
@@ -433,6 +654,78 @@ mod tests {
                 assert_eq!(points.len(), 2);
                 assert_eq!(points[0].value_real, Some(2.0));
                 assert_eq!(points[1].value_real, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn sample_points(values: &[f64]) -> Vec<daku_protocol::SamplePoint> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| daku_protocol::SamplePoint {
+                observed_at: index as i64,
+                value_real: Some(*value),
+            })
+            .collect()
+    }
+
+    fn feed_samples(
+        transfers: &mut BTreeMap<u64, super::TransferAssembly>,
+        transfer_id: u64,
+        chunk_index: u32,
+        chunk_count: u32,
+        points: Vec<daku_protocol::SamplePoint>,
+    ) -> Option<ServerMessage> {
+        super::ingest_chunk(
+            transfers,
+            transfer_id,
+            super::TransferAssembly::Samples {
+                environment_id: "prod".into(),
+                signal_id: "jobs".into(),
+                count: chunk_count,
+                parts: BTreeMap::new(),
+            },
+            |assembly| {
+                if let super::TransferAssembly::Samples { parts, .. } = assembly {
+                    parts.insert(chunk_index, points);
+                }
+            },
+        )
+    }
+
+    #[test]
+    fn ingest_chunk_assembles_only_when_complete() {
+        let mut transfers = BTreeMap::new();
+        assert!(
+            feed_samples(&mut transfers, 9, 1, 2, sample_points(&[2.0])).is_none(),
+            "one of two chunks must not assemble"
+        );
+        let whole = feed_samples(&mut transfers, 9, 0, 2, sample_points(&[1.0]))
+            .expect("second chunk completes the transfer");
+        match whole {
+            ServerMessage::SignalSamplesUpdated { points, .. } => {
+                assert_eq!(points.len(), 2);
+                assert_eq!(points[0].value_real, Some(1.0));
+                assert_eq!(points[1].value_real, Some(2.0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(transfers.is_empty(), "completed transfers leave no state");
+    }
+
+    #[test]
+    fn ingest_chunk_evicts_stale_transfer_for_same_series() {
+        let mut transfers = BTreeMap::new();
+        assert!(feed_samples(&mut transfers, 9, 0, 2, sample_points(&[1.0])).is_none());
+        // A newer transfer for the same series replaces the stale one: its
+        // single chunk completes immediately with only the new points.
+        let whole = feed_samples(&mut transfers, 10, 0, 1, sample_points(&[7.0]))
+            .expect("fresh single-chunk transfer completes");
+        match whole {
+            ServerMessage::SignalSamplesUpdated { points, .. } => {
+                assert_eq!(points.len(), 1);
+                assert_eq!(points[0].value_real, Some(7.0));
             }
             other => panic!("unexpected {other:?}"),
         }

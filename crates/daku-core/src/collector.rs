@@ -243,6 +243,9 @@ pub struct CollectorLoop {
     interval: Duration,
     /// Run concurrently, one scoped thread per group (one group per Environment).
     groups: Vec<Vec<Box<dyn SignalCollector>>>,
+    /// Environment id per group, in the same order: per-group timing feeds
+    /// per-environment tick telemetry.
+    group_envs: Vec<String>,
     /// Run sequentially after every group has finished (cross-Environment Signals).
     shared: Vec<Box<dyn SignalCollector>>,
     /// Slow cadence: every this many ticks (tick 0 always runs everything,
@@ -269,6 +272,7 @@ impl CollectorLoop {
         Self {
             interval,
             groups: Vec::new(),
+            group_envs: Vec::new(),
             shared: Vec::new(),
             slow_every: slow_secs.div_ceil(interval_secs).max(1),
             slow: Vec::new(),
@@ -298,8 +302,9 @@ impl CollectorLoop {
 
     /// Registers a set of collectors that run in order on their own thread,
     /// concurrently with the other groups.
-    pub fn register_group(&mut self, group: Vec<Box<dyn SignalCollector>>) {
+    pub fn register_group(&mut self, environment_id: &str, group: Vec<Box<dyn SignalCollector>>) {
         if !group.is_empty() {
+            self.group_envs.push(environment_id.to_owned());
             self.groups.push(group);
         }
     }
@@ -310,25 +315,44 @@ impl CollectorLoop {
 
     /// Runs one tick and reports how long it took, so the caller can sleep the
     /// remainder of the interval instead of a full interval on top of it.
-    fn tick_timed(&self) -> (anyhow::Result<()>, Duration) {
+    /// Also reports per-group wall time keyed by environment id, for
+    /// per-environment tick telemetry.
+    fn tick_timed(&self) -> (anyhow::Result<()>, Duration, Vec<(String, u64)>) {
         use std::sync::atomic::Ordering;
         let started = Instant::now();
         let tick = self.ticks.fetch_add(1, Ordering::Relaxed);
         let slow_tick = tick.is_multiple_of(self.slow_every);
-        let mut errors: Vec<anyhow::Error> = std::thread::scope(|scope| {
+        let mut errors: Vec<anyhow::Error> = Vec::new();
+        let mut group_ms: Vec<(String, u64)> = Vec::new();
+        std::thread::scope(|scope| {
             let handles: Vec<_> = self
                 .groups
                 .iter()
-                .map(|group| scope.spawn(move || run_sequential(group)))
-                .collect();
-            handles
-                .into_iter()
+                .zip(self.group_envs.iter())
                 .enumerate()
-                .filter_map(|(index, handle)| match handle.join() {
-                    Ok(result) => result.err(),
-                    Err(_) => Some(anyhow::anyhow!("collector group {index} panicked")),
+                .map(|(index, (group, environment_id))| {
+                    scope.spawn(move || {
+                        let group_started = Instant::now();
+                        let result = run_sequential(group);
+                        let elapsed_ms =
+                            u64::try_from(group_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        (index, environment_id.clone(), elapsed_ms, result)
+                    })
                 })
-                .collect()
+                .collect();
+            for (index, handle) in handles.into_iter().enumerate() {
+                match handle.join() {
+                    Ok((_, environment_id, elapsed_ms, result)) => {
+                        group_ms.push((environment_id, elapsed_ms));
+                        if let Err(error) = result {
+                            errors.push(error);
+                        }
+                    }
+                    Err(_) => {
+                        errors.push(anyhow::anyhow!("collector group {index} panicked"));
+                    }
+                }
+            }
         });
         // The shared collectors read across every Environment, so they must run
         // after every group has joined — plan 049 needs this tick's availability
@@ -364,13 +388,18 @@ impl CollectorLoop {
             Err(error) => Err(error.context(format!("tick {tick}"))),
             Ok(()) => Ok(()),
         };
-        (result, elapsed)
+        (result, elapsed, group_ms)
     }
 
-    pub fn run(&self, shutdown: &AtomicBool, clock: &dyn Clock, after: &dyn Fn(Duration)) {
+    pub fn run(
+        &self,
+        shutdown: &AtomicBool,
+        clock: &dyn Clock,
+        after: &dyn Fn(Duration, GroupTimes),
+    ) {
         // Publish last-known state from SQLite so a fresh subscriber is not blank
         // until the first tick completes.
-        publish(after, Duration::ZERO);
+        publish(after, Duration::ZERO, &[]);
         let mut was_offline = false;
         while !shutdown.load(Ordering::Acquire) {
             if self.offline_check.as_ref().is_some_and(|check| check()) {
@@ -387,11 +416,11 @@ impl CollectorLoop {
                 eprintln!("daku collector resumed");
                 was_offline = false;
             }
-            let (result, elapsed) = self.tick_timed();
+            let (result, elapsed, group_ms) = self.tick_timed();
             if let Err(error) = result {
                 eprintln!("daku collector tick failed: {error}");
             }
-            publish(after, elapsed);
+            publish(after, elapsed, &group_ms);
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
@@ -400,6 +429,11 @@ impl CollectorLoop {
         }
     }
 }
+
+/// Per-environment group wall times for one tick: environment id plus
+/// milliseconds. Shared between the collector loop and its delivery
+/// callback so the type stays readable at each signature.
+pub type GroupTimes<'a> = &'a [(String, u64)];
 
 /// Hosts one poll round must reach: ServiceNow and probe hosts verbatim,
 /// plus the GitHub API for repo Environments. Deduped, in config order.
@@ -436,8 +470,8 @@ pub fn all_hosts_unreachable(hosts: &[String]) -> bool {
 /// Publishes the dashboard, costing one tick's publish rather than the whole
 /// loop if it panics. `elapsed` is the tick that just ran (`ZERO` for the
 /// pre-first-tick publish); the callback records it for tick telemetry.
-fn publish(after: &dyn Fn(Duration), elapsed: Duration) {
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| after(elapsed))).is_err() {
+fn publish(after: &dyn Fn(Duration, GroupTimes), elapsed: Duration, groups: &[(String, u64)]) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| after(elapsed, groups))).is_err() {
         eprintln!("daku dashboard publish panicked");
     }
 }
@@ -470,7 +504,7 @@ fn combine_errors(errors: Vec<anyhow::Error>) -> anyhow::Result<()> {
 pub fn spawn_collector_loop(
     loop_: CollectorLoop,
     shutdown: Arc<AtomicBool>,
-    after_tick: impl Fn(Duration) + Send + 'static,
+    after_tick: impl Fn(Duration, GroupTimes<'_>) + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("daku-collector".into())
@@ -505,94 +539,103 @@ pub fn build_default_loop(
         // `platform_registry::signals_for` — keep the two in step when
         // adding a Platform.
         match environment.platform {
-            Platform::Servicenow => loop_.register_group(vec![
-                Box::new(AvailabilityCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(JobsCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(SyslogCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(MidEccCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(OutboundCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(FlowCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(EmailCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(UpgradeCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(SessionsCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(TableGrowthCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(TransactionCollector::new(
-                    one.clone(),
-                    credentials.clone(),
-                    client.clone(),
-                    store.clone(),
-                )),
-                Box::new(UpdateSetsCollector::new(
+            Platform::Servicenow => loop_.register_group(
+                &environment.id,
+                vec![
+                    Box::new(AvailabilityCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(JobsCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(SyslogCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(MidEccCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(OutboundCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(FlowCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(EmailCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(UpgradeCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(SessionsCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(TableGrowthCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(TransactionCollector::new(
+                        one.clone(),
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                    Box::new(UpdateSetsCollector::new(
+                        one,
+                        credentials.clone(),
+                        client.clone(),
+                        store.clone(),
+                    )),
+                ],
+            ),
+            // Other platforms register only their own probe: no ServiceNow
+            // semantics, no availability gating, no shared collectors.
+            Platform::Http => loop_.register_group(
+                &environment.id,
+                vec![Box::new(HttpProbeCollector::new(
                     one,
                     credentials.clone(),
                     client.clone(),
                     store.clone(),
-                )),
-            ]),
-            // Other platforms register only their own probe: no ServiceNow
-            // semantics, no availability gating, no shared collectors.
-            Platform::Http => loop_.register_group(vec![Box::new(HttpProbeCollector::new(
-                one,
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            ))]),
-            Platform::Github => loop_.register_group(vec![Box::new(ActionsCollector::new(
-                one,
-                credentials.clone(),
-                client.clone(),
-                store.clone(),
-            ))]),
+                ))],
+            ),
+            Platform::Github => loop_.register_group(
+                &environment.id,
+                vec![Box::new(ActionsCollector::new(
+                    one,
+                    credentials.clone(),
+                    client.clone(),
+                    store.clone(),
+                ))],
+            ),
         }
     }
     // Drift, last-clone, and scan read inventories and history: they ride
@@ -685,37 +728,63 @@ pub fn start_default_loop_with_store(
         }));
         loop_
     };
-    spawn_collector_loop(loop_, shutdown, move |elapsed: Duration| {
-        let now = unix_now();
-        if let Err(error) = publish_dashboard(
-            &dashboard_environments,
-            &dashboard_store,
-            &dashboard_tx,
-            now,
-        ) {
-            eprintln!("daku dashboard publish failed: {error}");
-        }
-        // Tick telemetry (FEAT-004): persisted per-tick durations back the
-        // overrun counts doctor reports. Best-effort; never fails the tick.
-        // Elapsed covers collection; the pre-first-tick publish passes ZERO.
-        if let Ok(connection) = dashboard_store.open() {
-            let _ = persistence::record_tick_stat_with_envs(
-                &connection,
+    let poll_secs = poll_interval_secs(settings);
+    spawn_collector_loop(
+        loop_,
+        shutdown,
+        move |elapsed: Duration, groups: GroupTimes| {
+            let now = unix_now();
+            let delivery = match publish_dashboard(
+                &dashboard_environments,
+                &dashboard_store,
+                &dashboard_tx,
                 now,
-                i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
-                dashboard_environments.len() as i64,
-            );
-        }
-        // Fire-and-forget: a slow forwarder must never stall polling.
-        if WebhookRelay::configured_url().is_some() {
-            let relay = webhook.clone();
-            let store = dashboard_store.clone();
-            std::thread::Builder::new()
-                .name("daku-webhook".into())
-                .spawn(move || relay.relay_tick(&store))
-                .ok();
-        }
-    });
+                poll_secs,
+            ) {
+                Ok(summary) => Some(summary),
+                Err(error) => {
+                    eprintln!("daku dashboard publish failed: {error}");
+                    None
+                }
+            };
+            // Tick telemetry (FEAT-004): persisted per-tick durations back the
+            // overrun counts doctor reports. Best-effort; never fails the tick.
+            // Elapsed covers collection; the pre-first-tick publish passes ZERO.
+            if let Ok(connection) = dashboard_store.open() {
+                let _ = persistence::record_tick_delivery(
+                    &connection,
+                    now,
+                    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+                    dashboard_environments.len() as i64,
+                    delivery
+                        .as_ref()
+                        .map(|summary| i64::try_from(summary.bytes).unwrap_or(i64::MAX))
+                        .unwrap_or(0),
+                    delivery
+                        .as_ref()
+                        .map(|summary| i64::try_from(summary.throttled).unwrap_or(i64::MAX))
+                        .unwrap_or(0),
+                );
+                for (environment_id, duration_ms) in groups {
+                    let _ = persistence::record_tick_env_stat(
+                        &connection,
+                        environment_id,
+                        now,
+                        i64::try_from(*duration_ms).unwrap_or(i64::MAX),
+                    );
+                }
+            }
+            // Fire-and-forget: a slow forwarder must never stall polling.
+            if WebhookRelay::configured_url().is_some() {
+                let relay = webhook.clone();
+                let store = dashboard_store.clone();
+                std::thread::Builder::new()
+                    .name("daku-webhook".into())
+                    .spawn(move || relay.relay_tick(&store))
+                    .ok();
+            }
+        },
+    );
     Some(dashboard_rx)
 }
 
@@ -768,6 +837,11 @@ pub struct DoctorRow {
     pub thresholds: String,
     /// Planned drift entries declared in `expected_drift`.
     pub expected_drift: usize,
+    /// Health events newer than the webhook cursor: the pending delivery
+    /// backlog. Zero when no webhook URL is configured.
+    pub webhook_pending: i64,
+    /// Dead-lettered webhook events awaiting requeue.
+    pub webhook_dead_letters: i64,
 }
 
 pub struct DoctorReport {
@@ -779,10 +853,18 @@ pub struct DoctorReport {
     pub tick_count: i64,
     /// Recorded ticks at or over the poll interval.
     pub tick_overruns: i64,
+    /// Serialized dashboard bytes summed over the retained window.
+    pub tick_publish_bytes: i64,
+    /// Throttled snapshots summed over the retained window.
+    pub tick_throttled: i64,
+    /// Slowest environment in the retained window, if any durations exist.
+    pub slowest_env: Option<(String, i64)>,
 }
 
 /// Read-only diagnosis: config, Credential presence (never the value), and a
-/// live Availability probe per Environment. Writes nothing to SQLite.
+/// live Availability probe per Environment. Creates no rows and migrates
+/// nothing; the only writes are the idempotent telemetry-table ensures the
+/// stats loaders already perform on every read path.
 pub fn run_doctor(
     environments_path: &Path,
     settings: &DaemonSettings,
@@ -797,6 +879,32 @@ pub fn run_doctor(
         client,
         store.clone(),
     );
+    // Webhook delivery state is read-only here: doctor never migrates or
+    // writes. A missing store reads as zero backlog everywhere.
+    let webhook_state: std::collections::HashMap<String, (i64, i64)> = store
+        .open()
+        .ok()
+        .map(|connection| {
+            environments
+                .iter()
+                .map(|environment| {
+                    let cursor = persistence::load_webhook_cursor(&connection, &environment.id)
+                        .unwrap_or(None)
+                        .unwrap_or(0);
+                    let pending = persistence::count_health_events_newer(
+                        &connection,
+                        &environment.id,
+                        cursor,
+                    )
+                    .unwrap_or(0);
+                    let dead =
+                        persistence::load_webhook_dead_letter_count(&connection, &environment.id)
+                            .unwrap_or(0);
+                    (environment.id.clone(), (pending, dead))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let rows = environments
         .iter()
         .map(|environment| {
@@ -845,17 +953,32 @@ pub fn run_doctor(
                 rtt_ms: observation.rtt_ms,
                 thresholds: environment.thresholds.summary(),
                 expected_drift: environment.expected_drift.len(),
+                webhook_pending: webhook_state
+                    .get(&environment.id)
+                    .map(|(pending, _)| *pending)
+                    .unwrap_or(0),
+                webhook_dead_letters: webhook_state
+                    .get(&environment.id)
+                    .map(|(_, dead)| *dead)
+                    .unwrap_or(0),
             }
         })
         .collect();
-    let (tick_count, tick_overruns) = store
+    let (tick_count, tick_overruns, tick_publish_bytes, tick_throttled, slowest_env) = store
         .open()
         .ok()
-        .and_then(|connection| {
-            persistence::load_tick_stats_summary(&connection, poll_interval_secs(settings) as i64)
-                .ok()
+        .map(|connection| {
+            let (count, overruns) = persistence::load_tick_stats_summary(
+                &connection,
+                poll_interval_secs(settings) as i64,
+            )
+            .unwrap_or((0, 0));
+            let (bytes, throttled) =
+                persistence::load_tick_delivery_summary(&connection).unwrap_or((0, 0));
+            let slowest = persistence::load_slowest_env_stat(&connection).unwrap_or(None);
+            (count, overruns, bytes, throttled, slowest)
         })
-        .unwrap_or((0, 0));
+        .unwrap_or((0, 0, 0, 0, None));
     Ok(DoctorReport {
         environments_path: environments_path.to_owned(),
         poll_interval_secs: poll_interval_secs(settings),
@@ -863,6 +986,9 @@ pub fn run_doctor(
         rows,
         tick_count,
         tick_overruns,
+        tick_publish_bytes,
+        tick_throttled,
+        slowest_env,
     })
 }
 
@@ -997,7 +1123,7 @@ mod tests {
                 self.0.store(true, Ordering::Release);
             }
         }
-        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|_| {
+        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|_, _| {
             calls.fetch_add(1, Ordering::Release);
         });
         assert_eq!(calls.load(Ordering::Acquire), 2);
@@ -1025,7 +1151,7 @@ mod tests {
             Duration::from_millis(200),
             Arc::new(AtomicUsize::new(0)),
         ));
-        loop_.run(&shutdown, &clock, &|_| {});
+        loop_.run(&shutdown, &clock, &|_, _| {});
         let sleeps = clock.1.lock().expect("sleeps").clone();
         assert_eq!(sleeps.len(), 1);
         assert!(
@@ -1044,7 +1170,7 @@ mod tests {
             Duration::from_millis(50),
             Arc::new(AtomicUsize::new(0)),
         ));
-        loop_.run(&shutdown, &clock, &|_| {});
+        loop_.run(&shutdown, &clock, &|_, _| {});
         assert_eq!(*clock.1.lock().expect("sleeps"), [Duration::ZERO]);
     }
 
@@ -1109,11 +1235,11 @@ mod tests {
     fn tick_still_runs_the_other_collectors_when_one_panics() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut loop_ = CollectorLoop::new(Duration::from_secs(120));
-        loop_.register_group(vec![Box::new(Panicking)]);
-        loop_.register_group(vec![Box::new(SleepingCollector(
-            Duration::ZERO,
-            calls.clone(),
-        ))]);
+        loop_.register_group("panicking", vec![Box::new(Panicking)]);
+        loop_.register_group(
+            "sleeping",
+            vec![Box::new(SleepingCollector(Duration::ZERO, calls.clone()))],
+        );
         loop_.register(SleepingCollector(Duration::ZERO, calls.clone()));
         let error = without_panic_output(|| loop_.tick().unwrap_err());
         assert!(
@@ -1140,7 +1266,7 @@ mod tests {
             }
         }
         without_panic_output(|| {
-            loop_.run(&shutdown, &StopAfterTwo(&shutdown, &calls), &|_| {
+            loop_.run(&shutdown, &StopAfterTwo(&shutdown, &calls), &|_, _| {
                 if calls.fetch_add(1, Ordering::AcqRel) == 0 {
                     panic!("publish exploded");
                 }
@@ -1166,11 +1292,14 @@ mod tests {
     fn collector_loop_tick_runs_groups_concurrently() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut loop_ = CollectorLoop::new(Duration::from_secs(120));
-        for _ in 0..3 {
-            loop_.register_group(vec![Box::new(SleepingCollector(
-                Duration::from_millis(200),
-                calls.clone(),
-            ))]);
+        for index in 0..3 {
+            loop_.register_group(
+                &format!("group-{index}"),
+                vec![Box::new(SleepingCollector(
+                    Duration::from_millis(200),
+                    calls.clone(),
+                ))],
+            );
         }
         let started = Instant::now();
         loop_.tick().unwrap();
@@ -1191,10 +1320,13 @@ mod tests {
         }
         let calls = Arc::new(AtomicUsize::new(0));
         let mut loop_ = CollectorLoop::new(Duration::from_secs(120));
-        loop_.register_group(vec![
-            Box::new(Failing),
-            Box::new(SleepingCollector(Duration::ZERO, calls.clone())),
-        ]);
+        loop_.register_group(
+            "failing",
+            vec![
+                Box::new(Failing),
+                Box::new(SleepingCollector(Duration::ZERO, calls.clone())),
+            ],
+        );
         loop_.register(SleepingCollector(Duration::ZERO, calls.clone()));
         let error = loop_.tick().unwrap_err();
         assert!(format!("{error:#}").contains("boom"), "{error:#}");
@@ -1214,10 +1346,10 @@ mod tests {
             }
         }
         let mut loop_ = CollectorLoop::new(Duration::from_secs(120));
-        loop_.register_group(vec![
-            Box::new(Failing("first")),
-            Box::new(Failing("second")),
-        ]);
+        loop_.register_group(
+            "failing",
+            vec![Box::new(Failing("first")), Box::new(Failing("second"))],
+        );
         let error = loop_.tick().unwrap_err();
         let text = format!("{error:#}");
         assert!(text.contains("first"), "{text}");
@@ -1391,7 +1523,7 @@ mod tests {
             }
         }
         loop_.register(SleepingCollector(Duration::ZERO, ticks.clone()));
-        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|_| {});
+        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|_, _| {});
         assert_eq!(
             ticks.load(Ordering::Acquire),
             0,
@@ -1402,7 +1534,7 @@ mod tests {
         let shutdown = AtomicBool::new(false);
         let mut loop_ = CollectorLoop::new(Duration::from_secs(120)).with_offline_check(|| false);
         loop_.register(SleepingCollector(Duration::ZERO, ticks.clone()));
-        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|_| {});
+        loop_.run(&shutdown, &StopOnSleep(&shutdown), &|_, _| {});
         assert_eq!(ticks.load(Ordering::Acquire), 1);
     }
 

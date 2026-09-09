@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use daku_protocol::{
-    ClientMessage, Command, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, Request, ResponseOutcome,
-    ResponsePayload, RpcError, ServerMessage,
+    ClientMessage, Command, DASHBOARD_CHUNK_BUDGET_BYTES, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION,
+    Request, ResponseOutcome, ResponsePayload, RpcError, ServerMessage,
 };
 use parking_lot::Mutex as ParkingMutex;
 use subtle::ConstantTimeEq as _;
@@ -51,6 +51,7 @@ struct HubState {
     subscribers: HashMap<u64, Sender<ServerMessage>>,
     dashboard: BTreeMap<String, ServerMessage>,
     dropped: u64,
+    next_transfer_id: u64,
 }
 
 /// Bound on per-subscriber queued dashboard messages. A stalled client stops
@@ -63,28 +64,14 @@ struct Hub {
 }
 
 impl Hub {
-    /// Broadcasts a dashboard message and remembers it for late subscribers.
-    /// Slow-subscriber drops and oversize payloads are logged, never silent.
-    /// Replay never blocks: both live delivery and catch-up use `try_send`
-    /// into the bounded queue, so a reconnect cannot deadlock before its
-    /// read loop drains. Oversize messages are not cached, so one large
-    /// rollup cannot poison every future replay; the next tick republishes
-    /// bounded state.
+    /// Broadcasts a dashboard message and remembers the whole message for
+    /// late subscribers. The cache key space is fixed (one entry per
+    /// environment and signal series), so caching whole messages cannot
+    /// grow memory with payload size; chunking bounds the wire instead.
+    /// Slow-subscriber drops are counted and logged, never silent.
     fn publish_dashboard(&self, message: ServerMessage) {
-        let wire_bytes = serde_json::to_vec(&message).map(|v| v.len()).unwrap_or(0);
-        let oversize = wire_bytes > MAX_WIRE_MESSAGE_BYTES;
-        if oversize {
-            eprintln!(
-                "daku-daemon publish above wire cap: {} bytes for {:?}; dropping from cache, clients keep last bounded state",
-                wire_bytes,
-                message
-                    .dashboard_cache_key()
-                    .as_deref()
-                    .unwrap_or("uncached"),
-            );
-        }
         let mut state = self.state.lock();
-        if !oversize && let Some(key) = message.dashboard_cache_key() {
+        if let Some(key) = message.dashboard_cache_key() {
             state.dashboard.insert(key, message.clone());
         }
         // Snapshot senders so the drop counter mutation never aliases the
@@ -97,14 +84,30 @@ impl Hub {
         let mut disconnected = Vec::new();
         let mut drops = 0u64;
         for (id, subscriber) in senders {
-            match subscriber.try_send(message.clone()) {
-                Ok(()) => {}
-                Err(crossbeam_channel::TrySendError::Full(_)) => {
-                    drops = drops.saturating_add(1);
+            let transfer_id = state.next_transfer_id;
+            state.next_transfer_id = state.next_transfer_id.saturating_add(1);
+            let mut failed = false;
+            let mut gone = false;
+            for piece in split_for_wire(&message, transfer_id) {
+                match subscriber.try_send(piece) {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        failed = true;
+                        break;
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        gone = true;
+                        break;
+                    }
                 }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    disconnected.push(id);
-                }
+            }
+            if gone {
+                disconnected.push(id);
+            } else if failed {
+                // One drop per message: a partial transfer can never
+                // assemble, so its queued pieces are dead weight the next
+                // transfer for the same series evicts.
+                drops = drops.saturating_add(1);
             }
         }
         if drops > 0 {
@@ -125,17 +128,15 @@ impl Hub {
         }
     }
 
-    fn subscribe(&self, sender: Sender<ServerMessage>) -> u64 {
+    /// Replays the full cached state to one sender, chunked like live
+    /// delivery. Returns the subscriber id and the count of cached
+    /// messages that did not fit, so the connection can say so.
+    fn subscribe(&self, sender: Sender<ServerMessage>) -> (u64, u64) {
         let mut state = self.state.lock();
         // Non-blocking replay: a subscriber that cannot keep up gets what
         // fits plus a drop count instead of deadlocking the handshake
         // before its read loop starts.
-        let mut replay_drops = 0u64;
-        for message in state.dashboard.values() {
-            if sender.try_send(message.clone()).is_err() {
-                replay_drops = replay_drops.saturating_add(1);
-            }
-        }
+        let replay_drops = replay_cached(&mut state, &sender);
         if replay_drops > 0 {
             state.dropped = state.dropped.saturating_add(replay_drops);
             eprintln!(
@@ -146,12 +147,162 @@ impl Hub {
         let id = state.next_subscriber_id;
         state.next_subscriber_id = state.next_subscriber_id.saturating_add(1);
         state.subscribers.insert(id, sender);
-        id
+        (id, replay_drops)
+    }
+
+    /// Replays the full cached state to one sender outside of subscribe,
+    /// for an explicit resync request. Drops are counted and logged like
+    /// any other slow-subscriber loss; the next live tick converges.
+    fn resync_to(&self, sender: &Sender<ServerMessage>) {
+        let mut state = self.state.lock();
+        let drops = replay_cached(&mut state, sender);
+        if drops > 0 {
+            state.dropped = state.dropped.saturating_add(drops);
+            eprintln!("daku-daemon dropped {drops} resync messages for a slow subscriber");
+        }
     }
 
     fn unsubscribe(&self, subscriber_id: u64) {
         self.state.lock().subscribers.remove(&subscriber_id);
     }
+}
+
+/// Sends every cached message to one sender, chunked for the wire.
+/// Returns the count of messages that did not fit.
+fn replay_cached(state: &mut HubState, sender: &Sender<ServerMessage>) -> u64 {
+    let mut drops = 0u64;
+    for message in state.dashboard.values().cloned().collect::<Vec<_>>() {
+        let transfer_id = state.next_transfer_id;
+        state.next_transfer_id = state.next_transfer_id.saturating_add(1);
+        let mut failed = false;
+        for piece in split_for_wire(&message, transfer_id) {
+            if sender.try_send(piece).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            drops = drops.saturating_add(1);
+        }
+    }
+    drops
+}
+
+/// Serialized size of one wire message.
+fn wire_size(message: &ServerMessage) -> usize {
+    serde_json::to_vec(message)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// Splits a dashboard message for the wire: whole when it fits the chunk
+/// budget, sequenced chunks for the three large series variants. Anything
+/// else oversize crosses whole with a log line, since no chunk shape
+/// exists for it.
+fn split_for_wire(message: &ServerMessage, transfer_id: u64) -> Vec<ServerMessage> {
+    if wire_size(message) <= DASHBOARD_CHUNK_BUDGET_BYTES {
+        return vec![message.clone()];
+    }
+    match message {
+        ServerMessage::SignalSamplesUpdated {
+            environment_id,
+            signal_id,
+            points,
+        } => split_items(points, |group, index, count| {
+            ServerMessage::SignalSamplesChunk {
+                environment_id: environment_id.clone(),
+                signal_id: signal_id.clone(),
+                transfer_id,
+                chunk_index: index,
+                chunk_count: count,
+                points: group,
+            }
+        }),
+        ServerMessage::SignalRollupsUpdated {
+            environment_id,
+            signal_id,
+            points,
+        } => split_items(points, |group, index, count| {
+            ServerMessage::SignalRollupsChunk {
+                environment_id: environment_id.clone(),
+                signal_id: signal_id.clone(),
+                transfer_id,
+                chunk_index: index,
+                chunk_count: count,
+                points: group,
+            }
+        }),
+        ServerMessage::SignalSnapshotsUpdated {
+            environment_id,
+            snapshots,
+        } => split_items(snapshots, |group, index, count| {
+            ServerMessage::SignalSnapshotsChunk {
+                environment_id: environment_id.clone(),
+                transfer_id,
+                chunk_index: index,
+                chunk_count: count,
+                snapshots: group,
+            }
+        }),
+        _ => {
+            eprintln!(
+                "daku-daemon publish above chunk budget with no chunk shape: {} bytes for {:?}",
+                wire_size(message),
+                message
+                    .dashboard_cache_key()
+                    .as_deref()
+                    .unwrap_or("uncached"),
+            );
+            vec![message.clone()]
+        }
+    }
+}
+
+/// Splits `items` into groups whose serialized chunk messages fit the
+/// budget. Sizes up from the whole-message average, then keeps halving
+/// any grouping that still overflows, so uneven item sizes converge.
+fn split_items<T: Clone + serde::Serialize>(
+    items: &[T],
+    build: impl Fn(Vec<T>, u32, u32) -> ServerMessage,
+) -> Vec<ServerMessage> {
+    if items.is_empty() {
+        return vec![build(Vec::new(), 0, 1)];
+    }
+    let total = wire_size(&build(items.to_vec(), 0, 1));
+    let per_item = (total / items.len()).max(1);
+    let mut group_len = (DASHBOARD_CHUNK_BUDGET_BYTES / per_item).max(1);
+    for _ in 0..16 {
+        let groups = chunk_vec(items, group_len);
+        let count = groups.len() as u32;
+        let fits = groups.iter().enumerate().all(|(index, group)| {
+            wire_size(&build(group.clone(), index as u32, count)) <= DASHBOARD_CHUNK_BUDGET_BYTES
+        });
+        if fits {
+            return groups
+                .into_iter()
+                .enumerate()
+                .map(|(index, group)| build(group, index as u32, count))
+                .collect();
+        }
+        if group_len == 1 {
+            break;
+        }
+        group_len = (group_len / 2).max(1);
+    }
+    // Deeper pathology than halving fixes (one giant item): single-item
+    // groups, and the wire cap decides.
+    let groups = chunk_vec(items, 1);
+    let count = groups.len() as u32;
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, group)| build(group, index as u32, count))
+        .collect()
+}
+
+/// Consecutive groups of at most `len` items.
+fn chunk_vec<T: Clone>(items: &[T], len: usize) -> Vec<Vec<T>> {
+    items.chunks(len.max(1)).map(<[T]>::to_vec).collect()
 }
 
 pub fn serve(
@@ -295,7 +446,11 @@ fn handle_connection(
         .set_read_timeout(Some(SOCKET_POLL_INTERVAL))?;
 
     let (outgoing, outgoing_rx) = bounded(SUBSCRIBER_QUEUE_BOUND);
-    let subscriber_id = hub.subscribe(outgoing.clone());
+    let (subscriber_id, replay_drops) = hub.subscribe(outgoing.clone());
+    // A lossy replay must be learnable: retry the notice after each drain
+    // until it queues, since the same full queue that caused the drops
+    // would also drop a single best-effort send.
+    let mut pending_sync_drops = replay_drops;
 
     'connection: while !shutdown.load(Ordering::Acquire) {
         while let Ok(message) = outgoing_rx.try_recv() {
@@ -303,10 +458,25 @@ fn handle_connection(
                 break 'connection;
             }
         }
+        if pending_sync_drops > 0
+            && outgoing
+                .try_send(ServerMessage::DashboardSyncNeeded {
+                    dropped: pending_sync_drops,
+                })
+                .is_ok()
+        {
+            pending_sync_drops = 0;
+        }
         match socket.read() {
             Ok(Message::Text(text)) => match serde_json::from_str(text.as_ref()) {
                 Ok(ClientMessage::Request(request)) => {
-                    dispatch_request(request, outgoing.clone(), backend.clone());
+                    // Resync replays Hub state, which no backend owns, so
+                    // the serve loop answers it directly.
+                    if matches!(request.command, Command::RequestDashboardSync) {
+                        dispatch_resync(request, outgoing.clone(), hub.clone());
+                    } else {
+                        dispatch_request(request, outgoing.clone(), backend.clone());
+                    }
                 }
                 Ok(ClientMessage::Shutdown) => {
                     if options.allow_shutdown {
@@ -338,6 +508,21 @@ fn handle_connection(
     }
     hub.unsubscribe(subscriber_id);
     Ok(())
+}
+
+fn dispatch_resync(request: Request, outgoing: Sender<ServerMessage>, hub: Arc<Hub>) {
+    std::thread::Builder::new()
+        .name("daku-daemon-resync".into())
+        .spawn(move || {
+            hub.resync_to(&outgoing);
+            let _ = outgoing.send(ServerMessage::Response {
+                request_id: request.request_id,
+                outcome: ResponseOutcome::Ok {
+                    payload: ResponsePayload::Ack,
+                },
+            });
+        })
+        .ok();
 }
 
 fn dispatch_request(request: Request, outgoing: Sender<ServerMessage>, backend: Arc<dyn Backend>) {
@@ -456,7 +641,8 @@ mod tests {
     fn hub_publishes_to_existing_subscribers() {
         let hub = Hub::default();
         let (tx, rx) = unbounded();
-        hub.subscribe(tx);
+        let (_, replay_drops) = hub.subscribe(tx);
+        assert_eq!(replay_drops, 0);
         hub.publish_dashboard(ServerMessage::EnvironmentsUpdated {
             environments: vec![],
         });
@@ -482,7 +668,8 @@ mod tests {
             environments: vec![],
         });
         let (tx, rx) = unbounded();
-        hub.subscribe(tx);
+        let (_, replay_drops) = hub.subscribe(tx);
+        assert_eq!(replay_drops, 0);
         let replayed: Vec<ServerMessage> = rx.try_iter().collect();
         assert_eq!(replayed.len(), 2);
         assert!(matches!(
@@ -499,7 +686,7 @@ mod tests {
     fn hub_bounds_slow_subscribers_with_drop_counter() {
         let hub = Hub::default();
         let (tx, rx) = bounded(1);
-        hub.subscribe(tx);
+        let _ = hub.subscribe(tx);
         for _ in 0..5 {
             hub.publish_dashboard(ServerMessage::EnvironmentsUpdated {
                 environments: vec![],
@@ -514,7 +701,7 @@ mod tests {
     fn hub_removes_disconnected_subscribers() {
         let hub = Hub::default();
         let (tx, rx) = bounded::<ServerMessage>(8);
-        hub.subscribe(tx);
+        let _ = hub.subscribe(tx);
         drop(rx);
         hub.publish_dashboard(ServerMessage::EnvironmentsUpdated {
             environments: vec![],
@@ -534,7 +721,119 @@ mod tests {
         }
         let (tx, _rx) = bounded::<ServerMessage>(1);
         // Must return without blocking even though replay exceeds capacity.
-        hub.subscribe(tx);
+        let (_, replay_drops) = hub.subscribe(tx);
+        assert!(replay_drops >= 1);
         assert!(hub.state.lock().dropped >= 1);
+    }
+
+    #[test]
+    fn hub_chunks_oversize_rollups_within_budget() {
+        use daku_protocol::{DASHBOARD_CHUNK_BUDGET_BYTES, RollupPoint};
+        let hub = Hub::default();
+        let points: Vec<RollupPoint> = (0..6000)
+            .map(|hour| RollupPoint {
+                hour_start: 1_700_000_000 - hour * 3600,
+                avg_real: Some(2.5),
+                max_real: Some(9.0),
+                sample_count: 30,
+            })
+            .collect();
+        let whole = ServerMessage::SignalRollupsUpdated {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            points,
+        };
+        assert!(
+            serde_json::to_vec(&whole).unwrap().len() > DASHBOARD_CHUNK_BUDGET_BYTES,
+            "fixture must actually exceed the chunk budget"
+        );
+        let (tx, rx) = unbounded();
+        hub.subscribe(tx);
+        hub.publish_dashboard(whole);
+        let mut chunks = Vec::new();
+        for message in rx.try_iter() {
+            match message {
+                ServerMessage::SignalRollupsChunk {
+                    chunk_index,
+                    chunk_count,
+                    points,
+                    ..
+                } => chunks.push((chunk_index, chunk_count, points.len())),
+                other => panic!("oversize publish must arrive chunked, got {other:?}"),
+            }
+        }
+        assert!(chunks.len() > 1);
+        let count = chunks[0].1;
+        let total: usize = chunks.iter().map(|(_, _, len)| len).sum();
+        assert_eq!(total, 6000);
+        let mut indexes: Vec<u32> = chunks.iter().map(|(index, _, _)| *index).collect();
+        indexes.sort_unstable();
+        assert_eq!(
+            indexes,
+            (0..count).collect::<Vec<_>>(),
+            "chunks carry a complete 0..count sequence"
+        );
+    }
+
+    #[test]
+    fn hub_small_messages_cross_whole() {
+        let hub = Hub::default();
+        let (tx, rx) = unbounded();
+        hub.subscribe(tx);
+        hub.publish_dashboard(ServerMessage::SignalRollupsUpdated {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            points: vec![],
+        });
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerMessage::SignalRollupsUpdated { .. }
+        ));
+    }
+
+    #[test]
+    fn split_for_wire_keeps_every_piece_within_budget() {
+        use daku_protocol::{DASHBOARD_CHUNK_BUDGET_BYTES, SamplePoint};
+        let points: Vec<SamplePoint> = (0..20000)
+            .map(|at| SamplePoint {
+                observed_at: at,
+                value_real: Some(1.5),
+            })
+            .collect();
+        let whole = ServerMessage::SignalSamplesUpdated {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            points,
+        };
+        assert!(
+            serde_json::to_vec(&whole).unwrap().len() > DASHBOARD_CHUNK_BUDGET_BYTES,
+            "fixture must actually exceed the chunk budget"
+        );
+        let pieces = split_for_wire(&whole, 3);
+        assert!(pieces.len() > 1);
+        for piece in &pieces {
+            assert!(
+                serde_json::to_vec(piece).unwrap().len() <= DASHBOARD_CHUNK_BUDGET_BYTES,
+                "every piece must fit the budget"
+            );
+        }
+    }
+
+    #[test]
+    fn hub_resync_replays_cache_to_one_sender() {
+        let hub = Hub::default();
+        hub.publish_dashboard(ServerMessage::EnvironmentsUpdated {
+            environments: vec![],
+        });
+        hub.publish_dashboard(ServerMessage::SignalSnapshotsUpdated {
+            environment_id: "prod".into(),
+            snapshots: vec![],
+        });
+        let (tx, rx) = bounded::<ServerMessage>(16);
+        hub.resync_to(&tx);
+        let replayed: Vec<ServerMessage> = rx.try_iter().collect();
+        assert_eq!(replayed.len(), 2);
+        // Resync never registers the sender as a live subscriber.
+        assert!(hub.state.lock().subscribers.is_empty());
     }
 }

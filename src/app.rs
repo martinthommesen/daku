@@ -42,7 +42,7 @@ use crate::TogglePalette;
 use crate::ToggleSignalNotify;
 use crate::ToggleWeeklyDigest;
 use crate::dashboard_state::{
-    DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase, freshness,
+    DashboardState, DrillIn, SignalCard, TREND_WINDOW_LABEL, TrendWindow, age_phrase,
     is_trend_signal, is_voting_signal, mute_remaining_label, signal_label,
 };
 use crate::env_sheet::{
@@ -2264,7 +2264,11 @@ impl Daku {
                 // Disconnected or never polled: the label, the URL and the
                 // freshness line stay, but stale colours would contradict them.
                 let observed = self.state.connected() && environment.last_observed_at.is_some();
-                let fresh = freshness(environment.last_observed_at, unix_now());
+                let fresh = crate::dashboard_state::freshness_with_cadence(
+                    environment.last_observed_at,
+                    unix_now(),
+                    environment.poll_interval_secs.unwrap_or(120),
+                );
                 let fresh_color = if fresh.critical {
                     cx.theme().danger
                 } else if fresh.stale {

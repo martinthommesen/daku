@@ -35,6 +35,13 @@ fn main() -> anyhow::Result<()> {
     if arguments.diagnostics {
         return run_diagnostics_command(arguments.diagnostics_out.clone());
     }
+    if arguments.webhook_status {
+        return run_webhook_status_command();
+    }
+    if arguments.webhook_requeue {
+        let env_id = arguments.webhook_env.clone().unwrap_or_default();
+        return run_webhook_requeue_command(&env_id);
+    }
     let auth = require_token(std::env::var(DAEMON_TOKEN_ENV))?;
     // The bearer capability belongs only to this server process. Remove it
     // before any provider or workspace subprocess can inherit the daemon's
@@ -184,6 +191,9 @@ impl daku_core::Backend for CombinedBackend {
                 }
                 Ok(daku_protocol::ResponsePayload::Ack)
             }
+            Command::RequestDashboardSync => {
+                anyhow::bail!("resync requests are served by the serve loop")
+            }
         }
     }
 }
@@ -258,6 +268,79 @@ fn run_mcp_command() -> anyhow::Result<()> {
         ),
         &daku_core::default_environments_path(),
     )
+}
+
+/// Webhook delivery status per Environment: relay cursor, pending events
+/// newer than the cursor, and dead letters awaiting requeue. Read-only.
+fn run_webhook_status_command() -> anyhow::Result<()> {
+    let store = daku_core::persistence::StateStore::daemon(
+        daku_core::persistence::StateStore::default_path(),
+    );
+    let connection = store.open().context("could not open state store")?;
+    let environments =
+        daku_core::config::load_environments(&daku_core::default_environments_path())
+            .with_context(|| {
+                format!(
+                    "reading {}",
+                    daku_core::default_environments_path().display()
+                )
+            })?;
+    for environment in &environments {
+        let cursor =
+            daku_core::persistence::load_webhook_cursor(&connection, &environment.id)?.unwrap_or(0);
+        let pending =
+            daku_core::persistence::count_health_events_newer(&connection, &environment.id, cursor)
+                .unwrap_or(0);
+        let dead =
+            daku_core::persistence::load_webhook_dead_letter_count(&connection, &environment.id)
+                .unwrap_or(0);
+        println!(
+            "{}: cursor {cursor}, {pending} pending, {dead} dead letters",
+            environment.id
+        );
+    }
+    Ok(())
+}
+
+/// Requeues one Environment's dead letters: the cursor moves below the
+/// oldest dead letter and the dead letters clear, so the relay reposts
+/// the surviving events on its next tick. Events already pruned from
+/// retention are reported, not silently skipped.
+fn run_webhook_requeue_command(environment_id: &str) -> anyhow::Result<()> {
+    let environments =
+        daku_core::config::load_environments(&daku_core::default_environments_path())
+            .with_context(|| {
+                format!(
+                    "reading {}",
+                    daku_core::default_environments_path().display()
+                )
+            })?;
+    if !environments
+        .iter()
+        .any(|environment| environment.id == environment_id)
+    {
+        bail!("unknown environment {environment_id}");
+    }
+    let store = daku_core::persistence::StateStore::daemon(
+        daku_core::persistence::StateStore::default_path(),
+    );
+    let connection = store.open().context("could not open state store")?;
+    let report = daku_core::persistence::requeue_webhook_dead_letters(&connection, environment_id)?;
+    if report.cleared == 0 {
+        println!("{environment_id}: no dead letters to requeue");
+        return Ok(());
+    }
+    println!(
+        "{environment_id}: cursor reset to {}, {} dead letters cleared for redelivery",
+        report.reset_to, report.cleared
+    );
+    if report.missing > 0 {
+        println!(
+            "{environment_id}: {} dead letters already left retention and cannot redeliver",
+            report.missing
+        );
+    }
+    Ok(())
 }
 
 /// Non-interactive onboarding: validates, probes (unless `--no-probe`),
@@ -401,6 +484,18 @@ fn run_doctor_command(fix: bool, check_roles: bool, arguments: &Arguments) -> an
         "ticks: {} recorded, {} overruns",
         report.tick_count, report.tick_overruns
     );
+    println!(
+        "delivery: {} dashboard bytes, {} throttled signals in window",
+        report.tick_publish_bytes, report.tick_throttled
+    );
+    if let Some((environment_id, duration_ms)) = &report.slowest_env {
+        println!("slowest environment: {environment_id} ({duration_ms} ms)");
+    }
+    let webhook_pending: i64 = report.rows.iter().map(|row| row.webhook_pending).sum();
+    let webhook_dead: i64 = report.rows.iter().map(|row| row.webhook_dead_letters).sum();
+    if webhook_pending > 0 || webhook_dead > 0 {
+        println!("webhook: {webhook_pending} pending, {webhook_dead} dead letters");
+    }
     for row in &report.rows {
         println!("{}", format_doctor_row(row));
     }
@@ -455,7 +550,7 @@ fn format_doctor_row(row: &daku_core::DoctorRow) -> String {
         (false, Some(error)) => format!("credential: ERROR {error}"),
     };
     format!(
-        "{} ({}) [{}] · {} · {} {} · build {} · {} ms{} · thresholds {}{}",
+        "{} ({}) [{}] · {} · {} {} · build {} · {} ms{} · thresholds {}{}{}",
         row.id,
         row.label,
         row.platform,
@@ -471,6 +566,16 @@ fn format_doctor_row(row: &daku_core::DoctorRow) -> String {
         row.thresholds,
         if row.expected_drift > 0 {
             format!(" · expected drift {}", row.expected_drift)
+        } else {
+            String::new()
+        },
+        if row.webhook_dead_letters > 0 {
+            format!(
+                " · webhook {} pending, {} dead",
+                row.webhook_pending, row.webhook_dead_letters
+            )
+        } else if row.webhook_pending > 0 {
+            format!(" · webhook {} pending", row.webhook_pending)
         } else {
             String::new()
         },
@@ -536,6 +641,9 @@ struct Arguments {
     setup_credential_file: Option<std::path::PathBuf>,
     setup_no_probe: bool,
     rotate_credential: bool,
+    webhook_status: bool,
+    webhook_requeue: bool,
+    webhook_env: Option<String>,
     credential_store: Option<String>,
     credential_file: Option<std::path::PathBuf>,
     digest_env: Option<String>,
@@ -566,6 +674,9 @@ impl Arguments {
         let mut setup_credential_file = None;
         let mut setup_no_probe = false;
         let mut rotate_credential = false;
+        let mut webhook_status = false;
+        let mut webhook_requeue = false;
+        let mut webhook_env = None;
         let mut credential_store = None;
         let mut credential_file = None;
         let mut digest_env = None;
@@ -587,6 +698,12 @@ impl Arguments {
                 }
                 "rotate-credential" => {
                     rotate_credential = true;
+                }
+                "webhook-status" => {
+                    webhook_status = true;
+                }
+                "webhook-requeue" => {
+                    webhook_requeue = true;
                 }
                 "--out" => {
                     diagnostics_out = Some(std::path::PathBuf::from(
@@ -655,13 +772,13 @@ impl Arguments {
                     digest_env = Some(String::new());
                 }
                 "--env" => {
-                    // Order-free: end validation decides whether digest or
-                    // rotate-credential owns this flag.
-                    digest_env = Some(
-                        arguments
-                            .next()
-                            .ok_or_else(|| anyhow!("--env requires an environment id"))?,
-                    );
+                    // Order-free: end validation decides whether digest,
+                    // rotate-credential, or webhook-requeue owns this flag.
+                    let id = arguments
+                        .next()
+                        .ok_or_else(|| anyhow!("--env requires an environment id"))?;
+                    digest_env = Some(id.clone());
+                    webhook_env = Some(id);
                 }
                 "--days" => {
                     digest_days = arguments
@@ -717,7 +834,7 @@ impl Arguments {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [probe-availability] [doctor [--fix] [--check-roles]] [digest --env ID [--days N]] [diagnostics [--out DIR]] [mcp] [setup --id ID --url URL [--label LABEL] [--platform servicenow|http|github] [--auth basic|oauth] [--clone-source] [--secret-file PATH] [--no-probe]] [rotate-credential --env ID --secret-file PATH [--no-probe]] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
+                        "usage: {} [probe-availability] [doctor [--fix] [--check-roles]] [digest --env ID [--days N]] [diagnostics [--out DIR]] [mcp] [setup --id ID --url URL [--label LABEL] [--platform servicenow|http|github] [--auth basic|oauth] [--clone-source] [--secret-file PATH] [--no-probe]] [rotate-credential --env ID --secret-file PATH [--no-probe]] [webhook-status] [webhook-requeue --env ID] [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--credential-store keychain|file] [--credential-file PATH]",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -734,8 +851,11 @@ impl Arguments {
         if digest_env.is_some() && digest_env.as_deref().is_some_and(|id| id.is_empty()) {
             bail!("--env requires an environment id");
         }
-        if digest_env.is_some() && !digest_command && !rotate_credential {
-            bail!("--env requires digest or rotate-credential");
+        if digest_env.is_some() && !digest_command && !rotate_credential && !webhook_requeue {
+            bail!("--env requires digest, rotate-credential, or webhook-requeue");
+        }
+        if webhook_requeue && webhook_env.as_deref().is_none_or(|id| id.is_empty()) {
+            bail!("webhook-requeue requires --env <id>");
         }
         if setup_credential_file.is_some() && !setup && !rotate_credential {
             bail!("--secret-file requires setup or rotate-credential");
@@ -791,6 +911,9 @@ impl Arguments {
             setup_credential_file,
             setup_no_probe,
             rotate_credential,
+            webhook_status,
+            webhook_requeue,
+            webhook_env,
         })
     }
 }
@@ -903,6 +1026,19 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/d.json"))
         );
         assert!(Arguments::parse(["--out".into(), "/tmp/d.json".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_webhook_status_and_requeue() {
+        let arguments = Arguments::parse(["webhook-status".into()]).unwrap();
+        assert!(arguments.webhook_status);
+        assert!(!arguments.webhook_requeue);
+        let arguments =
+            Arguments::parse(["webhook-requeue".into(), "--env".into(), "prod".into()]).unwrap();
+        assert!(arguments.webhook_requeue);
+        assert_eq!(arguments.webhook_env.as_deref(), Some("prod"));
+        assert!(Arguments::parse(["webhook-requeue".into()]).is_err());
+        assert!(Arguments::parse(["--env".into(), "prod".into()]).is_err());
     }
 
     #[test]
@@ -1097,6 +1233,8 @@ mod tests {
             rtt_ms: 12,
             thresholds: daku_core::config::Thresholds::default().summary(),
             expected_drift: 0,
+            webhook_pending: 0,
+            webhook_dead_letters: 0,
         }
     }
 
@@ -1110,6 +1248,28 @@ mod tests {
             format_doctor_row(&doctor_row(true)).contains("thresholds jobs"),
             "doctor prints effective thresholds"
         );
+    }
+
+    #[test]
+    fn format_doctor_row_shows_webhook_backlog_only_when_present() {
+        assert!(
+            !format_doctor_row(&doctor_row(true)).contains("webhook"),
+            "quiet relays stay out of the row"
+        );
+        let pending = daku_core::DoctorRow {
+            webhook_pending: 3,
+            ..doctor_row(true)
+        };
+        let line = format_doctor_row(&pending);
+        assert!(line.contains("webhook 3 pending"), "{line}");
+        assert!(!line.contains("dead"), "{line}");
+        let dead = daku_core::DoctorRow {
+            webhook_pending: 3,
+            webhook_dead_letters: 2,
+            ..doctor_row(true)
+        };
+        let line = format_doctor_row(&dead);
+        assert!(line.contains("webhook 3 pending, 2 dead"), "{line}");
     }
 
     #[test]

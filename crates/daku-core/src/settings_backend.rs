@@ -44,7 +44,8 @@ impl Backend for SettingsBackend {
             | Command::DeleteEnvironment { .. }
             | Command::TestEnvironment { .. }
             | Command::GetDigest { .. }
-            | Command::AddHealthEventNote { .. } => {
+            | Command::AddHealthEventNote { .. }
+            | Command::RequestDashboardSync => {
                 anyhow::bail!("command is served by another backend")
             }
         }

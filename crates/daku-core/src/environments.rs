@@ -113,6 +113,9 @@ impl Backend for EnvironmentsBackend {
             Command::AddHealthEventNote { .. } => {
                 bail!("notes are served by the digest handler")
             }
+            Command::RequestDashboardSync => {
+                bail!("resync requests are served by the serve loop")
+            }
         }
     }
 }

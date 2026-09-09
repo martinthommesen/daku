@@ -18,11 +18,11 @@ pub use payload::{
     skipped_reason,
 };
 pub use protocol::{
-    APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
-    EnvironmentHealth, EnvironmentSummary, HealthEventDto, HealthEventKind, MAX_WIRE_MESSAGE_BYTES,
-    PROTOCOL_VERSION, Reachability, Request, ResponseOutcome, ResponsePayload, RollupPoint,
-    RpcError, SamplePoint, ServerMessage, SignalEventDto, SignalSnapshotDto, SignalState,
-    environment_id_error, instance_url_error, is_supported_environment_id,
-    is_supported_instance_url,
+    APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV,
+    DASHBOARD_CHUNK_BUDGET_BYTES, DaemonReady, EnvironmentHealth, EnvironmentSummary,
+    HealthEventDto, HealthEventKind, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, Reachability,
+    Request, ResponseOutcome, ResponsePayload, RollupPoint, RpcError, SamplePoint, ServerMessage,
+    SignalEventDto, SignalSnapshotDto, SignalState, environment_id_error, instance_url_error,
+    is_supported_environment_id, is_supported_instance_url,
 };
 pub use settings::DaemonSettings;

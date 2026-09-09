@@ -95,6 +95,14 @@ Optional poll cadence: put a top-level `"poll_interval_secs"` in `~/.daku/settin
     granted/denied with the minimal role). `daku-daemon diagnostics [--out DIR]`
     writes a redacted bundle (config without secrets, scrubbed log tail,
     database census) for tickets and debugging — offline by design.
+    Webhook delivery failures land in a bounded per-Environment dead-letter
+    store (500 kept): `daku-daemon webhook-status` shows relay cursors,
+    pending events, and dead letters, and `daku-daemon webhook-requeue --env <id>`
+    resets the cursor below the oldest dead letter so the relay reposts the
+    surviving events. Delivery stays on the in-tick relay by design; a
+    dedicated outbox worker is adopted only if doctor shows dead letters
+    growing across releases with sustained pending backlog on an endpoint
+    that is otherwise reachable.
 2. Add an Environment from the app menu (daku → Add Environment…): label, `https://` URL, auth method, Credential, thresholds (empty means default), and expected-drift ids — Test dry-runs the probe, Save writes `~/.daku/environments.json` (0600) and the Keychain item, then reloads. Editing works from the Environment header (Edit); deleting asks twice. The sheet refuses malformed URLs, bad threshold numbers, and mismatched Credential shapes before anything is written.
 2. Prefer OAuth (`{"client_id":"…","client_secret":"…"}`), basic only for PDI stand-ins (`{"username":"…","password":"…"}`). Hand-editing stays supported: copy [`environments.example.json`](environments.example.json) to `~/.daku/environments.json` (`chmod 600` it) and store Credentials with `security add-generic-password -U -s daku -a <id> -w` (with `-w` last so the shell prompts — the secret never lands in history). Press ⌘R after hand-editing. Daemon diagnostics (missing config, Keychain misses, HTTP errors) are appended to `~/.daku/daemon.log`. Do not commit URLs or secrets.
 

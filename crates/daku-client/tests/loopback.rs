@@ -267,3 +267,99 @@ fn remote_supervisor_refuses_reload() {
     let ack = supervisor.client().request(Command::Ping).unwrap();
     assert!(matches!(ack, ResponsePayload::Ack), "unexpected {ack:?}");
 }
+
+#[test]
+fn oversize_rollups_arrive_reassembled_over_the_socket() {
+    use daku_protocol::RollupPoint;
+    let daemon = Daemon::start(false, &[]);
+    let client = daemon.connect();
+    let events = client.subscribe_dashboard();
+    let points: Vec<RollupPoint> = (0..6000)
+        .map(|hour| RollupPoint {
+            hour_start: 1_700_000_000 - hour * 3600,
+            avg_real: Some(2.5),
+            max_real: Some(9.0),
+            sample_count: 30,
+        })
+        .collect();
+    daemon
+        .dashboard
+        .send(ServerMessage::SignalRollupsUpdated {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            points,
+        })
+        .unwrap();
+    // Chunks never reach subscribers: the client reassembles first, so the
+    // first rollups message off the socket is already the whole series.
+    let message = recv_within(&events, WAIT).expect("reassembled rollups");
+    match message {
+        ServerMessage::SignalRollupsUpdated { points, .. } => {
+            assert_eq!(points.len(), 6000);
+            assert_eq!(points[0].avg_real, Some(2.5));
+        }
+        other => panic!("oversize publish must arrive whole, got {other:?}"),
+    }
+}
+
+#[test]
+fn lossy_replay_ends_with_a_sync_notice() {
+    // The subscriber queue bound is 512 by contract — size the cache well
+    // past it instead of reaching into daku-core for the constant.
+    const OVER: usize = 600;
+    let daemon = Daemon::start(false, &[]);
+    for index in 0..OVER {
+        daemon
+            .dashboard
+            .send(ServerMessage::SignalSnapshotsUpdated {
+                environment_id: format!("env-{index}"),
+                snapshots: vec![],
+            })
+            .unwrap();
+    }
+    // Let the Hub cache all 600 before subscribing: replay then runs
+    // synchronously inside subscribe, before the connection loop drains,
+    // so exactly OVER - 512 messages drop, deterministically.
+    std::thread::sleep(Duration::from_millis(1000));
+    // Raw socket: replay runs synchronously at subscribe, before this
+    // reader drains, so the bounded queue must drop and the notice that
+    // follows the drain must arrive.
+    let (mut socket, _) = tungstenite::connect(daemon.url("/v1")).unwrap();
+    let hello = serde_json::to_string(&ClientMessage::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        token: TOKEN.to_owned(),
+        client_id: Uuid::new_v4(),
+    })
+    .unwrap();
+    socket
+        .send(tungstenite::Message::Text(hello.into()))
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    // Bound the whole wait on the socket itself: a missing notice must
+    // fail the test, not hang the suite.
+    match socket.get_mut() {
+        tungstenite::stream::MaybeTlsStream::Plain(stream) => {
+            stream.set_read_timeout(Some(WAIT)).unwrap();
+        }
+        _ => panic!("loopback test uses plain ws"),
+    }
+    let mut saw_sync = None;
+    while Instant::now() < deadline {
+        let message = match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => {
+                serde_json::from_str::<ServerMessage>(text.as_ref()).unwrap()
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        };
+        if let ServerMessage::DashboardSyncNeeded { dropped } = message {
+            saw_sync = Some(dropped);
+            break;
+        }
+    }
+    assert_eq!(
+        saw_sync,
+        Some((OVER - 512) as u64),
+        "lossy replay must end with an exact sync notice"
+    );
+}

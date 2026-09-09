@@ -4,8 +4,12 @@ use uuid::Uuid;
 use crate::environment::{AuthMethod, EnvironmentConfig, Thresholds};
 use crate::settings::DaemonSettings;
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
+/// Serialized budget for one dashboard chunk on the wire. Small enough to
+/// stay far inside the wire cap with framing headroom, large enough that a
+/// 90-day rollup series crosses in a handful of chunks.
+pub const DASHBOARD_CHUNK_BUDGET_BYTES: usize = 256 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "DAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "DAKU_DAEMON_ADDRESS";
 pub const APP_EXECUTABLE_ENV: &str = "DAKU_APP_EXECUTABLE";
@@ -77,6 +81,12 @@ pub enum Command {
         /// Falls back to the stored item when `None`.
         credential_json: Option<String>,
     },
+    /// Asks the daemon to replay its full cached dashboard state to this
+    /// connection as chunks. Answered with `Ack` once the replay is
+    /// queued; the replayed state itself arrives as dashboard messages.
+    /// Intercepted by the serve loop before backend dispatch, since replay
+    /// state belongs to the Hub, not to any backend.
+    RequestDashboardSync,
     /// Renders a Markdown digest of one Environment's local history
     /// (transitions, builds, current states). Read-only; backs the weekly
     /// digest notification and any future digest surface.
@@ -206,6 +216,11 @@ pub struct EnvironmentSummary {
     pub thresholds: Thresholds,
     pub expected_drift: Vec<String>,
     pub sort_order: i64,
+    /// Effective daemon poll cadence in seconds, for cadence-aware
+    /// freshness thresholds. `None` from older daemons: clients fall back
+    /// to the fixed constants.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
 }
 
 /// ADR-0004: Environment URLs carry Credentials on every request, so they are
@@ -385,6 +400,42 @@ pub enum ServerMessage {
         signal_id: String,
         points: Vec<RollupPoint>,
     },
+    /// One sequenced piece of a large `SignalSamplesUpdated` payload.
+    /// Chunks are never cached and never applied alone: the client
+    /// reassembles `chunk_count` pieces of `transfer_id` into the whole
+    /// message first. Reassembly lives in `daku-client`, so desktop state
+    /// only ever sees complete messages.
+    SignalSamplesChunk {
+        environment_id: String,
+        signal_id: String,
+        transfer_id: u64,
+        chunk_index: u32,
+        chunk_count: u32,
+        points: Vec<SamplePoint>,
+    },
+    /// Chunked form of `SignalRollupsUpdated`. Same reassembly contract.
+    SignalRollupsChunk {
+        environment_id: String,
+        signal_id: String,
+        transfer_id: u64,
+        chunk_index: u32,
+        chunk_count: u32,
+        points: Vec<RollupPoint>,
+    },
+    /// Chunked form of `SignalSnapshotsUpdated`. Same reassembly contract.
+    SignalSnapshotsChunk {
+        environment_id: String,
+        transfer_id: u64,
+        chunk_index: u32,
+        chunk_count: u32,
+        snapshots: Vec<SignalSnapshotDto>,
+    },
+    /// A lossy replay dropped `dropped` cached messages for this
+    /// connection. The client answers once with `RequestDashboardSync`;
+    /// the next live tick converges regardless.
+    DashboardSyncNeeded {
+        dropped: u64,
+    },
     ShuttingDown,
 }
 
@@ -414,6 +465,12 @@ impl ServerMessage {
                 signal_id,
                 ..
             } => Some(format!("4:rollups:{environment_id}:{signal_id}")),
+            // Chunks and sync control are transport, never state: they are
+            // never cached and never replayed.
+            Self::SignalSamplesChunk { .. }
+            | Self::SignalRollupsChunk { .. }
+            | Self::SignalSnapshotsChunk { .. }
+            | Self::DashboardSyncNeeded { .. } => None,
             _ => None,
         }
     }
@@ -547,6 +604,7 @@ mod tests {
                 thresholds: crate::environment::Thresholds::default(),
                 expected_drift: Vec::new(),
                 sort_order: 0,
+                poll_interval_secs: Some(120),
             }],
         };
         let json = serde_json::to_value(&message).unwrap();
@@ -631,7 +689,89 @@ mod tests {
 
     #[test]
     fn protocol_version_is_daku_domain() {
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
+    }
+
+    #[test]
+    fn chunk_and_sync_variants_round_trip() {
+        let chunk = ServerMessage::SignalRollupsChunk {
+            environment_id: "prod".into(),
+            signal_id: "jobs".into(),
+            transfer_id: 7,
+            chunk_index: 1,
+            chunk_count: 3,
+            points: vec![RollupPoint {
+                hour_start: 1_700_000_000,
+                avg_real: Some(2.5),
+                max_real: Some(4.0),
+                sample_count: 30,
+            }],
+        };
+        let json = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(json["type"], "signalRollupsChunk");
+        assert_eq!(json["chunkIndex"], 1);
+        assert_eq!(json["chunkCount"], 3);
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::SignalRollupsChunk { chunk_count: 3, .. }
+        ));
+        let sync = ServerMessage::DashboardSyncNeeded { dropped: 4 };
+        let json = serde_json::to_value(&sync).unwrap();
+        assert_eq!(json["type"], "dashboardSyncNeeded");
+        let back: ServerMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back,
+            ServerMessage::DashboardSyncNeeded { dropped: 4 }
+        ));
+        let command = Command::RequestDashboardSync;
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["type"], "requestDashboardSync");
+        let back: Command = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, Command::RequestDashboardSync));
+    }
+
+    #[test]
+    fn chunks_and_sync_control_are_never_cached() {
+        assert_eq!(
+            ServerMessage::SignalSamplesChunk {
+                environment_id: "prod".into(),
+                signal_id: "jobs".into(),
+                transfer_id: 1,
+                chunk_index: 0,
+                chunk_count: 1,
+                points: Vec::new(),
+            }
+            .dashboard_cache_key(),
+            None
+        );
+        assert_eq!(
+            ServerMessage::SignalRollupsChunk {
+                environment_id: "prod".into(),
+                signal_id: "jobs".into(),
+                transfer_id: 1,
+                chunk_index: 0,
+                chunk_count: 1,
+                points: Vec::new(),
+            }
+            .dashboard_cache_key(),
+            None
+        );
+        assert_eq!(
+            ServerMessage::SignalSnapshotsChunk {
+                environment_id: "prod".into(),
+                transfer_id: 1,
+                chunk_index: 0,
+                chunk_count: 1,
+                snapshots: Vec::new(),
+            }
+            .dashboard_cache_key(),
+            None
+        );
+        assert_eq!(
+            ServerMessage::DashboardSyncNeeded { dropped: 1 }.dashboard_cache_key(),
+            None
+        );
     }
 
     #[test]

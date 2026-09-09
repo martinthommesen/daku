@@ -151,20 +151,45 @@ fn wire_reachability(payload_json: &str) -> Reachability {
     parse_reachability(&value)
 }
 
+/// What one `publish_dashboard` pass measured, for tick telemetry. Kept
+/// separate from `PublishOut` (the pure decision plan): this is observed
+/// delivery cost, recorded best-effort after the send.
+pub struct PublishSummary {
+    /// Serialized bytes across every message sent this publish.
+    pub bytes: u64,
+    /// Snapshots whose payload carries the throttled flag.
+    pub throttled: u64,
+}
+
 pub fn publish_dashboard(
     environments: &[EnvironmentConfig],
     store: &StateStore,
     sink: &Sender<ServerMessage>,
     now: i64,
-) -> anyhow::Result<()> {
+    poll_interval_secs: u64,
+) -> anyhow::Result<PublishSummary> {
     let connection = store.open().context("open state store for dashboard")?;
     let snapshots = persistence::load_all_signal_snapshots(&connection)?;
     let cutoff = now.saturating_sub(SAMPLE_RETENTION_SECS);
+    let mut summary = PublishSummary {
+        bytes: 0,
+        throttled: 0,
+    };
+    /// Sends one dashboard message while accounting its wire cost.
+    fn emit(sink: &Sender<ServerMessage>, summary: &mut PublishSummary, message: ServerMessage) {
+        summary.bytes = summary
+            .bytes
+            .saturating_add(serde_json::to_vec(&message).map(|v| v.len()).unwrap_or(0) as u64);
+        let _ = sink.send(message);
+    }
     // One grouping pass: every per-Environment step below reuses it instead
     // of re-scanning the full snapshot vector twice per Environment.
     let mut by_environment: std::collections::HashMap<&str, Vec<_>> =
         std::collections::HashMap::new();
     for snapshot in &snapshots {
+        if payload_is_throttled(&snapshot.payload_json) {
+            summary.throttled = summary.throttled.saturating_add(1);
+        }
         by_environment
             .entry(snapshot.environment_id.as_str())
             .or_default()
@@ -207,13 +232,18 @@ pub fn publish_dashboard(
                 thresholds: environment.thresholds.clone(),
                 expected_drift: environment.expected_drift.clone(),
                 sort_order: environment.sort_order,
+                poll_interval_secs: Some(poll_interval_secs.max(1)),
             },
             environment: environment.clone(),
         });
     }
-    let _ = sink.send(ServerMessage::EnvironmentsUpdated {
-        environments: published.iter().map(|item| item.summary.clone()).collect(),
-    });
+    emit(
+        sink,
+        &mut summary,
+        ServerMessage::EnvironmentsUpdated {
+            environments: published.iter().map(|item| item.summary.clone()).collect(),
+        },
+    );
 
     for item in &published {
         let environment = &item.environment;
@@ -229,10 +259,14 @@ pub fn publish_dashboard(
                 payload_json: snapshot.payload_json.clone(),
             })
             .collect();
-        let _ = sink.send(ServerMessage::SignalSnapshotsUpdated {
-            environment_id: environment.id.clone(),
-            snapshots: env_snaps,
-        });
+        emit(
+            sink,
+            &mut summary,
+            ServerMessage::SignalSnapshotsUpdated {
+                environment_id: environment.id.clone(),
+                snapshots: env_snaps,
+            },
+        );
         for signal_id in TREND_SIGNALS {
             let points = persistence::load_signal_samples(&connection, &environment.id, signal_id)?
                 .into_iter()
@@ -242,11 +276,15 @@ pub fn publish_dashboard(
                     value_real: sample.value_real,
                 })
                 .collect();
-            let _ = sink.send(ServerMessage::SignalSamplesUpdated {
-                environment_id: environment.id.clone(),
-                signal_id: signal_id.to_owned(),
-                points,
-            });
+            emit(
+                sink,
+                &mut summary,
+                ServerMessage::SignalSamplesUpdated {
+                    environment_id: environment.id.clone(),
+                    signal_id: signal_id.to_owned(),
+                    points,
+                },
+            );
             // One idempotent recompute of the current hour bucket, then the
             // bounded 90-day series. Raw 24 h samples are untouched.
             let hour_start = now - now % ROLLUP_BUCKET_SECS;
@@ -265,11 +303,15 @@ pub fn publish_dashboard(
                 sample_count: rollup.sample_count,
             })
             .collect();
-            let _ = sink.send(ServerMessage::SignalRollupsUpdated {
-                environment_id: environment.id.clone(),
-                signal_id: signal_id.to_owned(),
-                points: rollups,
-            });
+            emit(
+                sink,
+                &mut summary,
+                ServerMessage::SignalRollupsUpdated {
+                    environment_id: environment.id.clone(),
+                    signal_id: signal_id.to_owned(),
+                    points: rollups,
+                },
+            );
         }
         persistence::prune_signal_rollups(&connection, now)?;
         let events = persistence::load_health_events(
@@ -292,10 +334,14 @@ pub fn publish_dashboard(
             })
         })
         .collect();
-        let _ = sink.send(ServerMessage::HealthEventsUpdated {
-            environment_id: environment.id.clone(),
-            events,
-        });
+        emit(
+            sink,
+            &mut summary,
+            ServerMessage::HealthEventsUpdated {
+                environment_id: environment.id.clone(),
+                events,
+            },
+        );
         let signal_events = persistence::load_signal_events(
             &connection,
             &environment.id,
@@ -311,12 +357,26 @@ pub fn publish_dashboard(
             })
         })
         .collect();
-        let _ = sink.send(ServerMessage::SignalEventsUpdated {
-            environment_id: environment.id.clone(),
-            events: signal_events,
-        });
+        emit(
+            sink,
+            &mut summary,
+            ServerMessage::SignalEventsUpdated {
+                environment_id: environment.id.clone(),
+                events: signal_events,
+            },
+        );
     }
-    Ok(())
+    Ok(summary)
+}
+
+/// Whether a persisted snapshot payload marks its drill-in rows as
+/// throttled (HTTP 429 after the retry budget). Read at publish time so
+/// tick telemetry can count pressure without probe plumbing.
+fn payload_is_throttled(payload_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload_json)
+        .ok()
+        .and_then(|value| value.get("throttled")?.as_bool())
+        .unwrap_or(false)
 }
 
 /// Build string from an availability snapshot payload, if the probe read one.
@@ -695,7 +755,7 @@ mod tests {
     fn published_health_events(store: &StateStore, now: i64) -> Vec<HealthEventDto> {
         use crossbeam_channel::unbounded;
         let (tx, rx) = unbounded();
-        publish_dashboard(&[prod()], store, &tx, now).unwrap();
+        publish_dashboard(&[prod()], store, &tx, now, 120).unwrap();
         let mut events = Vec::new();
         while let Ok(message) = rx.try_recv() {
             if let ServerMessage::HealthEventsUpdated {
@@ -950,7 +1010,7 @@ mod tests {
         .unwrap();
 
         let (tx, rx) = unbounded();
-        publish_dashboard(&[prod()], &store, &tx, now).unwrap();
+        publish_dashboard(&[prod()], &store, &tx, now, 120).unwrap();
 
         let mut environments = None;
         let mut snapshots = None;

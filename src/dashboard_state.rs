@@ -134,9 +134,10 @@ fn encode_query(path: &str) -> String {
         .collect()
 }
 
-/// Older than this and the header tints "polled … ago" as stale.
-// ponytail: fixed threshold (2.5x default cadence); put poll_interval_secs on
-// EnvironmentsUpdated if Operators start tuning cadence.
+/// Stale and critical floors: below these the numbers on screen are always
+/// treated as current or history respectively, whatever the cadence.
+/// Stale derives from the daemon's effective cadence (2.5 polls missed);
+/// critical stays one hour for the default cadence and scales only upward.
 pub const STALE_AFTER_SECS: i64 = 300;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,10 +150,26 @@ pub struct Freshness {
 
 const CRITICAL_AFTER_SECS: i64 = 3600;
 
-/// "polled 42 s ago" / "polled 3 min ago" / "polled 2 h ago" for the selected
-/// Environment. An Environment with no observation yet reads "never polled" and
-/// is stale by definition — daku has not contacted it.
-pub fn freshness(last_observed_at: Option<i64>, now: i64) -> Freshness {
+/// Stale threshold for one poll cadence: two-and-a-half missed polls, never
+/// below the product floor. At the 120 s default this is exactly 300 s, so
+/// current labels are byte-identical.
+pub fn stale_after_secs(poll_interval_secs: u64) -> i64 {
+    (STALE_AFTER_SECS).max((poll_interval_secs as i64).saturating_mul(5) / 2)
+}
+
+/// Critical threshold for one poll cadence: thirty missed polls, never
+/// below one hour. At the 120 s default this is exactly 3600 s.
+pub fn critical_after_secs(poll_interval_secs: u64) -> i64 {
+    (CRITICAL_AFTER_SECS).max((poll_interval_secs as i64).saturating_mul(30))
+}
+
+/// `freshness` with the daemon's effective poll cadence. Summaries from
+/// older daemons carry no cadence and fall back to the 120 s default.
+pub fn freshness_with_cadence(
+    last_observed_at: Option<i64>,
+    now: i64,
+    poll_interval_secs: u64,
+) -> Freshness {
     let Some(last_observed_at) = last_observed_at else {
         return Freshness {
             label: "never polled".to_owned(),
@@ -170,8 +187,8 @@ pub fn freshness(last_observed_at: Option<i64>, now: i64) -> Freshness {
     };
     Freshness {
         label,
-        stale: age > STALE_AFTER_SECS,
-        critical: age > CRITICAL_AFTER_SECS,
+        stale: age > stale_after_secs(poll_interval_secs),
+        critical: age > critical_after_secs(poll_interval_secs),
     }
 }
 
@@ -209,6 +226,10 @@ pub struct DashboardState {
     /// (`104`). The 24 h raw samples in `samples` are untouched.
     rollups: HashMap<(String, String), Vec<RollupPoint>>,
     trend_window: TrendWindow,
+    /// Replay messages the daemon could not fit into the last catch-up,
+    /// from the most recent sync-needed notice. The client already asked
+    /// for a resync; this records that state was lossy in between.
+    sync_drops: u64,
 }
 
 /// Trend range for the drill-in sparklines. 24 h reads the raw samples the
@@ -582,8 +603,17 @@ impl DashboardState {
                 self.rollups
                     .insert((environment_id.clone(), signal_id.clone()), points.clone());
             }
+            ServerMessage::DashboardSyncNeeded { dropped } => {
+                self.sync_drops = *dropped;
+            }
             _ => {}
         }
+    }
+
+    /// Replay messages lost in the last catch-up, from the most recent
+    /// sync-needed notice. Zero means the last replay was complete.
+    pub fn sync_drops(&self) -> u64 {
+        self.sync_drops
     }
 
     pub fn select(&mut self, id: &str) {
@@ -679,7 +709,11 @@ impl DashboardState {
             EnvironmentHealth::Down => "down",
             EnvironmentHealth::Waiting => "waiting",
         };
-        let fresh = freshness(selected.last_observed_at, now);
+        let fresh = freshness_with_cadence(
+            selected.last_observed_at,
+            now,
+            selected.poll_interval_secs.unwrap_or(120),
+        );
         let mut lines = vec![format!(
             "{} ({}) — {}{}{}",
             selected.id,
@@ -692,6 +726,12 @@ impl DashboardState {
             },
             format!(", {}", fresh.label),
         )];
+        if self.sync_drops() > 0 {
+            lines.push(format!(
+                "replay dropped {} messages; resync requested",
+                self.sync_drops()
+            ));
+        }
         for signal_id in signal_ids_for(&selected.platform_id).iter().copied() {
             let status = self
                 .snapshots
@@ -2687,6 +2727,7 @@ fn env(
         thresholds: daku_protocol::Thresholds::default(),
         expected_drift: Vec::new(),
         sort_order: 0,
+        poll_interval_secs: None,
     }
 }
 
@@ -4224,18 +4265,21 @@ mod tests {
 
     #[test]
     fn freshness_formats_seconds_minutes_hours() {
-        let now_secs = freshness(Some(1000), 1042);
+        let now_secs = freshness_with_cadence(Some(1000), 1042, 120);
         assert_eq!(now_secs.label, "polled 42 s ago");
         assert!(!now_secs.stale);
-        assert_eq!(freshness(Some(1000), 1000 + 180).label, "polled 3 min ago");
-        let hours = freshness(Some(1000), 1000 + 7200);
+        assert_eq!(
+            freshness_with_cadence(Some(1000), 1000 + 180, 120).label,
+            "polled 3 min ago"
+        );
+        let hours = freshness_with_cadence(Some(1000), 1000 + 7200, 120);
         assert_eq!(hours.label, "polled 2 h ago");
         assert!(hours.stale);
     }
 
     #[test]
     fn freshness_without_an_observation_says_never_polled() {
-        let never = freshness(None, 1_700_000_000);
+        let never = freshness_with_cadence(None, 1_700_000_000, 120);
         assert_eq!(never.label, "never polled");
         assert!(never.stale);
     }
@@ -4243,10 +4287,10 @@ mod tests {
     #[test]
     fn freshness_keeps_its_existing_labels() {
         let now = 1_700_000_000;
-        let recent = freshness(Some(now - 42), now);
+        let recent = freshness_with_cadence(Some(now - 42), now, 120);
         assert_eq!(recent.label, "polled 42 s ago");
         assert!(!recent.stale);
-        assert!(freshness(Some(now - 400), now).stale);
+        assert!(freshness_with_cadence(Some(now - 400), now, 120).stale);
     }
 
     #[test]
@@ -4273,8 +4317,57 @@ mod tests {
 
     #[test]
     fn freshness_stale_after_threshold() {
-        assert!(!freshness(Some(0), STALE_AFTER_SECS).stale);
-        assert!(freshness(Some(0), STALE_AFTER_SECS + 1).stale);
+        assert!(!freshness_with_cadence(Some(0), STALE_AFTER_SECS, 120).stale);
+        assert!(freshness_with_cadence(Some(0), STALE_AFTER_SECS + 1, 120).stale);
+    }
+
+    #[test]
+    fn sync_needed_records_replay_drops() {
+        let mut state = DashboardState::new();
+        assert_eq!(state.sync_drops(), 0);
+        state.apply(&ServerMessage::DashboardSyncNeeded { dropped: 4 });
+        assert_eq!(state.sync_drops(), 4);
+        state.apply(&ServerMessage::DashboardSyncNeeded { dropped: 0 });
+        assert_eq!(state.sync_drops(), 0);
+    }
+
+    #[test]
+    fn summary_text_notes_lossy_replay() {
+        let mut state = loaded();
+        let clean = state.summary_text(1_700_000_012);
+        assert!(!clean.contains("resync"), "{clean}");
+        state.apply(&ServerMessage::DashboardSyncNeeded { dropped: 4 });
+        let text = state.summary_text(1_700_000_012);
+        assert!(
+            text.contains("replay dropped 4 messages; resync requested"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn freshness_defaults_match_the_120s_cadence() {
+        // The derived thresholds at the default cadence are exactly the
+        // historical constants, so current labels cannot drift.
+        assert_eq!(stale_after_secs(120), STALE_AFTER_SECS);
+        assert_eq!(critical_after_secs(120), 3600);
+        let at_boundary = freshness_with_cadence(Some(0), 300, 120);
+        assert_eq!(at_boundary.label, "polled 5 min ago");
+        assert!(!at_boundary.stale);
+        assert!(!at_boundary.critical);
+        assert!(freshness_with_cadence(Some(0), 301, 120).stale);
+    }
+
+    #[test]
+    fn freshness_follows_configured_cadence_with_floors() {
+        // A 600 s cadence tolerates one missed poll without going stale.
+        assert!(!freshness_with_cadence(Some(0), 400, 600).stale);
+        assert!(freshness_with_cadence(Some(0), 1501, 600).stale);
+        // A 30 s cadence never goes stale before the product floor.
+        assert!(!freshness_with_cadence(Some(0), 300, 30).stale);
+        assert!(freshness_with_cadence(Some(0), 301, 30).stale);
+        // Critical scales upward only: thirty missed polls at 600 s.
+        assert!(!freshness_with_cadence(Some(0), 18000, 600).critical);
+        assert!(freshness_with_cadence(Some(0), 18001, 600).critical);
     }
 
     #[test]

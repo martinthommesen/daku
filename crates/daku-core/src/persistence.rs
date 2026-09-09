@@ -995,6 +995,122 @@ pub fn load_webhook_dead_letter_count(
     row.get(0).map_err(to_io_error)
 }
 
+/// One dead-lettered webhook event, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookDeadLetter {
+    pub environment_id: String,
+    pub observed_at: i64,
+    pub kind: String,
+    pub error: String,
+}
+
+pub fn load_webhook_dead_letters(
+    connection: &Connection,
+    environment_id: &str,
+) -> io::Result<Vec<WebhookDeadLetter>> {
+    ensure_webhook_tables(connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT environment_id, observed_at, kind, error FROM webhook_dead_letters
+             WHERE environment_id = ?1 ORDER BY observed_at, kind",
+        )
+        .map_err(to_io_error)?;
+    let rows = statement
+        .query_map(params![environment_id], |row| {
+            Ok(WebhookDeadLetter {
+                environment_id: row.get(0)?,
+                observed_at: row.get(1)?,
+                kind: row.get(2)?,
+                error: row.get(3)?,
+            })
+        })
+        .map_err(to_io_error)?;
+    rows.collect::<Result<_, _>>().map_err(to_io_error)
+}
+
+/// How many health events are newer than the relay cursor: the pending
+/// delivery backlog for one environment.
+pub fn count_health_events_newer(
+    connection: &Connection,
+    environment_id: &str,
+    mark: i64,
+) -> io::Result<i64> {
+    let mut statement = connection
+        .prepare(
+            "SELECT COUNT(*) FROM health_events WHERE environment_id = ?1 AND observed_at > ?2",
+        )
+        .map_err(to_io_error)?;
+    let mut rows = statement
+        .query(params![environment_id, mark])
+        .map_err(to_io_error)?;
+    let Some(row) = rows.next().map_err(to_io_error)? else {
+        return Ok(0);
+    };
+    row.get(0).map_err(to_io_error)
+}
+
+/// Outcome of requeueing one environment's dead letters for redelivery.
+pub struct RequeueReport {
+    /// Cursor the relay resumes from: below the oldest dead letter.
+    pub reset_to: i64,
+    /// Dead letters cleared for redelivery.
+    pub cleared: usize,
+    /// Dead letters whose events already left retention and cannot come back.
+    pub missing: usize,
+}
+
+/// Resets the relay cursor to just below the oldest dead letter and
+/// clears the dead letters, so the existing relay reposts the surviving
+/// events on its next tick. Events already pruned from retention are
+/// reported, not silently skipped.
+pub fn requeue_webhook_dead_letters(
+    connection: &Connection,
+    environment_id: &str,
+) -> io::Result<RequeueReport> {
+    let dead = load_webhook_dead_letters(connection, environment_id)?;
+    if dead.is_empty() {
+        let cursor = load_webhook_cursor(connection, environment_id)?.unwrap_or(0);
+        return Ok(RequeueReport {
+            reset_to: cursor,
+            cleared: 0,
+            missing: 0,
+        });
+    }
+    let oldest = dead
+        .iter()
+        .map(|letter| letter.observed_at)
+        .min()
+        .unwrap_or(0);
+    let mut missing = 0usize;
+    for letter in &dead {
+        let mut statement = connection
+            .prepare(
+                "SELECT 1 FROM health_events
+                 WHERE environment_id = ?1 AND observed_at = ?2 AND kind = ?3 LIMIT 1",
+            )
+            .map_err(to_io_error)?;
+        let mut rows = statement
+            .query(params![environment_id, letter.observed_at, letter.kind])
+            .map_err(to_io_error)?;
+        if rows.next().map_err(to_io_error)?.is_none() {
+            missing += 1;
+        }
+    }
+    let reset_to = oldest.saturating_sub(1);
+    store_webhook_cursor(connection, environment_id, reset_to)?;
+    connection
+        .execute(
+            "DELETE FROM webhook_dead_letters WHERE environment_id = ?1",
+            params![environment_id],
+        )
+        .map_err(to_io_error)?;
+    Ok(RequeueReport {
+        reset_to,
+        cleared: dead.len(),
+        missing,
+    })
+}
+
 /// Additive per-tick timing telemetry (FEAT-004): one row per tick with its
 /// wall-clock duration, created idempotently outside the numbered migration
 /// chain like the webhook tables. Bounded to the newest 10_000 ticks.
@@ -1004,16 +1120,23 @@ pub fn ensure_tick_stats_table(connection: &Connection) -> io::Result<()> {
             "CREATE TABLE IF NOT EXISTS tick_stats (
                 started_at INTEGER NOT NULL,
                 duration_ms INTEGER NOT NULL,
-                env_count INTEGER NOT NULL DEFAULT 0
+                env_count INTEGER NOT NULL DEFAULT 0,
+                publish_bytes INTEGER NOT NULL DEFAULT 0,
+                throttle_count INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS tick_stats_by_time ON tick_stats (started_at);",
         )
         .map_err(to_io_error)?;
-    // Additive migration for pre-existing tables created without env_count.
-    let _ = connection.execute(
-        "ALTER TABLE tick_stats ADD COLUMN env_count INTEGER NOT NULL DEFAULT 0",
-        [],
-    );
+    // Additive migration for pre-existing tables created without the newer
+    // columns. Each ALTER fails on tables that already have the column;
+    // that failure is the migration being unnecessary, not an error.
+    for column in [
+        "env_count INTEGER NOT NULL DEFAULT 0",
+        "publish_bytes INTEGER NOT NULL DEFAULT 0",
+        "throttle_count INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let _ = connection.execute(&format!("ALTER TABLE tick_stats ADD COLUMN {column}"), []);
+    }
     Ok(())
 }
 
@@ -1031,11 +1154,33 @@ pub fn record_tick_stat_with_envs(
     duration_ms: i64,
     env_count: i64,
 ) -> io::Result<()> {
+    record_tick_delivery(connection, started_at, duration_ms, env_count, 0, 0)
+}
+
+/// Full per-tick record: wall-clock cost plus what the publish observed.
+/// Delivery cost rides the same row as duration so one prune bounds all
+/// tick telemetry together.
+pub fn record_tick_delivery(
+    connection: &Connection,
+    started_at: i64,
+    duration_ms: i64,
+    env_count: i64,
+    publish_bytes: i64,
+    throttle_count: i64,
+) -> io::Result<()> {
     ensure_tick_stats_table(connection)?;
     connection
         .execute(
-            "INSERT INTO tick_stats (started_at, duration_ms, env_count) VALUES (?1, ?2, ?3)",
-            params![started_at, duration_ms, env_count],
+            "INSERT INTO tick_stats
+                (started_at, duration_ms, env_count, publish_bytes, throttle_count)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                started_at,
+                duration_ms,
+                env_count,
+                publish_bytes,
+                throttle_count
+            ],
         )
         .map_err(to_io_error)?;
     connection
@@ -1071,6 +1216,88 @@ pub fn load_tick_stats_summary(
             .map_err(to_io_error)?
             .unwrap_or(0),
     ))
+}
+
+/// `(publish bytes, throttled signals)` summed over the retained window.
+pub fn load_tick_delivery_summary(connection: &Connection) -> io::Result<(i64, i64)> {
+    ensure_tick_stats_table(connection)?;
+    let mut statement = connection
+        .prepare("SELECT SUM(publish_bytes), SUM(throttle_count) FROM tick_stats")
+        .map_err(to_io_error)?;
+    let mut rows = statement.query([]).map_err(to_io_error)?;
+    let Some(row) = rows.next().map_err(to_io_error)? else {
+        return Ok((0, 0));
+    };
+    Ok((
+        row.get::<_, Option<i64>>(0)
+            .map_err(to_io_error)?
+            .unwrap_or(0),
+        row.get::<_, Option<i64>>(1)
+            .map_err(to_io_error)?
+            .unwrap_or(0),
+    ))
+}
+
+/// Additive per-environment tick durations, created idempotently outside
+/// the numbered migration chain like the other telemetry tables. Bounded
+/// to the newest 10_000 rows.
+pub fn ensure_tick_env_stats_table(connection: &Connection) -> io::Result<()> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS tick_env_stats (
+                environment_id TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS tick_env_stats_by_time
+                ON tick_env_stats (started_at);",
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+pub fn record_tick_env_stat(
+    connection: &Connection,
+    environment_id: &str,
+    started_at: i64,
+    duration_ms: i64,
+) -> io::Result<()> {
+    ensure_tick_env_stats_table(connection)?;
+    connection
+        .execute(
+            "INSERT INTO tick_env_stats (environment_id, started_at, duration_ms)
+             VALUES (?1, ?2, ?3)",
+            params![environment_id, started_at, duration_ms],
+        )
+        .map_err(to_io_error)?;
+    connection
+        .execute(
+            "DELETE FROM tick_env_stats WHERE rowid NOT IN (
+                 SELECT rowid FROM tick_env_stats ORDER BY started_at DESC LIMIT 10000
+             )",
+            [],
+        )
+        .map_err(to_io_error)?;
+    Ok(())
+}
+
+/// Slowest environment in the retained window, if any durations exist.
+pub fn load_slowest_env_stat(connection: &Connection) -> io::Result<Option<(String, i64)>> {
+    ensure_tick_env_stats_table(connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT environment_id, duration_ms FROM tick_env_stats
+             ORDER BY duration_ms DESC LIMIT 1",
+        )
+        .map_err(to_io_error)?;
+    let mut rows = statement.query([]).map_err(to_io_error)?;
+    let Some(row) = rows.next().map_err(to_io_error)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.get(0).map_err(to_io_error)?,
+        row.get(1).map_err(to_io_error)?,
+    )))
 }
 
 pub fn prune_signal_samples(connection: &Connection, now: i64) -> io::Result<usize> {
@@ -1121,6 +1348,77 @@ mod tests {
         record_tick_stat(&connection, 2000, 90_000).unwrap();
         assert_eq!(load_tick_stats_summary(&connection, 60).unwrap(), (2, 1));
         store.prune_all_for_startup();
+    }
+
+    #[test]
+    fn tick_delivery_columns_migrate_old_tables_and_sum() {
+        let db = TempDb::new("ticks-migrate");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        // A pre-existing table from before the delivery columns: the
+        // additive migration must pick it up with old rows readable.
+        connection
+            .execute_batch(
+                "CREATE TABLE tick_stats (started_at INTEGER NOT NULL, duration_ms INTEGER NOT NULL);
+                 INSERT INTO tick_stats (started_at, duration_ms) VALUES (1000, 5000);",
+            )
+            .unwrap();
+        record_tick_delivery(&connection, 2000, 90_000, 2, 4096, 3).unwrap();
+        assert_eq!(load_tick_stats_summary(&connection, 60).unwrap(), (2, 1));
+        assert_eq!(load_tick_delivery_summary(&connection).unwrap(), (4096, 3));
+    }
+
+    #[test]
+    fn tick_env_stats_record_slowest_and_prune() {
+        let db = TempDb::new("ticks-env");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        assert_eq!(load_slowest_env_stat(&connection).unwrap(), None);
+        record_tick_env_stat(&connection, "prod", 1000, 400).unwrap();
+        record_tick_env_stat(&connection, "test", 1000, 1_200).unwrap();
+        assert_eq!(
+            load_slowest_env_stat(&connection).unwrap(),
+            Some(("test".to_owned(), 1_200))
+        );
+    }
+
+    #[test]
+    fn webhook_requeue_resets_cursor_and_reports_missing() {
+        use crate::persistence::HealthEvent;
+        let db = TempDb::new("webhook-requeue");
+        let store = db.store();
+        let connection = store.open().unwrap();
+        // One surviving event and one pruned (absent) event.
+        record_health_event(
+            &connection,
+            &HealthEvent {
+                environment_id: "prod".into(),
+                observed_at: 200,
+                kind: "health".into(),
+                from_health: Some("healthy".into()),
+                to_health: "degraded".into(),
+                build: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        record_webhook_dead_letter(&connection, "prod", 100, "health", "down").unwrap();
+        record_webhook_dead_letter(&connection, "prod", 200, "health", "down").unwrap();
+        store_webhook_cursor(&connection, "prod", 200).unwrap();
+        let report = requeue_webhook_dead_letters(&connection, "prod").unwrap();
+        assert_eq!(report.reset_to, 99);
+        assert_eq!(report.cleared, 2);
+        assert_eq!(report.missing, 1);
+        assert_eq!(load_webhook_cursor(&connection, "prod").unwrap(), Some(99));
+        assert_eq!(
+            load_webhook_dead_letters(&connection, "prod")
+                .unwrap()
+                .len(),
+            0
+        );
+        // Nothing left to requeue reads as an empty report, not an error.
+        let again = requeue_webhook_dead_letters(&connection, "prod").unwrap();
+        assert_eq!(again.cleared, 0);
     }
 
     #[test]
